@@ -13,6 +13,11 @@ Read PROMPT.md and execute the FULL RUN section, end to end.
 
 That's it. Everything below is the detail it will follow.
 
+**Phases 0–E (build) run unattended.** **Phase F (deploy) will prompt for approval** even
+in auto mode — production actions on `168.144.188.190` are escalated by design, because
+the live CRM runs there. Be around for that part, or let it finish the build and deploy
+later.
+
 ---
 
 # FULL RUN — build, verify, deploy
@@ -83,6 +88,13 @@ This is the "what is it building" check, and the owner wants to see it.
 17. Delete `lovable-export/` once nothing references it. Commit.
 
 ## Phase F — Deploy
+
+> **Expect permission prompts here, even in auto mode.** Auto mode classifies anything
+> touching `168.144.188.190` as a production action and escalates it — including
+> *read-only* SSH. This is correct and expected: the live upCarrera CRM is on that box.
+> The owner approves each step. Do not try to route around a denial, and do not switch to
+> a different host or credential to avoid one. If the owner is not present, finish every
+> local phase, commit, and report that deployment is pending their approval.
 
 18. **Measure the droplet first:**
     ```
