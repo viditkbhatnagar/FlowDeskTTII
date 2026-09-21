@@ -7,9 +7,23 @@
 import { defineConfig } from "@lovable.dev/vite-tanstack-config";
 
 // Redirect TanStack Start's bundled server entry to src/server.ts (our SSR error wrapper).
-// @cloudflare/vite-plugin builds from this — wrangler.jsonc main alone is insufficient.
 export default defineConfig({
   tanstackStart: {
     server: { entry: "server" },
+  },
+
+  // D1 — FlowDesk is deployed to the upCarrera DigitalOcean droplet under PM2, not to
+  // Cloudflare Workers. The wrapper's zero-config default is `cloudflare-module`
+  // (defaultPreset, see node_modules/@lovable.dev/vite-tanstack-config/dist/index.js),
+  // which produces a Workers bundle PM2 cannot run. Pinning `node-server` makes nitro
+  // emit a plain Node entry at .output/server/index.mjs. Output paths are set explicitly
+  // so the deploy runbook (docs/06) does not depend on a nitro default.
+  nitro: {
+    preset: "node-server",
+    output: {
+      dir: ".output",
+      serverDir: ".output/server",
+      publicDir: ".output/public",
+    },
   },
 });
