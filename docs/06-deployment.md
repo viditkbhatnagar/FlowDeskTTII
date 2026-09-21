@@ -211,3 +211,101 @@ pg_dump "$SUPABASE_DB_URL" | gzip > /opt/flowdesk/backups/flowdesk-$(date +\%F).
 
 Retain ~30 days, and **restore one into a scratch database to prove the backup works**
 before relying on it.
+
+---
+
+# As actually deployed — 22 September 2026
+
+FlowDesk is **live** at **https://flowdesk.168-144-188-190.sslip.io** (D3 temporary
+hostname, real Let's Encrypt certificate, expires 20 December 2026).
+
+The steps above are correct, with **two corrections found by deploying, not by reading**.
+Both are already fixed in `deploy/ecosystem.config.cjs`.
+
+## Correction 1 — the PM2 config must be `.cjs`, not `.js`
+
+`package.json` sets `"type": "module"`, so `ecosystem.config.js` is parsed as ESM and its
+`module.exports` silently yields a config with **no apps**. Use
+`deploy/ecosystem.config.cjs`. Caught locally by loading the file before shipping it.
+
+## Correction 2 — FlowDesk needs its own Node 22 runtime
+
+The droplet ships **Node 20**, and the live CRM runs on it, so it must not be upgraded.
+But `@supabase/supabase-js` requires a global `WebSocket`, which only exists from Node 22.
+Under Node 20 every server function failed with:
+
+```
+Node.js detected but native WebSocket not found.
+```
+
+**This surfaced as a permanently empty Dashboard while all eight other screens looked
+completely fine** — a smoke test on `/` would have reported success. Only the Dashboard
+uses a server function.
+
+FlowDesk therefore runs under its own interpreter. `/usr/bin/node` stays at v20 and the
+CRM is untouched:
+
+```bash
+VER=v22.23.2
+curl -fsSL -o /tmp/node.tar.xz "https://nodejs.org/dist/$VER/node-$VER-linux-x64.tar.xz"
+mkdir -p /opt/flowdesk/node
+tar -xJf /tmp/node.tar.xz -C /opt/flowdesk/node --strip-components=1
+/opt/flowdesk/node/bin/node -v          # v22.23.2
+/usr/bin/node -v                        # v20.20.2 — unchanged, CRM's runtime
+```
+
+`ecosystem.config.cjs` sets `interpreter: '/opt/flowdesk/node/bin/node'`.
+
+## Correction 3 — PM2's `env_file` does not work
+
+On PM2 7.0.1 `env_file` is recorded in the process metadata but **never injected**. The
+app booted without `SUPABASE_URL` / `SUPABASE_PUBLISHABLE_KEY` and every server function
+failed with `[Supabase] Missing Supabase environment variable(s)`. `ecosystem.config.cjs`
+now parses `/opt/flowdesk/.env` itself and merges it into `env`, with the
+`PORT`/`HOST`/`NODE_ENV` literals last so they always win.
+
+## Measured before installing anything
+
+| | Before | After |
+|---|---|---|
+| Memory available | 3256 MB of 3916 | 3228 MB |
+| Disk | 6.6 G used, 70 G free (9%) | 6.8 G used, 70 G free (9%) |
+| CPU | 2 cores | — |
+| `upcarrera-api` | online, pid 88928, 3M uptime | **online, same pid, same uptime** |
+
+FlowDesk idles at ~65–95 MB. There was never any memory pressure.
+
+## Verified after deploying
+
+- All nine screens walked in a real browser against the live HTTPS URL — zero console
+  errors, Dashboard showing real figures.
+- Full journey: sign in → create a task → move it across the Kanban board → confirmed in
+  the database, then reverted. `work_tasks` returned to 18 rows.
+- `https://admin.upcarrera.com/` and `https://admissions.upcarrera.com/` both **200**,
+  before and after every change.
+- `nginx -t` passed before each reload. The CRM's certificate was never re-issued.
+
+## What is on the droplet
+
+```
+/opt/flowdesk/.output/              the build (rsynced, ~6 MB)
+/opt/flowdesk/node/                 FlowDesk's own Node 22 runtime
+/opt/flowdesk/ecosystem.config.cjs  PM2 definition
+/opt/flowdesk/.env                  chmod 600, root-owned
+/var/log/flowdesk/                  out.log, error.log
+/etc/nginx/sites-available/flowdesk.conf   + symlink in sites-enabled/
+```
+
+Nothing was written outside those paths.
+
+## Redeploying
+
+```bash
+bun run build                                     # locally
+rsync -az --delete -e "ssh -i ~/.ssh/upcarrera_deploy" \
+  .output/ root@168.144.188.190:/opt/flowdesk/.output/
+ssh -i ~/.ssh/upcarrera_deploy root@168.144.188.190 \
+  'chown -R root:root /opt/flowdesk/.output && pm2 restart flowdesk'
+```
+
+**`pm2 restart flowdesk` — never `pm2 restart all`.** That would bounce the live CRM.
