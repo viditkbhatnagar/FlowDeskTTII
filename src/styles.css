@@ -1,0 +1,245 @@
+@import "tailwindcss" source(none);
+@source "../src";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  --color-priority-low: var(--priority-low);
+  --color-priority-medium: var(--priority-medium);
+  --color-priority-high: var(--priority-high);
+  --color-priority-critical: var(--priority-critical);
+
+  --color-status-todo: var(--status-todo);
+  --color-status-progress: var(--status-progress);
+  --color-status-review: var(--status-review);
+  --color-status-done: var(--status-done);
+
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+  --color-violet: var(--violet);
+  --color-violet-soft: var(--violet-soft);
+
+  --shadow-soft: 0 1px 2px 0 rgb(16 24 40 / 0.04), 0 1px 3px 0 rgb(16 24 40 / 0.04);
+  --shadow-card: 0 8px 26px -12px color-mix(in oklab, var(--foreground) 16%, transparent), 0 2px 8px -4px color-mix(in oklab, var(--foreground) 9%, transparent);
+  --shadow-glass: 0 18px 48px -24px color-mix(in oklab, var(--primary) 22%, transparent), inset 0 1px 0 color-mix(in oklab, white 72%, transparent);
+}
+
+:root {
+  --radius: 0.75rem;
+
+  --background: oklch(0.99 0.002 240);
+  --foreground: oklch(0.18 0.02 250);
+
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.18 0.02 250);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.18 0.02 250);
+
+  --primary: oklch(0.55 0.18 265);
+  --primary-foreground: oklch(0.99 0 0);
+
+  --secondary: oklch(0.965 0.005 250);
+  --secondary-foreground: oklch(0.25 0.02 250);
+
+  --muted: oklch(0.965 0.005 250);
+  --muted-foreground: oklch(0.52 0.02 250);
+
+  --accent: oklch(0.95 0.015 260);
+  --accent-foreground: oklch(0.25 0.02 250);
+
+  --destructive: oklch(0.62 0.22 25);
+  --destructive-foreground: oklch(0.99 0 0);
+
+  --border: oklch(0.92 0.005 250);
+  --input: oklch(0.93 0.005 250);
+  --ring: oklch(0.55 0.18 265);
+
+  --sidebar: oklch(0.985 0.003 250);
+  --sidebar-foreground: oklch(0.28 0.02 250);
+  --sidebar-primary: oklch(0.55 0.18 265);
+  --sidebar-primary-foreground: oklch(0.99 0 0);
+  --sidebar-accent: oklch(0.95 0.01 260);
+  --sidebar-accent-foreground: oklch(0.25 0.02 250);
+  --sidebar-border: oklch(0.92 0.005 250);
+  --sidebar-ring: oklch(0.55 0.18 265);
+
+  --priority-low: oklch(0.72 0.12 180);
+  --priority-medium: oklch(0.75 0.14 80);
+  --priority-high: oklch(0.68 0.18 40);
+  --priority-critical: oklch(0.6 0.22 25);
+
+  --status-todo: oklch(0.6 0.02 250);
+  --status-progress: oklch(0.6 0.16 250);
+  --status-review: oklch(0.65 0.16 300);
+  --status-done: oklch(0.62 0.15 155);
+
+  --info: oklch(0.62 0.17 242);
+  --info-soft: oklch(0.96 0.035 242);
+  --success: oklch(0.62 0.16 155);
+  --success-soft: oklch(0.96 0.04 155);
+  --warning: oklch(0.72 0.16 75);
+  --warning-soft: oklch(0.97 0.045 75);
+  --violet: oklch(0.62 0.18 300);
+  --violet-soft: oklch(0.96 0.035 300);
+}
+
+.dark {
+  --background: oklch(0.16 0.015 250);
+  --foreground: oklch(0.96 0.005 250);
+
+  --card: oklch(0.20 0.018 250);
+  --card-foreground: oklch(0.96 0.005 250);
+  --popover: oklch(0.20 0.018 250);
+  --popover-foreground: oklch(0.96 0.005 250);
+
+  --primary: oklch(0.7 0.17 265);
+  --primary-foreground: oklch(0.15 0.02 250);
+
+  --secondary: oklch(0.24 0.018 250);
+  --secondary-foreground: oklch(0.96 0.005 250);
+
+  --muted: oklch(0.24 0.018 250);
+  --muted-foreground: oklch(0.68 0.02 250);
+
+  --accent: oklch(0.26 0.025 260);
+  --accent-foreground: oklch(0.96 0.005 250);
+
+  --destructive: oklch(0.65 0.22 25);
+  --destructive-foreground: oklch(0.99 0 0);
+
+  --border: oklch(1 0 0 / 8%);
+  --input: oklch(1 0 0 / 12%);
+  --ring: oklch(0.7 0.17 265);
+
+  --sidebar: oklch(0.18 0.018 250);
+  --sidebar-foreground: oklch(0.92 0.005 250);
+  --sidebar-primary: oklch(0.7 0.17 265);
+  --sidebar-primary-foreground: oklch(0.15 0.02 250);
+  --sidebar-accent: oklch(0.24 0.02 260);
+  --sidebar-accent-foreground: oklch(0.96 0.005 250);
+  --sidebar-border: oklch(1 0 0 / 8%);
+  --sidebar-ring: oklch(0.7 0.17 265);
+
+  --info: oklch(0.72 0.14 242);
+  --info-soft: oklch(0.26 0.05 242);
+  --success: oklch(0.72 0.14 155);
+  --success-soft: oklch(0.25 0.05 155);
+  --warning: oklch(0.79 0.14 75);
+  --warning-soft: oklch(0.27 0.05 75);
+  --violet: oklch(0.72 0.15 300);
+  --violet-soft: oklch(0.27 0.05 300);
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+@utility workspace-canvas {
+  background-image: linear-gradient(145deg, color-mix(in oklab, var(--primary) 4%, var(--background)), var(--background) 36%, color-mix(in oklab, var(--info) 3%, var(--background)));
+}
+
+@utility glass-surface {
+  background: color-mix(in oklab, var(--card) 88%, transparent);
+  backdrop-filter: blur(18px) saturate(125%);
+  box-shadow: var(--shadow-glass);
+}
+
+@utility brand-mark {
+  background: linear-gradient(135deg, var(--primary), var(--info));
+  box-shadow: 0 8px 22px -9px color-mix(in oklab, var(--primary) 72%, transparent);
+}
+
+@utility primary-lift {
+  box-shadow: 0 10px 24px -12px color-mix(in oklab, var(--primary) 72%, transparent);
+}
+
+@keyframes auth-card-drift {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-4px); }
+}
+
+@keyframes auth-progress {
+  0%, 100% { width: 58%; }
+  50% { width: 78%; }
+}
+
+@keyframes auth-shape-float {
+  0%, 100% { transform: translate3d(0, 0, 0) rotate(0deg); }
+  50% { transform: translate3d(10px, -12px, 0) rotate(5deg); }
+}
+
+
+@keyframes auth-bar-glow {
+  0%, 100% { opacity: 0.85; }
+  50% { opacity: 1; }
+}
+
+
+.auth-task-card { animation: auth-card-drift 6s ease-in-out infinite; }
+.auth-delay-2 { animation-delay: 1.2s; }
+.auth-delay-3 { animation-delay: 2.4s; }
+.auth-progress { animation: auth-progress 8s ease-in-out infinite; }
+.auth-bar-glow { animation: auth-bar-glow 6s ease-in-out infinite; }
+.auth-shape {
+  position: absolute;
+  border: 1px solid color-mix(in oklch, var(--primary-foreground) 14%, transparent);
+  background: color-mix(in oklch, var(--primary-foreground) 6%, transparent);
+  animation: auth-shape-float 12s ease-in-out infinite;
+}
+.auth-shape-one { right: -6rem; top: 8%; width: 18rem; height: 18rem; border-radius: 38%; transform: rotate(12deg); }
+.auth-shape-two { bottom: 20%; left: -7rem; width: 15rem; height: 15rem; border-radius: 44%; animation-delay: 3s; }
+
+@media (prefers-reduced-motion: reduce) {
+  .auth-task-card,
+  .auth-progress,
+  .auth-bar-glow,
+  .auth-shape { animation: none; }
+  .auth-progress { width: 68%; }
+}

@@ -1,0 +1,25 @@
+node_modules/
+dist/
+build/
+.env
+.env.local
+.env.*.local
+*.zip
+lovable-export/
+.DS_Store
+*.log
+coverage/
+.turbo/
+.vite/
+
+# Build output (TanStack Start / nitro / vite)
+.output/
+.nitro/
+.vinxi/
+.tanstack/
+dist-ssr/
+*.local
+
+# Wrangler / Cloudflare
+.wrangler/
+.dev.vars
