@@ -8,7 +8,8 @@ import { cn } from "@/lib/utils";
 
 const mainItems = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
-  { id: "my-tasks", label: "My Tasks", icon: CheckSquare, badge: 6 },
+  // No hardcoded badge: the previous literal `badge: 6` never matched anything real.
+  { id: "my-tasks", label: "My Tasks", icon: CheckSquare },
   { id: "team", label: "Team Tasks", icon: Users },
   { id: "projects", label: "Projects", icon: FolderKanban },
 ];
@@ -116,14 +117,6 @@ export function Sidebar({
                 <Icon className={cn("h-4 w-4 shrink-0", isActive && "text-primary")} />
                 {!collapsed && <span className="text-sm">{item.label}</span>}
               </span>
-              {!collapsed && item.badge && (
-                <span className="rounded-md bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold text-primary">
-                  {item.badge}
-                </span>
-              )}
-              {collapsed && item.badge && (
-                <span className="absolute right-1 top-1 h-2 w-2 rounded-full bg-primary" />
-              )}
             </button>
           );
         })}

@@ -22,7 +22,8 @@ import {
   Sparkles,
 } from "lucide-react";
 import { projects, type Task, type Status, type Priority } from "@/lib/mock-data";
-import { useWorkspace } from "@/lib/workspace-data";
+import { useWorkspace, type WorkspaceTask } from "@/lib/workspace-data";
+import { WorkspaceState } from "@/components/workspace/WorkspaceState";
 import { cn } from "@/lib/utils";
 import { format, formatDistanceToNow } from "date-fns";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
@@ -47,6 +48,11 @@ const priorityRank: Record<Priority, number> = { critical: 0, high: 1, medium: 2
 function bucket(t: Task): Status | "waiting" {
   return t.status === "review" ? "waiting" : t.status;
 }
+
+// A work_tasks id is a 36-character uuid. Showing it whole made every card and every
+// drawer header start with an unreadable identifier. Show a short, stable reference
+// instead — enough to quote in a message, without the noise.
+const taskRef = (id: string) => (id.includes("-") && id.length >= 8 ? `#${id.slice(0, 8)}` : `#${id}`);
 
 type View = "kanban" | "list" | "priority";
 
@@ -88,7 +94,7 @@ const comments = [
 
 export function MyTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () => void; dashboardFilter?: string }) {
   // Treat all tasks as "mine" for the demo
-  const { tasks: items, updateTask } = useWorkspace();
+  const { tasks: items, updateTask, status: loadStatus } = useWorkspace();
   const [view, setView] = useState<View>("kanban");
   const [query, setQuery] = useState("");
   const [priorityFilter, setPriorityFilter] = useState<Priority | "all">("all");
@@ -137,7 +143,9 @@ export function MyTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () => v
 
   const productivity = Math.round((counts.completed / Math.max(counts.total, 1)) * 100);
   const focus = filtered.filter((t) => t.status !== "done").slice(0, 3);
-  const selected = items.find((t) => t.id === selectedId) ?? items[0];
+  // `items` is empty while loading, on a query failure, and for a brand-new
+  // organization — so this can legitimately be undefined. Callers must handle it.
+  const selected: WorkspaceTask | undefined = items.find((t) => t.id === selectedId) ?? items[0];
 
   useEffect(() => {
     if (dashboardFilter?.startsWith("task:")) {
@@ -163,6 +171,7 @@ export function MyTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () => v
 
   return (
     <div className="space-y-6">
+      <WorkspaceState status={loadStatus} hasTasks={items.length > 0} />
       {/* Top heading */}
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
@@ -551,7 +560,7 @@ export function MyTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () => v
         </div>
 
         {/* Right detail panel — docked beside List/Priority, centered modal over Kanban */}
-        {view !== "kanban" && (
+        {view !== "kanban" && selected && (
           <TaskDetailPanel
             task={selected}
             onClose={() => {
@@ -640,7 +649,7 @@ function MyTaskCard({
     >
       <div className="flex items-center justify-between gap-2">
         <span className="text-[10px] font-medium text-muted-foreground">
-          {task.id} · {task.project}
+          {taskRef(task.id)} · {task.project}
         </span>
         <span
           className={cn(
@@ -776,7 +785,7 @@ function TaskDetailPanel({
       <div className={cn("flex items-center justify-between px-4 py-3 border-b border-border", bare && "pr-16")}>
         <div className="min-w-0">
           <div className="text-[10px] text-muted-foreground">
-            {task.id} · {task.project}
+            {taskRef(task.id)} · {task.project}
           </div>
           <h3 className="text-sm font-semibold truncate">{task.title}</h3>
         </div>

@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { allPeople, projects, type Task, type Priority } from "@/lib/mock-data";
 import { useWorkspace, type WorkspaceTask } from "@/lib/workspace-data";
+import { WorkspaceState } from "@/components/workspace/WorkspaceState";
 import {
   Plus,
   LayoutGrid,
@@ -61,7 +62,7 @@ const workloadData = allPeople.map((p, i) => {
 
 export function TeamTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () => void; dashboardFilter?: string }) {
   const [view, setView] = useState<"kanban" | "table" | "timeline">("kanban");
-  const { tasks: workspaceTasks, updateTask } = useWorkspace();
+  const { tasks: workspaceTasks, updateTask, status: loadStatus } = useWorkspace();
   const items = useMemo<TeamTask[]>(
     () =>
       workspaceTasks.map((task, index) => ({
@@ -113,7 +114,8 @@ export function TeamTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () =>
     const productivity = Math.round(
       workloadData.reduce((s, p) => s + p.productivity, 0) / workloadData.length,
     );
-    const completionRate = Math.round((completedToday / total) * 100);
+    // total is items.length, which is 0 while loading and for an empty organization.
+    const completionRate = Math.round((completedToday / Math.max(total, 1)) * 100);
     return { total, active, delayed, completedToday, reviews, productivity, completionRate };
   }, [items]);
 
@@ -125,6 +127,7 @@ export function TeamTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () =>
 
   return (
     <div className="space-y-6">
+      <WorkspaceState status={loadStatus} hasTasks={workspaceTasks.length > 0} />
       {/* Header */}
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>

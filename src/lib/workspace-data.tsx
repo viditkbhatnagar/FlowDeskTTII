@@ -28,8 +28,16 @@ export type NewWorkspaceTask = Omit<WorkspaceTask, "id" | "progress" | "comments
   blockedReason?: string;
 };
 
+export type WorkspaceStatus = "loading" | "ready" | "error";
+
 type WorkspaceContextValue = {
   tasks: WorkspaceTask[];
+  /**
+   * Load state of the work_tasks query. Consumers must distinguish "still loading"
+   * from "loaded and genuinely empty" — otherwise a slow network renders as an empty
+   * board, and a failed query renders as an empty board too.
+   */
+  status: WorkspaceStatus;
   addTask: (task: NewWorkspaceTask) => WorkspaceTask;
   updateTask: (id: string, updates: Partial<WorkspaceTask>) => void;
 };
@@ -75,7 +83,11 @@ const initialTasks: WorkspaceTask[] = seedTasks.map((task, index) => ({
 const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);
 
 export function WorkspaceProvider({ children }: { children: ReactNode }) {
-  const [tasks, setTasks] = useState<WorkspaceTask[]>(initialTasks);
+  // Seeded empty, NOT with the sample tasks in mock-data.ts. Seeding fabricated tasks
+  // here meant a failed or slow query rendered twelve convincing fake tasks that a user
+  // could not tell from their real work. An empty list plus an explicit status is honest.
+  const [tasks, setTasks] = useState<WorkspaceTask[]>([]);
+  const [status, setStatus] = useState<WorkspaceStatus>("loading");
 
   useEffect(() => {
     let active = true;
@@ -84,7 +96,12 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         supabase.from("work_tasks").select("*, work_projects(name), task_recurrences(*)").is("archived_at", null),
         supabase.auth.getUser(),
       ]);
-      if (!active || error || !rows) return;
+      if (!active) return;
+      if (error || !rows) {
+        console.error("[flowdesk] failed to load work_tasks", error);
+        setStatus("error");
+        return;
+      }
       const currentName = profile.user?.user_metadata?.full_name || profile.user?.email?.split("@")[0] || "Account";
       const currentPerson = allPeople.find((person) => person.name === currentName) ?? { name: currentName, initials: currentName.split(" ").map((part: string) => part[0]).join("").slice(0, 2).toUpperCase(), color: "oklch(0.62 0.18 250)" };
       setTasks(rows.filter((row) => row.status !== "cancelled").map((row) => {
@@ -128,6 +145,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         recurrence: storedRule,
         recurrenceSummary: storedRule ? recurrenceSummary(storedRule) : undefined,
       }); }));
+      setStatus("ready");
     };
     void load();
     return () => { active = false; };
@@ -136,6 +154,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const value = useMemo<WorkspaceContextValue>(
     () => ({
       tasks,
+      status,
       addTask: (input) => {
         const number =
           Math.max(100, ...tasks.map((task) => Number(task.id.replace(/\D/g, "")) || 0)) + 1;
@@ -185,7 +204,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         }
       },
     }),
-    [tasks],
+    [tasks, status],
   );
 
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>;
