@@ -485,7 +485,11 @@ export function ProjectWorkspace({
           </nav>
         </header>
 
-        <main className="mx-auto w-full max-w-6xl pb-8">
+        {/* Not <main>: the workspace shell (routes/_authenticated/index.tsx) already
+            provides the page's main landmark, and nesting a second one is an
+            accessibility violation — a screen reader offers two "main" regions
+            and neither is the whole page. */}
+        <div className="mx-auto w-full max-w-6xl pb-8">
           {tab === "overview" && (
             <OverviewTab
               project={project}
@@ -548,7 +552,7 @@ export function ProjectWorkspace({
             <DocumentsTab documents={documents} onChange={setDocuments} onLog={log} />
           )}
           {tab === "activity" && <ActivityTab activities={activities} />}
-        </main>
+        </div>
 
         <NewTaskDialog
           open={taskOpen}

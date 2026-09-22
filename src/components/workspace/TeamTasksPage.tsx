@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { allPeople, projects, type Task, type Priority } from "@/lib/mock-data";
 import { useWorkspace, type WorkspaceTask } from "@/lib/workspace-data";
+import { useOrganizations } from "@/lib/organizations-data";
 import { WorkspaceState } from "@/components/workspace/WorkspaceState";
 import {
   Plus,
@@ -31,11 +32,10 @@ interface TeamTask extends Omit<WorkspaceTask, "status"> {
   comments: number;
 }
 
-const departments = ["Engineering", "Design", "Marketing", "Operations", "Research"];
-
-const mapStatus = (s: Task["status"]): TeamStatus =>
-  s === "todo" ? (Math.random() > 0.5 ? "backlog" : "assigned") : s;
-
+// "Backlog" and "Assigned" are not database statuses — both are `todo`. They used
+// to be split by array index parity, so a card's column was decided by its
+// position in the list and dragging between the two did nothing. They now mean
+// something real: Backlog is unassigned work, Assigned is work that has an owner.
 const columns: { id: TeamStatus; label: string; dot: string }[] = [
   { id: "backlog", label: "Backlog", dot: "bg-muted-foreground/50" },
   { id: "assigned", label: "Assigned", dot: "bg-status-todo" },
@@ -51,27 +51,77 @@ const priorityClass: Record<Priority, string> = {
   critical: "bg-destructive/15 text-destructive",
 };
 
-const workloadData = allPeople.map((p, i) => {
-  const active = [7, 5, 9, 6, 4][i];
-  const capacity = 10;
-  const pct = Math.round((active / capacity) * 100);
-  const productivity = [92, 87, 78, 95, 84][i];
-  const availability = pct > 80 ? "Busy" : pct > 50 ? "Available" : "Free";
-  return { ...p, active, capacity, pct, productivity, availability };
-});
+/**
+ * Team workload, computed from the real task list.
+ *
+ * This was five invented people with the literal arrays [7,5,9,6,4] and
+ * [92,87,78,95,84] rendered next to live Supabase data, so the numbers never
+ * moved and never referred to anyone real.
+ */
+const CAPACITY = 10;
+function buildWorkload(tasks: { assignee: { name: string; initials: string; color: string }; status: string }[]) {
+  const byPerson = new Map<string, { name: string; initials: string; color: string; active: number; done: number }>();
+  for (const task of tasks) {
+    const key = task.assignee?.name;
+    if (!key || key === "Unassigned") continue;
+    const entry = byPerson.get(key) ?? { ...task.assignee, active: 0, done: 0 };
+    if (task.status === "done") entry.done += 1;
+    else if (task.status !== "cancelled") entry.active += 1;
+    byPerson.set(key, entry);
+  }
+  return [...byPerson.values()]
+    .map((person) => {
+      const total = person.active + person.done;
+      const pct = Math.round((person.active / CAPACITY) * 100);
+      return {
+        ...person,
+        capacity: CAPACITY,
+        pct,
+        // Share of their work that is finished — a real ratio, not a fixed score.
+        productivity: total ? Math.round((person.done / total) * 100) : 0,
+        availability: pct > 80 ? "Busy" : pct > 50 ? "Available" : "Free",
+      };
+    })
+    .sort((a, b) => b.active - a.active);
+}
 
 export function TeamTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () => void; dashboardFilter?: string }) {
   const [view, setView] = useState<"kanban" | "table" | "timeline">("kanban");
   const { tasks: workspaceTasks, updateTask, status: loadStatus } = useWorkspace();
+  const { users, departments: orgDepartments } = useOrganizations();
+
+  // Which department a task belongs to, via the person it is assigned to. Was
+  // `departments[index % departments.length]` — a round-robin over five
+  // hardcoded names, so the department filter sorted by array position.
+  const departmentOf = useMemo(() => {
+    const nameById = new Map(orgDepartments.map((d) => [d.id, d.name]));
+    const byUserId = new Map<string, string>();
+    for (const user of users) {
+      const departmentId = user.memberships.find((m) => m.departmentId)?.departmentId;
+      if (departmentId) byUserId.set(user.id, nameById.get(departmentId) ?? "Unassigned");
+    }
+    return byUserId;
+  }, [users, orgDepartments]);
+
   const items = useMemo<TeamTask[]>(
     () =>
-      workspaceTasks.map((task, index) => ({
+      workspaceTasks.map((task) => ({
         ...task,
-        status: task.status === "todo" ? (index % 2 ? "backlog" : "assigned") : task.status,
-        department: departments[index % departments.length],
+        // Backlog = nobody owns it yet; Assigned = someone does.
+        status: task.status === "todo" ? (task.assigneeId ? "assigned" : "backlog") : task.status,
+        department: (task.assigneeId && departmentOf.get(task.assigneeId)) || "Unassigned",
         comments: task.comments,
       })),
-    [workspaceTasks],
+    [workspaceTasks, departmentOf],
+  );
+
+  const workloadData = useMemo(() => buildWorkload(workspaceTasks), [workspaceTasks]);
+
+  // Only offer departments that actually appear, so the filter can never show an
+  // option that matches nothing.
+  const departmentOptions = useMemo(
+    () => [...new Set(items.map((task) => task.department))].sort(),
+    [items],
   );
   const [dragId, setDragId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
@@ -261,7 +311,7 @@ export function TeamTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () =>
             className="h-8 rounded-md border border-border bg-card px-2 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
           >
             <option value="all">All departments</option>
-            {departments.map((d) => (
+            {departmentOptions.map((d) => (
               <option key={d}>{d}</option>
             ))}
           </select>
@@ -327,8 +377,8 @@ export function TeamTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () =>
       {/* Team insights */}
       <section className="grid items-stretch gap-4 md:grid-cols-2 xl:grid-cols-3">
         <ActivityFeed />
-        <WorkloadPanel />
-        <HeatmapPanel />
+        <WorkloadPanel members={workloadData} />
+        <HeatmapPanel members={workloadData} tasks={workspaceTasks} />
       </section>
       <TaskDetailDrawer variant={view === "kanban" ? "modal" : "sheet"} task={workspaceTasks.find((task) => task.id === selectedId)} open={Boolean(selectedId)} onOpenChange={(open) => !open && setSelectedId(undefined)} />
     </div>
@@ -582,7 +632,9 @@ function TimelineView({ tasks }: { tasks: TeamTask[] }) {
   );
 }
 
-function WorkloadPanel() {
+type WorkloadMember = ReturnType<typeof buildWorkload>[number];
+
+function WorkloadPanel({ members }: { members: WorkloadMember[] }) {
   return (
     <div className="rounded-xl border border-border bg-card p-4 shadow-[var(--shadow-soft)]">
       <div className="flex items-center justify-between">
@@ -590,7 +642,10 @@ function WorkloadPanel() {
         <button className="text-[11px] text-primary hover:underline">Manage</button>
       </div>
       <div className="mt-3 space-y-3">
-        {workloadData.map((m) => {
+        {members.length === 0 && (
+          <p className="text-xs text-muted-foreground">No tasks are assigned yet.</p>
+        )}
+        {members.map((m) => {
           const color =
             m.pct > 80 ? "bg-destructive" : m.pct > 50 ? "bg-status-progress" : "bg-status-done";
           const availColor =
@@ -637,10 +692,31 @@ function WorkloadPanel() {
   );
 }
 
-function HeatmapPanel() {
-  const days = ["Mon", "Tue", "Wed", "Thu", "Fri"];
-  // 5 members x 5 days deterministic intensities
-  const intensities = workloadData.map((_, r) => days.map((_, c) => ((r * 3 + c * 2 + 1) % 5) + 1));
+function HeatmapPanel({ members, tasks }: { members: WorkloadMember[]; tasks: WorkspaceTask[] }) {
+  // The last five days, ending today, labelled by their real weekday.
+  const today = new Date();
+  const dayKeys = Array.from({ length: 5 }, (_, i) => {
+    const d = new Date(today);
+    d.setDate(d.getDate() - (4 - i));
+    return d.toISOString().slice(0, 10);
+  });
+  const days = dayKeys.map((key) =>
+    new Date(`${key}T00:00:00`).toLocaleDateString(undefined, { weekday: "short" }),
+  );
+
+  // Real completions per person per day. This was
+  // `((r * 3 + c * 2 + 1) % 5) + 1` — a fixed pattern presented as productivity.
+  const intensities = members.map((member) =>
+    dayKeys.map(
+      (key) =>
+        tasks.filter(
+          (task) =>
+            task.assignee?.name === member.name &&
+            task.completedAt &&
+            task.completedAt.slice(0, 10) === key,
+        ).length,
+    ),
+  );
 
   return (
     <div className="rounded-xl border border-border bg-card p-4 shadow-[var(--shadow-soft)]">
@@ -655,12 +731,13 @@ function HeatmapPanel() {
             {d}
           </div>
         ))}
-        {workloadData.map((m, r) => (
+        {members.map((m, r) => (
           <Fragment key={m.name}>
             <div className="text-[11px] text-muted-foreground truncate">{m.name.split(" ")[0]}</div>
             {days.map((_, c) => {
               const v = intensities[r][c];
-              const opacity = 0.15 + v * 0.17;
+              // Saturate at four completions so one busy day does not flatten the rest.
+              const opacity = v === 0 ? 0.06 : 0.2 + Math.min(v, 4) * 0.19;
               return (
                 <div
                   key={c}
@@ -668,7 +745,7 @@ function HeatmapPanel() {
                   style={{
                     background: `color-mix(in oklab, var(--primary) ${opacity * 100}%, transparent)`,
                   }}
-                  title={`${v * 2} tasks`}
+                  title={`${v} task${v === 1 ? "" : "s"} completed`}
                 />
               );
             })}
