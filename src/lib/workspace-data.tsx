@@ -92,9 +92,12 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let active = true;
     const load = async () => {
-      const [{ data: rows, error }, { data: profile }] = await Promise.all([
+      const [{ data: rows, error }, { data: profile }, { data: people }] = await Promise.all([
         supabase.from("work_tasks").select("*, work_projects(name), task_recurrences(*)").is("archived_at", null),
         supabase.auth.getUser(),
+        // Needed to show who a task actually belongs to. Without this every card
+        // claimed the viewer owned it.
+        supabase.from("profiles").select("user_id, full_name, username"),
       ]);
       if (!active) return;
       if (error || !rows) {
@@ -103,7 +106,24 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         return;
       }
       const currentName = profile.user?.user_metadata?.full_name || profile.user?.email?.split("@")[0] || "Account";
-      const currentPerson = allPeople.find((person) => person.name === currentName) ?? { name: currentName, initials: currentName.split(" ").map((part: string) => part[0]).join("").slice(0, 2).toUpperCase(), color: "oklch(0.62 0.18 250)" };
+      const initialsOf = (value: string) =>
+        value.split(/\s+/).filter(Boolean).map((part) => part[0]).join("").slice(0, 2).toUpperCase() || "?";
+      const hueFor = (value: string) => {
+        let hash = 0;
+        for (let i = 0; i < value.length; i++) hash = (hash * 31 + value.charCodeAt(i)) >>> 0;
+        return [265, 30, 155, 300, 80, 200, 340, 120][hash % 8];
+      };
+      const personFor = (userId: string | null | undefined) => {
+        const row = (people ?? []).find((candidate) => candidate.user_id === userId);
+        const name = row?.full_name || row?.username || (userId ? "Unknown" : "Unassigned");
+        return { name, initials: initialsOf(name), color: `oklch(0.7 0.15 ${hueFor(name)})` };
+      };
+      const currentPerson = personFor(profile.user?.id) ?? {
+        name: currentName,
+        initials: initialsOf(currentName),
+        color: "oklch(0.62 0.18 250)",
+      };
+      void currentPerson;
       setTasks(rows.filter((row) => row.status !== "cancelled").map((row) => {
         const storedRule = row.task_recurrences ? {
           frequency: row.task_recurrences.frequency as RecurrenceRule["frequency"],
@@ -122,7 +142,10 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         project: row.work_projects?.name ?? "No project",
         projectId: row.project_id ?? undefined,
         organizationId: row.organization_id,
-        assignee: currentPerson,
+        // Was `currentPerson`, which made every task on every board read
+        // "Owned by <whoever is looking>" and hid assignment entirely — while the
+        // dashboard, which IS assignee-scoped, disagreed with it.
+        assignee: personFor(row.assignee_id),
         assigneeId: row.assignee_id,
         reviewerId: row.reviewer_id,
         status: row.status as Status,

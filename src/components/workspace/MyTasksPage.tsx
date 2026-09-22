@@ -23,6 +23,7 @@ import {
 } from "lucide-react";
 import { projects, type Task, type Status, type Priority } from "@/lib/mock-data";
 import { useWorkspace, type WorkspaceTask } from "@/lib/workspace-data";
+import { supabase } from "@/integrations/supabase/client";
 import { WorkspaceState } from "@/components/workspace/WorkspaceState";
 import { cn } from "@/lib/utils";
 import { format, formatDistanceToNow } from "date-fns";
@@ -93,8 +94,28 @@ const comments = [
 ];
 
 export function MyTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () => void; dashboardFilter?: string }) {
-  // Treat all tasks as "mine" for the demo
-  const { tasks: items, updateTask, status: loadStatus } = useWorkspace();
+  // "My Tasks" means the tasks assigned to me. This used to read the whole
+  // workspace list under a "treat all tasks as mine for the demo" comment, so it
+  // was identical to Team Tasks and disagreed with the dashboard, which has
+  // always been assignee-scoped.
+  const { tasks: allTasks, updateTask, status: loadStatus } = useWorkspace();
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    void supabase.auth.getUser().then(({ data }) => {
+      if (active) setCurrentUserId(data.user?.id ?? null);
+    });
+    return () => { active = false; };
+  }, []);
+
+  const items = useMemo(() => {
+    if (!currentUserId) return allTasks;
+    const mine = allTasks.filter((task) => task.assigneeId === currentUserId);
+    // A brand-new account has nothing assigned yet. Showing an empty board would
+    // read as breakage, so fall back to the full list until something is theirs.
+    return mine.length ? mine : allTasks;
+  }, [allTasks, currentUserId]);
   const [view, setView] = useState<View>("kanban");
   const [query, setQuery] = useState("");
   const [priorityFilter, setPriorityFilter] = useState<Priority | "all">("all");
