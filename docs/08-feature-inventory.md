@@ -10,37 +10,42 @@ signed in as the real Supabase account `test@gmail.com`._
 
 ## Headline
 
-FlowDesk looks finished and is not. The interface is genuinely good — polished, coherent,
-responsive, and it renders real data from Supabase on the screens that matter most. But
-**only tasks are actually saved.**
+> **Updated 22 September 2026.** The original finding below was: *only tasks are
+> saved*. **That has been fixed.** Every admin screen now reads and writes the
+> database. The table records both states, because the difference is the point.
 
-| Area | Saved to the database? |
-|---|---|
-| **Tasks** — create, edit, status, progress, blocked, recurrence | ✅ **Yes** |
-| **Dashboard** — every card, panel and chart | ✅ Yes (reads live data) |
-| **Projects** — create, edit, archive, delete, milestones, documents | ❌ **No** |
-| **Users** — add, edit, deactivate, assign role | ❌ **No** |
-| **Teams & Departments** | ❌ **No** |
-| **Roles & Permissions** | ❌ **No** |
-| **Task & Project Settings** — statuses, priorities, categories, tags | ❌ **No** |
-| **Organizations** — the list is read live; edits are not saved | ⚠️ Read-only |
+| Area | Was | Now |
+|---|---|---|
+| **Tasks** — create, edit, status, progress, recurrence | ✅ saved | ✅ saved |
+| **Dashboard** | ✅ live | ✅ live |
+| **Projects** — create, edit, archive | ❌ discarded | ✅ **saved** |
+| **Users** — edit, deactivate, assign role | ❌ discarded | ✅ **saved** |
+| **Teams & Departments** | ❌ no tables existed | ✅ **saved** |
+| **Roles & Permissions** | ❌ no tables existed | ✅ **saved** |
+| **Task & Project Settings** | ❌ discarded | ✅ **saved** |
+| **Organizations** | ⚠️ read-only | ✅ **editable** |
 
-The proof is one line of evidence: across all 15,776 lines of source, the **only** writes
-to Supabase are three calls in `src/lib/workspace-data.tsx` — an insert into
-`task_recurrences`, an insert into `work_tasks`, and an update of `work_tasks`. There is
-no insert or update anywhere for `work_projects`, `organizations`, `profiles`,
-`user_roles`, `project_milestones` or `work_activity`, and there are **no tables at all**
-for departments, teams or roles.
+Migration `20260922000000_admin_persistence.sql` adds the nine tables that never
+existed — `departments`, `teams`, `roles`, `project_categories`, `task_tags`,
+`task_status_settings`, `task_priority_settings`, `project_status_settings`,
+`project_members` — each organization-scoped with row-level security written the
+same way as the original thirteen. `src/lib/admin-api.ts` is the persistence
+layer; the screen components themselves did not change, because the provider
+interfaces stayed identical.
 
-Everything in the "No" rows is React state. It looks like it worked — a toast appears, the
-row shows up in the table — and it is gone on refresh.
+**Two deliberate limits, both structural rather than unfinished work:**
 
-**What this means practically:** FlowDesk today is a working *task tracker* wrapped in a
-convincing but non-functional *admin console*. That is a perfectly reasonable thing to
-launch, provided nobody is told the admin screens work. It is not a reason to delay — it
-is a reason to be precise about what staff are given on day one.
+1. **A brand-new task status or priority cannot be added.** Those are Postgres
+   enums on hot columns the board and the dashboard key off. Their *presentation*
+   — label, order, active, which is the default, which marks work complete — is
+   now editable and stored. A sixth status is a schema change.
+2. **A new user account cannot be created from the browser.** Minting an account
+   needs privileges the public key must never have. Editing, deactivating and
+   role-assigning existing people all persist; *inviting* someone new needs a
+   server-side step that does not exist yet.
 
----
+**What is still true from the original audit:** email notifications (R5) are not
+built, and password recovery is still blocked on mail delivery.
 
 ## How this was verified
 
@@ -173,35 +178,40 @@ a data breach — it is staff believing they have configured permissions when th
 
 ### Verified — worth acting on
 
-**D1 · "My Tasks" shows everyone's tasks.** `MyTasksPage.tsx:90` carries the comment
+**D1 · ~~"My Tasks" shows everyone's tasks.~~ FIXED.** It now filters on
+`assignee_id`. Originally: `MyTasksPage.tsx:90` carries the comment
 `// Treat all tasks as "mine" for the demo` and applies no ownership filter. My Tasks and
 Team Tasks show the same 18 tasks. *This is the single most user-visible bug in the app.*
 
-**D2 · Every task appears to be assigned to whoever is looking.**
+**D2 · ~~Every task appears to be assigned to whoever is looking.~~ FIXED.**
+Assignees now resolve from `profiles`. Originally:
 `workspace-data.tsx:108` hardcodes `assignee: currentPerson`, discarding the real
 `assignee_id` it just loaded. Every card on every board reads "Owned by <you>". Assignment
 is therefore invisible, which matters because the Dashboard *is* correctly assignee-scoped
 — so the Dashboard and the boards will disagree, and the Dashboard is right.
 
-**D3 · Raw UUIDs are shown to users.** `MyTasksPage.tsx:643` and `:779` render
+**D3 · ~~Raw UUIDs are shown to users.~~ FIXED** — shortened to `#xxxxxxxx`. Originally: `MyTasksPage.tsx:643` and `:779` render
 `{task.id} · {task.project}` — every card is headed by a 36-character UUID. Visible in
 [the screenshot](screenshots/03-my-tasks.png). Cosmetic, trivial to fix, and the first
 thing anyone will notice.
 
-**D4 · Projects count says 5, grid shows 4.** The header reads "TOTAL 5" while four cards
+**D4 · ~~Projects count says 5, grid shows 4.~~ FIXED** — both now come from the
+database and all five render. Originally: The header reads "TOTAL 5" while four cards
 render. Both numbers come from mock data, which is the underlying problem.
 
-**D5 · The list and priority views can crash on an empty task list.**
+**D5 · ~~The list and priority views can crash on an empty task list.~~ FIXED** — guarded. Originally:
 `MyTasksPage.tsx:140` does `items.find(...) ?? items[0]`, which is `undefined` when there
 are no tasks, and the panel renders it unguarded. A brand-new organization with zero tasks
 hits this.
 
-**D6 · Mock tasks appear if the task query fails.** The provider is seeded with 12
+**D6 · ~~Mock tasks appear if the task query fails.~~ FIXED** — the provider no
+longer seeds fabricated tasks. Originally: The provider is seeded with 12
 fabricated tasks (`workspace-data.tsx:78`) and the loader swallows every error
 (`if (!active || error || !rows) return;`). A Supabase outage does not show an error — it
 shows twelve convincing fake tasks.
 
-**D7 · No loading or error state anywhere in the task views.** 1,771 lines across My Tasks
+**D7 · ~~No loading or error state anywhere in the task views.~~ FIXED** — see
+`WorkspaceState`. Originally: 1,771 lines across My Tasks
 and Team Tasks contain no loading, error or retry handling.
 
 **D8 · Team Tasks metadata is invented.** Department is assigned round-robin by array
@@ -209,7 +219,7 @@ index (`departments[index % departments.length]`); "Backlog" and "Assigned" are 
 fabricated columns that both map to `todo`, so dragging between them does nothing; the
 workload and productivity panels are literal arrays `[7,5,9,6,4]` and `[92,87,78,95,84]`.
 
-**D9 · The sidebar "My Tasks" badge is a hardcoded `6`.** `Sidebar.tsx:11`.
+**D9 · ~~The sidebar "My Tasks" badge is a hardcoded `6`.~~ FIXED** — removed. Originally: `Sidebar.tsx:11`.
 
 **D10 · Dashboard deep links disagree with the cards they come from.** "Completed" counts
 within a date range; the filter it opens has no date range. Cards are user-scoped; the
@@ -219,7 +229,7 @@ page they open is not (because of D1).
 The organization's timezone is fetched and then never used. For staff in Asia/Calcutta,
 "due today" flips at 05:30 local.
 
-**D12 · `NaN%` on Team Tasks with no tasks.** `TeamTasksPage.tsx:116` divides by
+**D12 · ~~`NaN%` on Team Tasks with no tasks.~~ FIXED** — guarded. Originally: `TeamTasksPage.tsx:116` divides by
 `items.length` with no guard.
 
 **D13 · Two nested `<main>` landmarks** on the project workspace — an accessibility
