@@ -1,1 +1,49 @@
+# Local development stack for FlowDesk.
+#
+# project_id also names the local docker containers, and the ports below are
+# deliberately off the Supabase defaults (543xx) so this can run alongside
+# another local Supabase project without fighting it for ports.
 project_id = "azrpqltfpvbfnjawqxbp"
+
+[api]
+enabled = true
+port = 54421
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54422
+shadow_port = 54420
+major_version = 17
+
+[studio]
+enabled = true
+port = 54423
+
+# Captures outbound mail locally, so the password-recovery flow can be exercised
+# without a real SMTP provider.
+[inbucket]
+enabled = true
+port = 54424
+
+[auth]
+enabled = true
+site_url = "http://localhost:8080"
+additional_redirect_urls = ["http://localhost:8080/auth", "http://127.0.0.1:3100/auth"]
+jwt_expiry = 3600
+enable_signup = true
+
+[auth.email]
+enable_signup = true
+enable_confirmations = false
+
+[storage]
+enabled = true
+
+[realtime]
+enabled = true
+
+# Not needed for local development, and it wants a port of its own.
+[analytics]
+enabled = false

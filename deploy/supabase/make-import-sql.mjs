@@ -137,6 +137,40 @@ for (const id of userIds) {
 ) ON CONFLICT (id) DO NOTHING;`);
 }
 
+// GoTrue reads these varchar columns into plain Go strings, not pointers, so a
+// NULL makes every sign-in fail with "Database error querying schema" — the user
+// row looks perfectly fine in SQL but authentication is broken. They must be ''.
+//
+// Done as a guarded UPDATE rather than in the INSERT because the exact column
+// set differs between GoTrue versions, and a self-hosted instance may not be on
+// the same one as the project this data came from.
+out.push(`
+-- === GoTrue NULL-token fix ===
+-- Empty string, never NULL. See the comment above: NULLs here break sign-in.
+DO $gotrue$
+DECLARE c TEXT;
+BEGIN
+  FOREACH c IN ARRAY ARRAY[
+    'confirmation_token', 'recovery_token', 'email_change', 'email_change_token_new',
+    'email_change_token_current', 'phone_change', 'phone_change_token', 'reauthentication_token'
+  ] LOOP
+    IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'auth' AND table_name = 'users' AND column_name = c
+    ) THEN
+      EXECUTE format('UPDATE auth.users SET %I = %L WHERE %I IS NULL', c, '', c);
+    END IF;
+  END LOOP;
+
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'auth' AND table_name = 'users' AND column_name = 'email_change_confirm_status'
+  ) THEN
+    UPDATE auth.users SET email_change_confirm_status = 0 WHERE email_change_confirm_status IS NULL;
+  END IF;
+END
+$gotrue$;`);
+
 // GoTrue needs an identity row per user or password sign-in fails.
 out.push(`\n-- === auth.identities ===
 -- GoTrue resolves an email login through identities; without these the users
