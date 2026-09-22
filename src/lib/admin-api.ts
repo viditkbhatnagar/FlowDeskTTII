@@ -593,3 +593,111 @@ export async function archiveProjectRow(id: string): Promise<boolean> {
     .eq("id", id);
   return error ? Boolean(fail("archiveProject", error)) : true;
 }
+
+/* ------------------------------------------------------------------ */
+/* Task & Project settings                                             */
+/*                                                                     */
+/* Categories and tags are free-form and get real rows. Statuses and    */
+/* priorities are backed by Postgres enums that the board and the       */
+/* dashboard key off, so only their PRESENTATION is stored — see the    */
+/* note at the top of 20260922000000_admin_persistence.sql.             */
+/* ------------------------------------------------------------------ */
+
+export interface LoadedSettings {
+  statuses: { id: string; value: string; label: string; order: number; isDefault: boolean; isCompleted: boolean; active: boolean }[];
+  categories: { id: string; name: string; orgId: string; active: boolean }[];
+  tags: { id: string; name: string; orgId: string; active: boolean }[];
+}
+
+export async function loadSettings(): Promise<LoadedSettings | null> {
+  const [statusRows, categoryRows, tagRows] = await Promise.all([
+    supabase.from("task_status_settings").select("*").order("sort_order"),
+    supabase.from("project_categories").select("*").order("sort_order"),
+    supabase.from("task_tags").select("*").order("name"),
+  ]);
+  const firstError = [statusRows, categoryRows, tagRows].find((r) => r.error);
+  if (firstError?.error) return fail("loadSettings", firstError.error);
+
+  return {
+    statuses: (statusRows.data ?? []).map((r) => ({
+      id: r.id,
+      value: r.value,
+      label: r.label,
+      order: r.sort_order,
+      isDefault: r.is_default,
+      isCompleted: r.is_completed,
+      active: r.status === "active",
+    })),
+    categories: (categoryRows.data ?? []).map((r) => ({
+      id: r.id, name: r.name, orgId: r.organization_id, active: r.status === "active",
+    })),
+    tags: (tagRows.data ?? []).map((r) => ({
+      id: r.id, name: r.name, orgId: r.organization_id, active: r.status === "active",
+    })),
+  };
+}
+
+export async function updateStatusSettingRow(
+  id: string,
+  updates: { label?: string; order?: number; isDefault?: boolean; isCompleted?: boolean; active?: boolean },
+): Promise<boolean> {
+  const payload: Upd<"task_status_settings"> = {};
+  if (updates.label !== undefined) payload.label = updates.label;
+  if (updates.order !== undefined) payload.sort_order = updates.order;
+  if (updates.isDefault !== undefined) payload.is_default = updates.isDefault;
+  if (updates.isCompleted !== undefined) payload.is_completed = updates.isCompleted;
+  if (updates.active !== undefined) payload.status = updates.active ? "active" : "inactive";
+  if (!Object.keys(payload).length) return true;
+  const { error } = await supabase.from("task_status_settings").update(payload).eq("id", id);
+  return error ? Boolean(fail("updateStatusSetting", error)) : true;
+}
+
+/** Exactly one status may be the default, and one the completed state. */
+export async function setExclusiveStatusFlag(
+  orgId: string, id: string, flag: "is_default" | "is_completed",
+): Promise<boolean> {
+  // Built explicitly rather than with a computed key, so the generated types
+  // still check the column name.
+  const off: Upd<"task_status_settings"> = flag === "is_default" ? { is_default: false } : { is_completed: false };
+  const on: Upd<"task_status_settings"> = flag === "is_default" ? { is_default: true } : { is_completed: true };
+  const clear = await supabase.from("task_status_settings").update(off).eq("organization_id", orgId);
+  if (clear.error) return Boolean(fail("setExclusiveStatusFlag (clear)", clear.error));
+  const set = await supabase.from("task_status_settings").update(on).eq("id", id);
+  return set.error ? Boolean(fail("setExclusiveStatusFlag (set)", set.error)) : true;
+}
+
+export async function createCategoryRow(orgId: string, name: string): Promise<string | null> {
+  const { data, error } = await supabase
+    .from("project_categories").insert({ organization_id: orgId, name }).select("id").single();
+  if (error) return fail("createCategory", error);
+  return data.id;
+}
+
+export async function updateCategoryRow(
+  id: string, updates: { name?: string; active?: boolean },
+): Promise<boolean> {
+  const payload: Upd<"project_categories"> = {};
+  if (updates.name !== undefined) payload.name = updates.name;
+  if (updates.active !== undefined) payload.status = updates.active ? "active" : "inactive";
+  if (!Object.keys(payload).length) return true;
+  const { error } = await supabase.from("project_categories").update(payload).eq("id", id);
+  return error ? Boolean(fail("updateCategory", error)) : true;
+}
+
+export async function createTagRow(orgId: string, name: string): Promise<string | null> {
+  const { data, error } = await supabase
+    .from("task_tags").insert({ organization_id: orgId, name }).select("id").single();
+  if (error) return fail("createTag", error);
+  return data.id;
+}
+
+export async function updateTagRow(
+  id: string, updates: { name?: string; active?: boolean },
+): Promise<boolean> {
+  const payload: Upd<"task_tags"> = {};
+  if (updates.name !== undefined) payload.name = updates.name;
+  if (updates.active !== undefined) payload.status = updates.active ? "active" : "inactive";
+  if (!Object.keys(payload).length) return true;
+  const { error } = await supabase.from("task_tags").update(payload).eq("id", id);
+  return error ? Boolean(fail("updateTag", error)) : true;
+}

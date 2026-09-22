@@ -1,4 +1,13 @@
-import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  createCategoryRow,
+  createTagRow,
+  loadSettings,
+  setExclusiveStatusFlag,
+  updateCategoryRow,
+  updateStatusSettingRow,
+  updateTagRow,
+} from "@/lib/admin-api";
 
 export type ConfigStatus = "active" | "inactive";
 
@@ -193,9 +202,47 @@ interface TaskSettingsContextValue {
 const TaskSettingsContext = createContext<TaskSettingsContextValue | null>(null);
 
 export function TaskSettingsProvider({ children }: { children: ReactNode }) {
-  const [taskStatuses, setTaskStatuses] = useState<TaskStatusConfig[]>(seedTaskStatuses);
-  const [projectCategories, setProjectCategories] = useState<ProjectCategory[]>(seedCategories);
-  const [tags, setTags] = useState<TagConfig[]>(seedTags);
+  // Loaded from the database. These were hardcoded arrays, so every status
+  // rename, category and tag an admin created was discarded on refresh.
+  const [taskStatuses, setTaskStatuses] = useState<TaskStatusConfig[]>([]);
+  const [projectCategories, setProjectCategories] = useState<ProjectCategory[]>([]);
+  const [tags, setTags] = useState<TagConfig[]>([]);
+  const [orgId, setOrgId] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    void loadSettings().then((loaded) => {
+      if (!active || !loaded) return;
+      setTaskStatuses(
+        loaded.statuses.map((row) => ({
+          id: row.id,
+          name: row.label,
+          // The enum value is the type; a status cannot exist outside it.
+          type: (row.value === "todo" ? "open"
+            : row.value === "progress" ? "in-progress"
+            : row.value === "review" ? "review"
+            : row.value === "done" ? "completed"
+            : "cancelled") as TaskStatusType,
+          status: row.active ? "active" : "inactive",
+          order: row.order,
+          isDefault: row.isDefault,
+          isCompletedState: row.isCompleted,
+        })),
+      );
+      setProjectCategories(
+        loaded.categories.map((row) => ({
+          id: row.id,
+          name: row.name,
+          scope: "selected" as const,
+          orgIds: [row.orgId],
+          status: row.active ? "active" : "inactive",
+        })),
+      );
+      setTags(loaded.tags.map((row) => ({ id: row.id, name: row.name, status: row.active ? "active" : "inactive" })));
+      setOrgId(loaded.categories[0]?.orgId ?? loaded.tags[0]?.orgId ?? null);
+    });
+    return () => { active = false; };
+  }, []);
 
   const resequence = useCallback(
     (list: TaskStatusConfig[]) => list.map((item, index) => ({ ...item, order: index + 1 })),
@@ -209,7 +256,14 @@ export function TaskSettingsProvider({ children }: { children: ReactNode }) {
       activeTaskStatuses: ordered.filter((s) => s.status === "active"),
       defaultTaskStatus: ordered.find((s) => s.isDefault),
       completedTaskStatus: ordered.find((s) => s.isCompletedState),
+      // A task status is backed by the work_task_status enum, so a brand-new one
+      // cannot be stored — work_tasks.status could never hold it. The five that
+      // exist can be renamed, reordered and deactivated; adding a sixth needs a
+      // schema change. Kept local so the screen still behaves, and loud about it.
       addTaskStatus: ({ name, type, status }) =>
+        (console.warn(
+          "[flowdesk] A new task status cannot be saved: statuses are backed by the work_task_status enum. Rename or reorder the existing ones instead.",
+        ),
         setTaskStatuses((current) => [
           ...current,
           {
@@ -221,9 +275,15 @@ export function TaskSettingsProvider({ children }: { children: ReactNode }) {
             isDefault: false,
             isCompletedState: false,
           },
-        ]),
-      updateTaskStatus: (id, updates) =>
-        setTaskStatuses((current) => current.map((s) => (s.id === id ? { ...s, ...updates } : s))),
+        ])),
+      updateTaskStatus: (id, updates) => {
+        setTaskStatuses((current) => current.map((s) => (s.id === id ? { ...s, ...updates } : s)));
+        void updateStatusSettingRow(id, {
+          label: updates.name,
+          order: updates.order,
+          active: updates.status ? updates.status === "active" : undefined,
+        });
+      },
       reorderTaskStatuses: (fromId, toId) =>
         setTaskStatuses((current) => {
           const list = [...current].sort((a, b) => a.order - b.order);
@@ -232,28 +292,33 @@ export function TaskSettingsProvider({ children }: { children: ReactNode }) {
           if (from < 0 || to < 0 || from === to) return current;
           const [moved] = list.splice(from, 1);
           list.splice(to, 0, moved);
-          return resequence(list);
+          const next = resequence(list);
+          for (const item of next) void updateStatusSettingRow(item.id, { order: item.order });
+          return next;
         }),
-      setTaskStatusActive: (id, status) =>
-        setTaskStatuses((current) =>
-          current.map((s) =>
-            s.id === id && !(status === "inactive" && (s.isDefault || s.isCompletedState))
-              ? { ...s, status }
-              : s,
-          ),
-        ),
-      setDefaultTaskStatus: (id) =>
+      setTaskStatusActive: (id, status) => {
+        const target = taskStatuses.find((s) => s.id === id);
+        // The default and the completed state must stay available.
+        if (!target || (status === "inactive" && (target.isDefault || target.isCompletedState))) return;
+        setTaskStatuses((current) => current.map((s) => (s.id === id ? { ...s, status } : s)));
+        void updateStatusSettingRow(id, { active: status === "active" });
+      },
+      setDefaultTaskStatus: (id) => {
         setTaskStatuses((current) =>
           current.map((s) => ({ ...s, isDefault: s.id === id, status: s.id === id ? "active" : s.status })),
-        ),
-      setCompletedTaskStatus: (id) =>
+        );
+        if (orgId) void setExclusiveStatusFlag(orgId, id, "is_default");
+      },
+      setCompletedTaskStatus: (id) => {
         setTaskStatuses((current) =>
           current.map((s) => ({
             ...s,
             isCompletedState: s.id === id,
             status: s.id === id ? "active" : s.status,
           })),
-        ),
+        );
+        if (orgId) void setExclusiveStatusFlag(orgId, id, "is_completed");
+      },
       isTaskStatusNameTaken: (name, exceptId) =>
         taskStatuses.some((s) => s.id !== exceptId && normalize(s.name) === normalize(name)),
 
@@ -267,33 +332,64 @@ export function TaskSettingsProvider({ children }: { children: ReactNode }) {
             c.status === "active" &&
             (c.scope === "global" || !orgId || orgId === "all" || c.orgIds.includes(orgId)),
         ),
-      addCategory: (input) =>
-        setProjectCategories((current) => [
-          ...current,
-          { ...input, name: input.name.trim(), id: `PC-${current.length + 1}-${Date.now()}` },
-        ]),
-      updateCategory: (id, updates) =>
-        setProjectCategories((current) => current.map((c) => (c.id === id ? { ...c, ...updates } : c))),
-      setCategoryStatus: (id, status) =>
-        setProjectCategories((current) => current.map((c) => (c.id === id ? { ...c, status } : c))),
+      addCategory: (input) => {
+        const tempId = `PC-pending-${Date.now()}`;
+        const name = input.name.trim();
+        setProjectCategories((current) => [...current, { ...input, name, id: tempId }]);
+        const target = orgId ?? input.orgIds[0];
+        if (target) {
+          void createCategoryRow(target, name).then((realId) =>
+            setProjectCategories((current) =>
+              realId
+                ? current.map((c) => (c.id === tempId ? { ...c, id: realId } : c))
+                : current.filter((c) => c.id !== tempId),
+            ),
+          );
+        }
+      },
+      updateCategory: (id, updates) => {
+        setProjectCategories((current) => current.map((c) => (c.id === id ? { ...c, ...updates } : c)));
+        void updateCategoryRow(id, {
+          name: updates.name,
+          active: updates.status ? updates.status === "active" : undefined,
+        });
+      },
+      setCategoryStatus: (id, status) => {
+        setProjectCategories((current) => current.map((c) => (c.id === id ? { ...c, status } : c)));
+        void updateCategoryRow(id, { active: status === "active" });
+      },
       isCategoryNameTaken: (name, exceptId) =>
         projectCategories.some((c) => c.id !== exceptId && normalize(c.name) === normalize(name)),
 
       tags,
       activeTags: tags.filter((t) => t.status === "active"),
-      addTag: (name) =>
-        setTags((current) => [
-          ...current,
-          { id: `TG-${current.length + 1}-${Date.now()}`, name: name.trim(), status: "active" },
-        ]),
-      renameTag: (id, name) =>
-        setTags((current) => current.map((t) => (t.id === id ? { ...t, name: name.trim() } : t))),
-      setTagStatus: (id, status) =>
-        setTags((current) => current.map((t) => (t.id === id ? { ...t, status } : t))),
+      addTag: (name) => {
+        const tempId = `TG-pending-${Date.now()}`;
+        const clean = name.trim();
+        setTags((current) => [...current, { id: tempId, name: clean, status: "active" }]);
+        if (orgId) {
+          void createTagRow(orgId, clean).then((realId) =>
+            setTags((current) =>
+              realId
+                ? current.map((t) => (t.id === tempId ? { ...t, id: realId } : t))
+                : current.filter((t) => t.id !== tempId),
+            ),
+          );
+        }
+      },
+      renameTag: (id, name) => {
+        const clean = name.trim();
+        setTags((current) => current.map((t) => (t.id === id ? { ...t, name: clean } : t)));
+        void updateTagRow(id, { name: clean });
+      },
+      setTagStatus: (id, status) => {
+        setTags((current) => current.map((t) => (t.id === id ? { ...t, status } : t)));
+        void updateTagRow(id, { active: status === "active" });
+      },
       isTagNameTaken: (name, exceptId) =>
         tags.some((t) => t.id !== exceptId && normalize(t.name) === normalize(name)),
     };
-  }, [taskStatuses, projectCategories, tags, resequence]);
+  }, [taskStatuses, projectCategories, tags, resequence, orgId]);
 
   return <TaskSettingsContext.Provider value={value}>{children}</TaskSettingsContext.Provider>;
 }
