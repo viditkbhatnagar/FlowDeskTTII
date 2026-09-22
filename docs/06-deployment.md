@@ -309,3 +309,93 @@ ssh -i ~/.ssh/upcarrera_deploy root@168.144.188.190 \
 ```
 
 **`pm2 restart flowdesk` — never `pm2 restart all`.** That would bounce the live CRM.
+
+---
+
+# Taking the admin screens live
+
+The admin screens (Projects, Users, Teams & Departments, Roles, Settings) now read
+and write the database, but that needs migration `20260922000000_admin_persistence.sql`
+applied. **Until it is, the deployed site still runs the earlier build and those
+screens still discard edits.**
+
+Everything below has been rehearsed end to end against a local Supabase stack
+(`supabase start`) with the real data imported. What is missing is only the
+credential for a real project.
+
+## Step 1 — apply the migration
+
+Any one of these; they do the same thing.
+
+**With the Supabase CLI** (needs a personal access token from
+supabase.com/dashboard/account/tokens):
+
+```bash
+supabase link --project-ref <project-ref>
+supabase db push
+supabase gen types typescript --linked > src/integrations/supabase/types.ts
+```
+
+**With psql** (needs the database connection string from Project Settings →
+Database):
+
+```bash
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f supabase/migrations/20260922000000_admin_persistence.sql
+```
+
+**By hand:** paste that file into the Supabase SQL editor and run it. It is
+idempotent — running it twice changes nothing.
+
+## Step 2 — confirm it took
+
+```sql
+select table_name from information_schema.tables
+ where table_schema = 'public'
+   and table_name in ('departments','teams','roles','project_categories',
+                      'task_tags','task_status_settings','project_members');
+-- expect 7 rows
+
+select name, base_role from public.roles order by name;
+-- expect the five seeded roles per organization
+```
+
+If `roles` is empty, the seed trigger did not run — re-apply; the backfill block
+at the end of the migration covers existing organizations.
+
+## Step 3 — rebuild and redeploy
+
+`VITE_*` values are baked in at build time, so this is a rebuild.
+
+```bash
+bun run build
+rsync -az --delete -e "ssh -i ~/.ssh/upcarrera_deploy" \
+  .output/ root@168.144.188.190:/opt/flowdesk/.output/
+ssh -i ~/.ssh/upcarrera_deploy root@168.144.188.190 \
+  'chown -R root:root /opt/flowdesk/.output && pm2 restart flowdesk'
+```
+
+**`pm2 restart flowdesk` — never `pm2 restart all`.**
+
+## Step 4 — verify
+
+```bash
+curl -fsS -I https://flowdesk.168-144-188-190.sslip.io/
+curl -fsS -I https://admin.upcarrera.com/        # CRM must still be 200
+curl -fsS -I https://admissions.upcarrera.com/   # CRM must still be 200
+```
+
+Then sign in and create a department under Teams & Departments, **reload the
+page**, and confirm it is still there. That single check is what separates this
+build from the previous one.
+
+## What still will not work afterwards
+
+- **Creating a new user account from the browser.** Minting accounts needs
+  privileges the public key must never have. Editing, deactivating and
+  role-assigning existing people all persist; inviting someone new needs a
+  server-side step that does not exist yet.
+- **Adding a sixth task status or a new priority.** Those are Postgres enums on
+  columns the board and dashboard key off; their presentation is editable, the
+  set is not.
+- **Email**, including password recovery. Not built. See `docs/03`.
