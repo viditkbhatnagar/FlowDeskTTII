@@ -24,6 +24,8 @@ import {
 import { projects, type Task, type Status, type Priority } from "@/lib/mock-data";
 import { useWorkspace, type WorkspaceTask } from "@/lib/workspace-data";
 import { supabase } from "@/integrations/supabase/client";
+import { useOrganizations } from "@/lib/organizations-data";
+import { todayIn } from "@/lib/today";
 import { WorkspaceState } from "@/components/workspace/WorkspaceState";
 import { cn } from "@/lib/utils";
 import { format, formatDistanceToNow } from "date-fns";
@@ -99,6 +101,13 @@ export function MyTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () => v
   // was identical to Team Tasks and disagreed with the dashboard, which has
   // always been assignee-scoped.
   const { tasks: allTasks, updateTask, status: loadStatus } = useWorkspace();
+  // Due-date comparisons must use the organization's calendar date, not UTC's.
+  const { organizations, activeOrgId } = useOrganizations();
+  const orgTimezone = useMemo(
+    () =>
+      organizations.find((o) => o.id === activeOrgId)?.timezone ?? organizations[0]?.timezone,
+    [organizations, activeOrgId],
+  );
   const [currentUserId, setCurrentUserId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -128,7 +137,7 @@ export function MyTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () => v
 
   const filtered = useMemo(() => {
     let list = items.filter((t) => {
-      const today = new Date().toISOString().slice(0, 10);
+      const today = todayIn(orgTimezone);
       if (dashboardFilter === "open" && t.status === "done") return false;
       if (dashboardFilter === "due-today" && t.dueDate.slice(0, 10) !== today) return false;
       if (dashboardFilter === "overdue" && !(t.status !== "done" && t.dueDate.slice(0, 10) < today)) return false;
@@ -149,7 +158,7 @@ export function MyTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () => v
       return b.progress - a.progress;
     });
     return list;
-  }, [items, query, priorityFilter, projectFilter, sortBy, dashboardFilter]);
+  }, [items, query, priorityFilter, projectFilter, sortBy, dashboardFilter, orgTimezone]);
 
   const counts = useMemo(() => {
     const now = new Date();

@@ -24,6 +24,7 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart";
 import { cn } from "@/lib/utils";
+import { todayIn } from "@/lib/today";
 
 type Scope = "mine" | "team";
 type Period = "week" | "month" | "quarter" | "custom";
@@ -86,7 +87,9 @@ export function DashboardPage({
 
   const data = query.data as DashboardPayload;
   const page = data.scope === "team" ? "team" : "my-tasks";
-  const today = new Date().toISOString().slice(0, 10);
+  // The organization's calendar date, not UTC's. See src/lib/today.ts.
+  const today = todayIn(data?.organizations.find((o) => o.id === data.organizationId)?.timezone
+    ?? data?.organizations[0]?.timezone);
   const open = data.tasks.filter((task) => !["done", "cancelled"].includes(task.status));
   const dueToday = open.filter((task) => dateOf(task) === today);
   const overdue = open.filter((task) => {
