@@ -29,7 +29,14 @@ import { differenceInCalendarDays, format } from "date-fns";
 import { toast } from "sonner";
 import { z } from "zod";
 import { cn } from "@/lib/utils";
-import { projects as baseProjects, tasks, allPeople, type Project } from "@/lib/mock-data";
+import { tasks, allPeople, type Project } from "@/lib/mock-data";
+import {
+  archiveProjectRow,
+  createProjectRow,
+  loadProjects,
+  updateProjectRow,
+  type LoadedProject,
+} from "@/lib/admin-api";
 import { useOrganizations } from "@/lib/organizations-data";
 import { useTaskSettings, projectCategoryRotation } from "@/lib/task-settings-data";
 import { ProjectWorkspace } from "./ProjectWorkspace";
@@ -74,21 +81,36 @@ type ProjectExt = Project & {
   createdAt?: string;
   updatedAt?: string;
   isNew?: boolean;
+  /** Which organization owns it — required to write the row back. */
+  orgId?: string;
 };
 
 const clients = ["Northwind Co.", "Lumen Labs", "Pioneer Bank", "Atlas Studios", "Helix Health"];
 const categories = projectCategoryRotation;
 
-const projectsData: ProjectExt[] = baseProjects.map((p, i) => ({
-  ...p,
-  client: clients[i % clients.length],
-  startDate: new Date(Date.now() - (30 + i * 5) * 86400000).toISOString(),
-  manager: allPeople[i % allPeople.length],
-  team: allPeople.slice(0, 3 + (i % 3)),
-  pendingTasks: tasks.filter((t) => t.project === p.name && t.status !== "done").length || 3 + i,
-  risk: (["low", "medium", "high"] as const)[i % 3],
-  category: categories[i % categories.length],
-}));
+/** Widen a project loaded from Supabase into the shape this screen renders. */
+const fromLoaded = (p: LoadedProject): ProjectExt => ({
+  id: p.id,
+  name: p.name,
+  color: p.color,
+  progress: p.progress,
+  members: p.members,
+  deadline: p.deadline,
+  status: p.status,
+  client: p.client || (p.projectType === "client" ? "Client" : "Internal"),
+  startDate: p.startDate,
+  manager: p.manager,
+  team: p.team,
+  pendingTasks: p.pendingTasks,
+  risk: p.risk,
+  category: p.category,
+  description: p.description,
+  projectId: p.id.slice(0, 8).toUpperCase(),
+  projectType: p.projectType,
+  priority: p.priority,
+  creationStatus: p.creationStatus,
+  orgId: p.organizationId,
+});
 
 const statusStyles: Record<Project["status"], string> = {
   "on-track":
@@ -116,7 +138,24 @@ function fmtDate(iso: string) {
 }
 
 export function ProjectsPage({ onNewTask: _onNewTask, dashboardFilter }: { onNewTask?: () => void; dashboardFilter?: string }) {
-  const [projectItems, setProjectItems] = useState<ProjectExt[]>(projectsData);
+  // Loaded from work_projects. This screen used to render five hardcoded
+  // projects from mock-data.ts while the five real rows sat unread.
+  const [projectItems, setProjectItems] = useState<ProjectExt[]>([]);
+  const [projectsStatus, setProjectsStatus] = useState<"loading" | "ready" | "error">("loading");
+
+  useEffect(() => {
+    let active = true;
+    void loadProjects().then((rows) => {
+      if (!active) return;
+      if (rows) {
+        setProjectItems(rows.map(fromLoaded));
+        setProjectsStatus("ready");
+      } else {
+        setProjectsStatus("error");
+      }
+    });
+    return () => { active = false; };
+  }, []);
   const [view, setView] = useState<"grid" | "list" | "timeline">("grid");
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("all");
@@ -159,7 +198,38 @@ export function ProjectsPage({ onNewTask: _onNewTask, dashboardFilter }: { onNew
     setProjectItems((current) => [project, ...current]);
     setCreateOpen(false);
     setSelected(project);
-    toast.success("Project created successfully");
+
+    // Persist it. The dialog builds the object client-side, so until this
+    // resolves the card on screen is not yet a row in the database — which is
+    // exactly what used to be true forever.
+    const orgId = activeOrgId !== "all" ? activeOrgId : project.orgId;
+    if (!orgId) {
+      toast.error("Could not tell which organization this project belongs to.");
+      return;
+    }
+    void createProjectRow({
+      orgId,
+      name: project.name,
+      description: project.description,
+      startDate: project.startDate,
+      dueDate: project.deadline,
+      categoryName: project.category,
+      priority: project.priority,
+      projectType: project.projectType,
+      clientName: project.projectType === "client" ? project.client : undefined,
+      status: project.creationStatus,
+    }).then((realId) => {
+      if (!realId) {
+        setProjectItems((current) => current.filter((item) => item.id !== project.id));
+        setSelected(null);
+        toast.error("Project could not be saved. Nothing was created.");
+        return;
+      }
+      const saved = { ...project, id: realId, projectId: realId.slice(0, 8).toUpperCase() };
+      setProjectItems((current) => current.map((item) => (item.id === project.id ? saved : item)));
+      setSelected((current) => (current && current.id === project.id ? saved : current));
+      toast.success("Project created successfully");
+    });
   };
 
   if (selected) {
@@ -178,10 +248,44 @@ export function ProjectsPage({ onNewTask: _onNewTask, dashboardFilter }: { onNew
             };
             setProjectItems((current) => [duplicate as ProjectExt, ...current]);
             setSelected(duplicate as ProjectExt);
+            // onDuplicate hands back a WorkspaceProject, which carries no
+            // organization, so resolve it from the list we loaded.
+            const orgId =
+              activeOrgId !== "all"
+                ? activeOrgId
+                : projectItems.find((item) => item.id === source.id)?.orgId;
+            if (orgId) {
+              void createProjectRow({
+                orgId,
+                name: duplicate.name,
+                description: source.description,
+                startDate: source.startDate,
+                dueDate: source.deadline,
+                categoryName: source.category,
+                priority: source.priority,
+                projectType: source.projectType,
+                clientName: source.projectType === "client" ? source.client : undefined,
+                status: "planning",
+              }).then((realId) => {
+                if (!realId) {
+                  setProjectItems((current) => current.filter((item) => item.id !== duplicate.id));
+                  toast.error("The copy could not be saved.");
+                  return;
+                }
+                const saved = { ...(duplicate as ProjectExt), id: realId };
+                setProjectItems((current) => current.map((item) => (item.id === duplicate.id ? saved : item)));
+                setSelected((current) => (current && current.id === duplicate.id ? saved : current));
+              });
+            }
           }}
-          onDelete={(projectId) =>
-            setProjectItems((current) => current.filter((item) => item.id !== projectId))
-          }
+          onDelete={(projectId) => {
+            setProjectItems((current) => current.filter((item) => item.id !== projectId));
+            // Archived, not deleted: work_tasks reference the project, and
+            // removing it would take their history with it.
+            void archiveProjectRow(projectId).then((ok) => {
+              if (!ok) toast.error("The project could not be archived.");
+            });
+          }}
         />
         <ProjectFormDialog
           open={createOpen}

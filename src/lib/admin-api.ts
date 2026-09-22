@@ -400,3 +400,196 @@ export async function updateOrganizationRow(
   const { error } = await supabase.from("organizations").update(payload).eq("id", id);
   return error ? Boolean(fail("updateOrganization", error)) : true;
 }
+
+/* ------------------------------------------------------------------ */
+/* Projects                                                            */
+/*                                                                     */
+/* The Projects screen rendered five hardcoded projects from            */
+/* mock-data.ts while work_projects held five real ones it never read,  */
+/* and "Create Project" persisted nothing. These map between the table  */
+/* and the shape that screen already uses.                              */
+/* ------------------------------------------------------------------ */
+
+/** Stable colour per project, so a project keeps its colour between loads. */
+function projectColor(seed: string): string {
+  let hash = 0;
+  for (let i = 0; i < seed.length; i++) hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
+  const hues = [265, 30, 155, 300, 80, 200, 340, 120];
+  return `oklch(0.7 0.15 ${hues[hash % hues.length]})`;
+}
+
+const initialsOf = (name: string) =>
+  name.split(/\s+/).filter(Boolean).map((part) => part[0]).join("").slice(0, 2).toUpperCase() || "?";
+
+export interface LoadedProject {
+  id: string;
+  name: string;
+  description?: string;
+  color: string;
+  progress: number;
+  members: number;
+  deadline: string;
+  startDate: string;
+  status: "on-track" | "at-risk" | "delayed";
+  organizationId: string;
+  manager: { name: string; initials: string; color: string };
+  team: { name: string; initials: string; color: string }[];
+  pendingTasks: number;
+  risk: "low" | "medium" | "high";
+  category: string;
+  priority: "low" | "medium" | "high" | "critical";
+  projectType: "internal" | "client";
+  client: string;
+  creationStatus: "planning" | "active" | "on-hold";
+}
+
+/**
+ * Load projects with their real progress.
+ *
+ * Progress and pendingTasks are derived from work_tasks rather than stored, so
+ * they cannot drift from the board the way a cached column would.
+ */
+export async function loadProjects(): Promise<LoadedProject[] | null> {
+  const [projectRows, taskRows, profileRows, categoryRows, memberRows] = await Promise.all([
+    supabase.from("work_projects").select("*").is("archived_at", null).order("created_at"),
+    supabase.from("work_tasks").select("id, project_id, status").is("archived_at", null),
+    supabase.from("profiles").select("user_id, full_name, username"),
+    supabase.from("project_categories").select("id, name"),
+    supabase.from("project_members").select("project_id, user_id"),
+  ]);
+
+  const firstError = [projectRows, taskRows, profileRows, categoryRows, memberRows].find((r) => r.error);
+  if (firstError?.error) return fail("loadProjects", firstError.error);
+
+  const personFor = (userId: string | null) => {
+    const row = (profileRows.data ?? []).find((p) => p.user_id === userId);
+    const name = row?.full_name || row?.username || "Unassigned";
+    return { name, initials: initialsOf(name), color: projectColor(name) };
+  };
+  const categoryName = new Map((categoryRows.data ?? []).map((c) => [c.id, c.name]));
+  const today = new Date().toISOString().slice(0, 10);
+
+  return (projectRows.data ?? []).map((row) => {
+    const mine = (taskRows.data ?? []).filter((t) => t.project_id === row.id);
+    const done = mine.filter((t) => t.status === "done").length;
+    const pending = mine.filter((t) => t.status !== "done" && t.status !== "cancelled").length;
+    const progress = mine.length ? Math.round((done / mine.length) * 100) : 0;
+    const due = row.due_date ?? "";
+
+    // Overdue and unfinished is delayed; due within a fortnight and under
+    // halfway is at risk. Everything else is on track.
+    const daysLeft = due ? Math.round((Date.parse(due) - Date.parse(today)) / 86400000) : Infinity;
+    const status: LoadedProject["status"] =
+      progress < 100 && daysLeft < 0 ? "delayed"
+      : progress < 50 && daysLeft <= 14 ? "at-risk"
+      : "on-track";
+
+    const team = (memberRows.data ?? [])
+      .filter((m) => m.project_id === row.id)
+      .map((m) => personFor(m.user_id));
+
+    return {
+      id: row.id,
+      name: row.name,
+      description: row.description ?? undefined,
+      color: projectColor(row.name),
+      progress,
+      members: team.length,
+      deadline: due ? `${due}T23:59:59` : "",
+      startDate: row.start_date ? `${row.start_date}T00:00:00` : "",
+      status,
+      organizationId: row.organization_id,
+      manager: personFor(row.manager_id ?? row.owner_id),
+      team,
+      pendingTasks: pending,
+      risk: row.priority === "critical" || row.priority === "high" ? "high" : row.priority === "medium" ? "medium" : "low",
+      category: (row.category_id ? categoryName.get(row.category_id) : undefined) ?? "Internal",
+      priority: row.priority,
+      projectType: (row.project_type === "client" ? "client" : "internal"),
+      client: row.client_name ?? "",
+      creationStatus: row.status === "on_hold" ? "on-hold" : row.status === "active" ? "active" : "planning",
+    };
+  });
+}
+
+export async function createProjectRow(input: {
+  orgId: string;
+  name: string;
+  description?: string;
+  startDate?: string;
+  dueDate?: string;
+  categoryName?: string;
+  priority?: "low" | "medium" | "high" | "critical";
+  projectType?: "internal" | "client";
+  clientName?: string;
+  status?: "planning" | "active" | "on-hold";
+  managerId?: string | null;
+}): Promise<string | null> {
+  const { data: auth } = await supabase.auth.getUser();
+  if (!auth.user) return fail("createProject", new Error("not signed in"));
+
+  let categoryId: string | null = null;
+  if (input.categoryName) {
+    const { data } = await supabase
+      .from("project_categories")
+      .select("id")
+      .eq("organization_id", input.orgId)
+      .eq("name", input.categoryName)
+      .maybeSingle();
+    categoryId = data?.id ?? null;
+  }
+
+  const { data, error } = await supabase
+    .from("work_projects")
+    .insert({
+      organization_id: input.orgId,
+      name: input.name,
+      description: input.description ?? null,
+      // RLS requires owner_id = auth.uid() on insert, so this is not optional.
+      owner_id: auth.user.id,
+      manager_id: input.managerId ?? auth.user.id,
+      start_date: input.startDate ? input.startDate.slice(0, 10) : null,
+      due_date: input.dueDate ? input.dueDate.slice(0, 10) : null,
+      category_id: categoryId,
+      priority: input.priority ?? "medium",
+      project_type: input.projectType ?? "internal",
+      client_name: input.clientName ?? null,
+      status: input.status === "on-hold" ? "on_hold" : (input.status ?? "planning"),
+    })
+    .select("id")
+    .single();
+  if (error) return fail("createProject", error);
+  return data.id;
+}
+
+export async function updateProjectRow(
+  id: string,
+  updates: { name?: string; description?: string; startDate?: string; dueDate?: string; priority?: "low" | "medium" | "high" | "critical"; status?: string; clientName?: string },
+): Promise<boolean> {
+  const payload: Upd<"work_projects"> = {};
+  if (updates.name !== undefined) payload.name = updates.name;
+  if (updates.description !== undefined) payload.description = updates.description;
+  if (updates.startDate !== undefined) payload.start_date = updates.startDate ? updates.startDate.slice(0, 10) : null;
+  if (updates.dueDate !== undefined) payload.due_date = updates.dueDate ? updates.dueDate.slice(0, 10) : null;
+  if (updates.priority !== undefined) payload.priority = updates.priority;
+  if (updates.clientName !== undefined) payload.client_name = updates.clientName;
+  if (updates.status !== undefined) {
+    const map: Record<string, Upd<"work_projects">["status"]> = {
+      "on-hold": "on_hold", planning: "planning", active: "active",
+      completed: "completed", cancelled: "cancelled", archived: "archived",
+    };
+    payload.status = map[updates.status] ?? "planning";
+  }
+  if (!Object.keys(payload).length) return true;
+  const { error } = await supabase.from("work_projects").update(payload).eq("id", id);
+  return error ? Boolean(fail("updateProject", error)) : true;
+}
+
+/** Archive rather than delete, so the tasks that reference it keep their history. */
+export async function archiveProjectRow(id: string): Promise<boolean> {
+  const { error } = await supabase
+    .from("work_projects")
+    .update({ archived_at: new Date().toISOString(), status: "archived" })
+    .eq("id", id);
+  return error ? Boolean(fail("archiveProject", error)) : true;
+}
