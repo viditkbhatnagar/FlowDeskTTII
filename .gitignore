@@ -23,3 +23,7 @@ dist-ssr/
 # Wrangler / Cloudflare
 .wrangler/
 .dev.vars
+
+# Supabase CLI scratch (local dev stack)
+supabase/.branches/
+supabase/.temp/
