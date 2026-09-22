@@ -236,6 +236,14 @@ out.push(insert('project_milestones', milestones));
 out.push(insert('work_activity', activity));
 
 out.push(`
+-- profiles.email mirrors auth.users.email so the Users screen can read it under
+-- normal RLS. The trigger that maintains it does not fire here, because this
+-- load runs with session_replication_role = replica, so set it explicitly.
+UPDATE public.profiles p
+SET email = u.email
+FROM auth.users u
+WHERE u.id = p.user_id AND p.email IS DISTINCT FROM u.email;
+
 -- Named roles came from the migration's seed; point each user_roles row at its
 -- match, exactly as the migration does for an in-place upgrade.
 UPDATE public.user_roles ur SET role_id = r.id

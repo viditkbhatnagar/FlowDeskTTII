@@ -1,5 +1,23 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { supabase } from "@/integrations/supabase/client";
+import {
+  assignRoleRow,
+  createDepartmentRow,
+  createRoleRow,
+  createTeamRow,
+  deleteRoleRow,
+  loadAdminSnapshot,
+  removeMembershipRow,
+  resolveUserId,
+  setUserTeam,
+  updateDepartmentRow,
+  updateOrganizationRow,
+  updateProfileRow,
+  updateRoleRow,
+  updateTeamRow,
+  upsertMembershipRow,
+  type BaseRole,
+} from "@/lib/admin-api";
 
 export type OrgStatus = "active" | "inactive";
 
@@ -597,14 +615,19 @@ type OrganizationsContextValue = {
 const OrganizationsContext = createContext<OrganizationsContextValue | null>(null);
 
 export function OrganizationsProvider({ children }: { children: ReactNode }) {
-  const [organizations, setOrganizations] = useState<Organization[]>(seedOrganizations);
-  const [departments, setDepartments] = useState<Department[]>(seedDepartments);
-  const [teams, setTeams] = useState<Team[]>(seedTeams);
-  const [users, setUsers] = useState<OrgUser[]>(seedUsers);
+  // Everything starts empty and is loaded from Supabase. These lists used to be
+  // seeded from hardcoded arrays of invented people (Alex Morgan, UPC-0001 ...),
+  // which meant the admin screens showed convincing data that did not exist and
+  // silently discarded every edit.
+  const [organizations, setOrganizations] = useState<Organization[]>([]);
+  const [departments, setDepartments] = useState<Department[]>([]);
+  const [teams, setTeams] = useState<Team[]>([]);
+  const [users, setUsers] = useState<OrgUser[]>([]);
   const [projects, setProjects] = useState<OrgProject[]>(seedProjects);
   const [activeOrgId, setActiveOrgId] = useState<string | "all">("all");
-  const [roles, setRoles] = useState<Role[]>(seedRoles);
-  const [userActivity, setUserActivity] = useState<UserActivity[]>(seedUserActivity);
+  const [roles, setRoles] = useState<Role[]>([]);
+  const [userActivity, setUserActivity] = useState<UserActivity[]>([]);
+  const [adminStatus, setAdminStatus] = useState<"loading" | "ready" | "error">("loading");
   const [authenticatedUserId, setAuthenticatedUserId] = useState<string | null>(null);
   const [accessibleOrgIds, setAccessibleOrgIds] = useState<string[]>([]);
   const [authenticatedRoles, setAuthenticatedRoles] = useState<string[]>([]);
@@ -614,47 +637,33 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
     const loadAccess = async () => {
       const { data: authData } = await supabase.auth.getUser();
       if (!authData.user || !active) return;
-      const [{ data: memberships }, { data: assignedRoles }, { data: permittedOrganizations }] = await Promise.all([
+      const [{ data: memberships }, { data: assignedRoles }] = await Promise.all([
         supabase
           .from("organization_memberships")
           .select("organization_id, is_primary")
           .eq("user_id", authData.user.id)
           .eq("status", "active"),
         supabase.from("user_roles").select("role").eq("user_id", authData.user.id),
-        supabase.from("organizations").select("id, name, code, logo_url, official_email, phone, website, country, timezone, status"),
       ]);
       if (!active) return;
       setAuthenticatedUserId(authData.user.id);
       setAccessibleOrgIds((memberships ?? []).map((membership) => membership.organization_id));
       setAuthenticatedRoles((assignedRoles ?? []).map((assignedRole) => assignedRole.role));
-      if (permittedOrganizations?.length) {
-        const mappedOrganizations = permittedOrganizations.map((organization) => ({
-          id: organization.id,
-          name: organization.name,
-          code: organization.code,
-          logoUrl: organization.logo_url ?? undefined,
-          email: organization.official_email ?? undefined,
-          phone: organization.phone ?? undefined,
-          website: organization.website ?? undefined,
-          country: organization.country,
-          timezone: organization.timezone,
-          status: organization.status,
-        }));
-        const idMap = new Map<string, string>();
-        const upCarrera = mappedOrganizations.find((organization) => organization.code === "UPC");
-        const ttii = mappedOrganizations.find((organization) => organization.code === "TTII");
-        if (upCarrera) idMap.set("ORG-1", upCarrera.id);
-        if (ttii) idMap.set("ORG-2", ttii.id);
-        setOrganizations(mappedOrganizations);
-        setDepartments((current) => current.map((department) => ({ ...department, orgId: idMap.get(department.orgId) ?? department.orgId })));
-        setTeams((current) => current.map((team) => ({ ...team, orgId: idMap.get(team.orgId) ?? team.orgId })));
-        setUsers((current) => current.map((user) => ({
-          ...user,
-          primaryOrgId: idMap.get(user.primaryOrgId) ?? user.primaryOrgId,
-          memberships: user.memberships.map((membership) => ({ ...membership, orgId: idMap.get(membership.orgId) ?? membership.orgId })),
-        })));
-        setProjects((current) => current.map((project) => ({ ...project, orgId: idMap.get(project.orgId) ?? project.orgId })));
+      // Load the admin surfaces from the database. RLS already narrows every
+      // table to this user's organizations, so no client-side scoping is needed.
+      const snapshot = await loadAdminSnapshot();
+      if (!active) return;
+      if (snapshot) {
+        setOrganizations(snapshot.organizations);
+        setDepartments(snapshot.departments);
+        setTeams(snapshot.teams);
+        setUsers(snapshot.users);
+        setRoles(snapshot.roles);
+        setAdminStatus("ready");
+      } else {
+        setAdminStatus("error");
       }
+
       const primary = memberships?.find((membership) => membership.is_primary)?.organization_id;
       if (primary) setActiveOrgId(primary);
     };
@@ -663,6 +672,30 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
       active = false;
     };
   }, []);
+
+  /**
+   * The screens call create* synchronously and use the returned object straight
+   * away, so a row is added locally with a provisional id while the insert is in
+   * flight. This swaps in the id the database actually assigned.
+   *
+   * If the insert failed (RLS refused it, or the network dropped) realId is null:
+   * the row is removed again rather than left behind looking saved, and the cause
+   * is already in the console from admin-api.
+   */
+  const reconcileId = useCallback(
+    <T extends { id: string }>(
+      setter: React.Dispatch<React.SetStateAction<T[]>>,
+      tempId: string,
+      realId: string | null,
+    ) => {
+      setter((current) =>
+        realId
+          ? current.map((row) => (row.id === tempId ? { ...row, id: realId } : row))
+          : current.filter((row) => row.id !== tempId),
+      );
+    },
+    [],
+  );
 
   const pushActivity = useCallback((userId: string, type: UserActivityType, message: string) => {
     setUserActivity((current) => [
@@ -683,6 +716,17 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo<OrganizationsContextValue>(() => {
     const normalize = (v: string) => v.trim().toLowerCase();
+
+    // The privilege a role actually carries. Everything else on a role is
+    // presentation; this is the single value row-level security consults, so a
+    // new role must declare one or it would grant nothing.
+    const baseRoleFor = (scope: DataScope): BaseRole =>
+      scope === "all" ? "admin"
+      : scope === "organization" ? "viewer"
+      : scope === "department" ? "manager"
+      : scope === "team" ? "team_lead"
+      : "employee";
+
     return {
       organizations,
       departments,
@@ -702,15 +746,21 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
         setOrganizations((current) => [...current, org]);
         return org;
       },
-      updateOrganization: (id, updates) =>
-        setOrganizations((current) => current.map((o) => (o.id === id ? { ...o, ...updates } : o))),
-      setOrganizationStatus: (id, status) =>
-        setOrganizations((current) => current.map((o) => (o.id === id ? { ...o, status } : o))),
-      addDepartment: (orgId, name, head) =>
-        setDepartments((current) => [
-          ...current,
-          { id: `D-${current.length + 1}-${Date.now()}`, orgId, name, head, status: "active" },
-        ]),
+      updateOrganization: (id, updates) => {
+        setOrganizations((current) => current.map((o) => (o.id === id ? { ...o, ...updates } : o)));
+        void updateOrganizationRow(id, updates);
+      },
+      setOrganizationStatus: (id, status) => {
+        setOrganizations((current) => current.map((o) => (o.id === id ? { ...o, status } : o)));
+        void updateOrganizationRow(id, { status });
+      },
+      addDepartment: (orgId, name, head) => {
+        const tempId = `D-pending-${Date.now()}`;
+        setDepartments((current) => [...current, { id: tempId, orgId, name, head, status: "active" }]);
+        void createDepartmentRow({ orgId, name, headUserId: resolveUserId(users, head) }).then((realId) =>
+          reconcileId(setDepartments, tempId, realId),
+        );
+      },
       addUserToOrganization: (userId, orgId, membership) =>
         setUsers((current) =>
           current.map((u) =>
@@ -731,17 +781,34 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
         pushActivity(user.id, "created", "User account created");
         return user;
       },
-      updateUser: (id, updates) =>
-        setUsers((current) => current.map((u) => (u.id === id ? { ...u, ...updates } : u))),
+      updateUser: (id, updates) => {
+        setUsers((current) => current.map((u) => (u.id === id ? { ...u, ...updates } : u)));
+        void updateProfileRow(id, {
+          name: updates.name,
+          phone: updates.phone,
+          employeeId: updates.employeeId,
+          joiningDate: updates.joiningDate,
+          status: updates.status,
+        });
+      },
       setUserStatus: (id, status) => {
         setUsers((current) => current.map((u) => (u.id === id ? { ...u, status } : u)));
+        void updateProfileRow(id, { status });
         pushActivity(
           id,
           status === "active" ? "activated" : "deactivated",
           status === "active" ? "Account activated" : "Account deactivated",
         );
       },
-      upsertMembership: (userId, membership) =>
+      upsertMembership: (userId, membership) => {
+        void upsertMembershipRow(userId, {
+          orgId: membership.orgId,
+          departmentId: membership.departmentId,
+          teamId: membership.teamId,
+          roleId: roles.find((r) => normalize(r.name) === normalize(membership.role))?.id ?? null,
+          reportingManagerId: membership.reportingManagerId ?? null,
+          status: membership.status,
+        });
         setUsers((current) =>
           current.map((u) => {
             if (u.id !== userId) return u;
@@ -753,42 +820,93 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
                 : [...u.memberships, membership],
             };
           }),
-        ),
-      removeMembership: (userId, orgId) =>
+        );
+      },
+      removeMembership: (userId, orgId) => {
+        // The primary organization is never removed; that would leave the account
+        // with no route into any workspace.
+        const user = users.find((u) => u.id === userId);
+        if (!user || user.primaryOrgId === orgId) return;
         setUsers((current) =>
           current.map((u) =>
-            u.id === userId && u.primaryOrgId !== orgId
+            u.id === userId
               ? { ...u, memberships: u.memberships.filter((m) => m.orgId !== orgId) }
               : u,
           ),
-        ),
+        );
+        void removeMembershipRow(userId, orgId);
+      },
       createDepartment: (input) => {
-        const dept: Department = { ...input, id: `D-${departments.length + 1}-${Date.now()}` };
+        const tempId = `D-pending-${Date.now()}`;
+        const dept: Department = { ...input, id: tempId };
         setDepartments((current) => [...current, dept]);
+        void createDepartmentRow({
+          orgId: input.orgId,
+          name: input.name,
+          code: input.code,
+          description: input.description,
+          headUserId: resolveUserId(users, input.head),
+        }).then((realId) => reconcileId(setDepartments, tempId, realId));
         return dept;
       },
-      updateDepartment: (id, updates) =>
-        setDepartments((current) => current.map((d) => (d.id === id ? { ...d, ...updates } : d))),
-      setDepartmentStatus: (id, status) =>
-        setDepartments((current) => current.map((d) => (d.id === id ? { ...d, status } : d))),
+      updateDepartment: (id, updates) => {
+        setDepartments((current) => current.map((d) => (d.id === id ? { ...d, ...updates } : d)));
+        void updateDepartmentRow(id, {
+          name: updates.name,
+          code: updates.code,
+          description: updates.description,
+          status: updates.status,
+          ...(updates.head !== undefined ? { headUserId: resolveUserId(users, updates.head) } : {}),
+        });
+      },
+      setDepartmentStatus: (id, status) => {
+        setDepartments((current) => current.map((d) => (d.id === id ? { ...d, status } : d)));
+        void updateDepartmentRow(id, { status });
+      },
       createTeam: (input) => {
-        const team: Team = { ...input, id: `TM-${teams.length + 1}-${Date.now()}` };
+        const tempId = `TM-pending-${Date.now()}`;
+        const team: Team = { ...input, id: tempId };
         setTeams((current) => [...current, team]);
+        void createTeamRow({
+          orgId: input.orgId,
+          departmentId: input.departmentId,
+          name: input.name,
+          leadUserId: resolveUserId(users, input.lead),
+        }).then((realId) => {
+          reconcileId(setTeams, tempId, realId);
+          // Members are a column on the membership row, so they can only be
+          // written once the team has a real id.
+          if (realId) {
+            for (const userId of input.memberIds ?? []) void setUserTeam(userId, input.orgId, realId);
+          }
+        });
         return team;
       },
-      updateTeam: (id, updates) =>
-        setTeams((current) => current.map((t) => (t.id === id ? { ...t, ...updates } : t))),
-      setTeamStatus: (id, status) =>
-        setTeams((current) => current.map((t) => (t.id === id ? { ...t, status } : t))),
-      addTeamMember: (teamId, userId) =>
+      updateTeam: (id, updates) => {
+        setTeams((current) => current.map((t) => (t.id === id ? { ...t, ...updates } : t)));
+        void updateTeamRow(id, {
+          name: updates.name,
+          departmentId: updates.departmentId,
+          status: updates.status,
+          ...(updates.lead !== undefined ? { leadUserId: resolveUserId(users, updates.lead) } : {}),
+        });
+      },
+      setTeamStatus: (id, status) => {
+        setTeams((current) => current.map((t) => (t.id === id ? { ...t, status } : t)));
+        void updateTeamRow(id, { status });
+      },
+      addTeamMember: (teamId, userId) => {
         setTeams((current) =>
           current.map((t) =>
             t.id === teamId && !t.memberIds.includes(userId)
               ? { ...t, memberIds: [...t.memberIds, userId] }
               : t,
           ),
-        ),
-      removeTeamMember: (teamId, userId) =>
+        );
+        const orgId = teams.find((t) => t.id === teamId)?.orgId;
+        if (orgId) void setUserTeam(userId, orgId, teamId);
+      },
+      removeTeamMember: (teamId, userId) => {
         setTeams((current) =>
           current.map((t) =>
             t.id === teamId
@@ -799,8 +917,11 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
                 }
               : t,
           ),
-        ),
-      moveTeamMember: (fromTeamId, toTeamId, userId) =>
+        );
+        const orgId = teams.find((t) => t.id === teamId)?.orgId;
+        if (orgId) void setUserTeam(userId, orgId, null);
+      },
+      moveTeamMember: (fromTeamId, toTeamId, userId) => {
         setTeams((current) =>
           current.map((t) => {
             if (t.id === fromTeamId) {
@@ -815,7 +936,10 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
             }
             return t;
           }),
-        ),
+        );
+        const orgId = teams.find((t) => t.id === toTeamId)?.orgId ?? teams.find((t) => t.id === fromTeamId)?.orgId;
+        if (orgId) void setUserTeam(userId, orgId, toTeamId);
+      },
       isDepartmentNameTaken: (orgId, name, exceptId) =>
         departments.some(
           (d) => d.orgId === orgId && d.id !== exceptId && normalize(d.name) === normalize(name),
@@ -835,14 +959,42 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
       isRoleNameTaken: (name, exceptId) =>
         roles.some((r) => r.id !== exceptId && normalize(r.name) === normalize(name)),
       createRole: (input) => {
-        const role: Role = { ...input, id: `R-${roles.length + 1}-${Date.now()}` };
+        const tempId = `R-pending-${Date.now()}`;
+        const role: Role = { ...input, id: tempId };
         setRoles((current) => [...current, role]);
+        const orgId = activeOrgId !== "all" ? activeOrgId : (accessibleOrgIds[0] ?? organizations[0]?.id);
+        if (orgId) {
+          void createRoleRow({
+            orgId,
+            name: input.name,
+            description: input.description,
+            baseRole: baseRoleFor(input.scope),
+            scope: input.scope,
+            permissions: input.permissions,
+            settings: input.settings,
+          }).then((realId) => reconcileId(setRoles, tempId, realId));
+        }
         return role;
       },
-      updateRole: (id, updates) =>
-        setRoles((current) => current.map((r) => (r.id === id ? { ...r, ...updates } : r))),
-      setRoleStatus: (id, status) =>
-        setRoles((current) => current.map((r) => (r.id === id ? { ...r, status } : r))),
+      updateRole: (id, updates) => {
+        setRoles((current) => current.map((r) => (r.id === id ? { ...r, ...updates } : r)));
+        void updateRoleRow(id, {
+          name: updates.name,
+          description: updates.description,
+          scope: updates.scope,
+          permissions: updates.permissions,
+          settings: updates.settings,
+          status: updates.status,
+          // A system role refuses this at the database; a custom role follows its scope.
+          ...(updates.scope !== undefined && !roles.find((r) => r.id === id)?.system
+            ? { baseRole: baseRoleFor(updates.scope) }
+            : {}),
+        });
+      },
+      setRoleStatus: (id, status) => {
+        setRoles((current) => current.map((r) => (r.id === id ? { ...r, status } : r)));
+        void updateRoleRow(id, { status });
+      },
       duplicateRole: (id) =>
         setRoles((current) => {
           const source = current.find((r) => r.id === id);
@@ -852,10 +1004,20 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
           while (current.some((r) => normalize(r.name) === normalize(name))) {
             name = `${source.name} (Copy ${n++})`;
           }
-          return [
-            ...current,
-            { ...source, id: `R-${current.length + 1}-${Date.now()}`, name, aliases: [], system: false },
-          ];
+          const tempId = `R-pending-${Date.now()}`;
+          const orgId = activeOrgId !== "all" ? activeOrgId : (accessibleOrgIds[0] ?? organizations[0]?.id);
+          if (orgId) {
+            void createRoleRow({
+              orgId,
+              name,
+              description: source.description,
+              baseRole: baseRoleFor(source.scope),
+              scope: source.scope,
+              permissions: source.permissions,
+              settings: source.settings,
+            }).then((realId) => reconcileId(setRoles, tempId, realId));
+          }
+          return [...current, { ...source, id: tempId, name, aliases: [], system: false }];
         }),
       assignRole: (userId, roleName) => {
         setUsers((current) =>
@@ -865,6 +1027,16 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
               : u,
           ),
         );
+        const role = roles.find((r) => normalize(r.name) === normalize(roleName));
+        const user = users.find((u) => u.id === userId);
+        if (role && user) {
+          // Writes the label AND the privilege. Without the second, the screen
+          // would report a permission change that granted nothing.
+          const base = baseRoleFor(role.scope);
+          for (const membership of user.memberships) {
+            void assignRoleRow(userId, membership.orgId, { id: role.id, baseRole: base });
+          }
+        }
         pushActivity(userId, "role-changed", `Role changed to ${roleName}`);
       },
     };

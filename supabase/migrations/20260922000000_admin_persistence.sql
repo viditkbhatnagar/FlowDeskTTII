@@ -215,6 +215,33 @@ ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS phone         TEXT;
 ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS joining_date  DATE;
 ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS status        public.organization_status NOT NULL DEFAULT 'active';
 
+-- The Users screen lists people by email, but the address lives in auth.users,
+-- which PostgREST does not expose. Mirror it onto the profile so the screen can
+-- read it under the normal RLS rules.
+ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS email TEXT;
+
+UPDATE public.profiles p
+SET email = u.email
+FROM auth.users u
+WHERE u.id = p.user_id AND p.email IS DISTINCT FROM u.email;
+
+-- Keep it in step. handle_new_user() already creates the profile row on sign-up;
+-- this covers the address changing afterwards.
+CREATE OR REPLACE FUNCTION public.sync_profile_email()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  UPDATE public.profiles SET email = NEW.email WHERE user_id = NEW.id;
+  RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS sync_profile_email ON auth.users;
+CREATE TRIGGER sync_profile_email AFTER INSERT OR UPDATE OF email ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.sync_profile_email();
+
 ALTER TABLE public.organization_memberships ADD COLUMN IF NOT EXISTS department_id        UUID REFERENCES public.departments(id) ON DELETE SET NULL;
 ALTER TABLE public.organization_memberships ADD COLUMN IF NOT EXISTS team_id              UUID REFERENCES public.teams(id) ON DELETE SET NULL;
 ALTER TABLE public.organization_memberships ADD COLUMN IF NOT EXISTS role_id              UUID REFERENCES public.roles(id) ON DELETE SET NULL;
