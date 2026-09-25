@@ -289,6 +289,57 @@ export type Database = {
           },
         ]
       }
+      project_documents: {
+        Row: {
+          created_at: string
+          file_name: string
+          file_size: number
+          id: string
+          mime_type: string
+          organization_id: string
+          project_id: string
+          storage_path: string
+          uploaded_by: string
+        }
+        Insert: {
+          created_at?: string
+          file_name: string
+          file_size: number
+          id?: string
+          mime_type: string
+          organization_id: string
+          project_id: string
+          storage_path: string
+          uploaded_by?: string
+        }
+        Update: {
+          created_at?: string
+          file_name?: string
+          file_size?: number
+          id?: string
+          mime_type?: string
+          organization_id?: string
+          project_id?: string
+          storage_path?: string
+          uploaded_by?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "project_documents_organization_id_fkey"
+            columns: ["organization_id"]
+            isOneToOne: false
+            referencedRelation: "organizations"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "project_documents_project_id_fkey"
+            columns: ["project_id"]
+            isOneToOne: false
+            referencedRelation: "work_projects"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       project_members: {
         Row: {
           created_at: string
@@ -468,6 +519,82 @@ export type Database = {
             columns: ["organization_id"]
             isOneToOne: false
             referencedRelation: "organizations"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      task_attachments: {
+        Row: {
+          created_at: string
+          file_name: string
+          file_size: number
+          id: string
+          mime_type: string
+          storage_path: string
+          task_id: string
+          uploaded_by: string
+        }
+        Insert: {
+          created_at?: string
+          file_name: string
+          file_size: number
+          id?: string
+          mime_type: string
+          storage_path: string
+          task_id: string
+          uploaded_by?: string
+        }
+        Update: {
+          created_at?: string
+          file_name?: string
+          file_size?: number
+          id?: string
+          mime_type?: string
+          storage_path?: string
+          task_id?: string
+          uploaded_by?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "task_attachments_task_id_fkey"
+            columns: ["task_id"]
+            isOneToOne: false
+            referencedRelation: "work_tasks"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      task_comments: {
+        Row: {
+          author_id: string
+          body: string
+          created_at: string
+          id: string
+          task_id: string
+          updated_at: string
+        }
+        Insert: {
+          author_id?: string
+          body: string
+          created_at?: string
+          id?: string
+          task_id: string
+          updated_at?: string
+        }
+        Update: {
+          author_id?: string
+          body?: string
+          created_at?: string
+          id?: string
+          task_id?: string
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "task_comments_task_id_fkey"
+            columns: ["task_id"]
+            isOneToOne: false
+            referencedRelation: "work_tasks"
             referencedColumns: ["id"]
           },
         ]
@@ -661,6 +788,47 @@ export type Database = {
             columns: ["organization_id"]
             isOneToOne: false
             referencedRelation: "organizations"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      task_subtasks: {
+        Row: {
+          completed: boolean
+          created_at: string
+          created_by: string
+          id: string
+          sort_order: number
+          task_id: string
+          title: string
+          updated_at: string
+        }
+        Insert: {
+          completed?: boolean
+          created_at?: string
+          created_by?: string
+          id?: string
+          sort_order?: number
+          task_id: string
+          title: string
+          updated_at?: string
+        }
+        Update: {
+          completed?: boolean
+          created_at?: string
+          created_by?: string
+          id?: string
+          sort_order?: number
+          task_id?: string
+          title?: string
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "task_subtasks_task_id_fkey"
+            columns: ["task_id"]
+            isOneToOne: false
+            referencedRelation: "work_tasks"
             referencedColumns: ["id"]
           },
         ]
@@ -977,6 +1145,7 @@ export type Database = {
           project_id: string | null
           recurrence_id: string | null
           reviewer_id: string | null
+          start_date: string | null
           status: Database["public"]["Enums"]["work_task_status"]
           tags: string[]
           title: string
@@ -1002,6 +1171,7 @@ export type Database = {
           project_id?: string | null
           recurrence_id?: string | null
           reviewer_id?: string | null
+          start_date?: string | null
           status?: Database["public"]["Enums"]["work_task_status"]
           tags?: string[]
           title: string
@@ -1027,6 +1197,7 @@ export type Database = {
           project_id?: string | null
           recurrence_id?: string | null
           reviewer_id?: string | null
+          start_date?: string | null
           status?: Database["public"]["Enums"]["work_task_status"]
           tags?: string[]
           title?: string
@@ -1071,6 +1242,13 @@ export type Database = {
         | "task_assignee_changed"
         | "task_due_date_changed"
         | "milestone_completed"
+        | "task_status_changed"
+        | "task_updated"
+        | "task_commented"
+        | "task_file_attached"
+        | "task_archived"
+        | "project_updated"
+        | "project_document_added"
       app_role: "admin" | "manager" | "team_lead" | "employee" | "viewer"
       organization_status: "active" | "inactive"
       project_lifecycle_status:
@@ -1219,6 +1397,13 @@ export const Constants = {
         "task_assignee_changed",
         "task_due_date_changed",
         "milestone_completed",
+        "task_status_changed",
+        "task_updated",
+        "task_commented",
+        "task_file_attached",
+        "task_archived",
+        "project_updated",
+        "project_document_added",
       ],
       app_role: ["admin", "manager", "team_lead", "employee", "viewer"],
       organization_status: ["active", "inactive"],

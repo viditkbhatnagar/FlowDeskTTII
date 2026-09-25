@@ -43,9 +43,15 @@ const lit = (v) => {
   if (typeof v === 'number') return String(v);
   if (typeof v === 'boolean') return v ? 'true' : 'false';
   if (Array.isArray(v)) {
-    if (v.length === 0) return `'{}'`;
-    // text[] columns (tags, permissions)
-    return `ARRAY[${v.map((x) => lit(x)).join(',')}]::text[]`;
+    // An untyped array literal ('{...}') coerces to whatever the column is —
+    // text[] for tags and permissions, smallint[] for task_recurrences.weekdays.
+    // Casting everything to text[] broke the first import that contained a
+    // weekly recurrence.
+    const element = (x) =>
+      typeof x === 'number' ? String(x)
+      : x === null ? 'NULL'
+      : `"${String(x).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+    return `'{${v.map(element).join(',')}}'`.replace(/'/g, (m, i, s) => (i === 0 || i === s.length - 1 ? m : "''"));
   }
   if (typeof v === 'object') return `'${JSON.stringify(v).replace(/'/g, "''")}'::jsonb`;
   return `'${String(v).replace(/'/g, "''")}'`;

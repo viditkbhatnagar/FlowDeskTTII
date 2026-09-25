@@ -168,7 +168,32 @@ const seedTags: TagConfig[] = [
 
 const normalize = (value: string) => value.trim().toLowerCase();
 
+/** Database value of a task status (the work_task_status enum). */
+export type TaskStatusValue = "todo" | "progress" | "review" | "done" | "cancelled";
+
+const typeForValue: Record<TaskStatusValue, TaskStatusType> = {
+  todo: "open",
+  progress: "in-progress",
+  review: "review",
+  done: "completed",
+  cancelled: "cancelled",
+};
+
+const fallbackLabel: Record<TaskStatusValue, string> = {
+  todo: "To Do",
+  progress: "In Progress",
+  review: "Waiting Approval",
+  done: "Completed",
+  cancelled: "Cancelled",
+};
+
 interface TaskSettingsContextValue {
+  /**
+   * The configured name for a status, e.g. statusLabel("review").
+   * Every screen must use this: "review" used to be shown as "Waiting Approval",
+   * "Under Review" and "Awaiting review" on three different screens (FD-018).
+   */
+  statusLabel: (value: string) => string;
   taskStatuses: TaskStatusConfig[];
   activeTaskStatuses: TaskStatusConfig[];
   defaultTaskStatus: TaskStatusConfig | undefined;
@@ -251,7 +276,12 @@ export function TaskSettingsProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo<TaskSettingsContextValue>(() => {
     const ordered = [...taskStatuses].sort((a, b) => a.order - b.order);
+    const statusLabel = (value: string) => {
+      const type = typeForValue[value as TaskStatusValue];
+      return ordered.find((s) => s.type === type)?.name ?? fallbackLabel[value as TaskStatusValue] ?? value;
+    };
     return {
+      statusLabel,
       taskStatuses: ordered,
       activeTaskStatuses: ordered.filter((s) => s.status === "active"),
       defaultTaskStatus: ordered.find((s) => s.isDefault),

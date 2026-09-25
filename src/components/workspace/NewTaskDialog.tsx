@@ -92,10 +92,10 @@ export function NewTaskDialog({
     (endMode === "on_date" && (!endDate || (dueDate && endDate <= dueDate))) ||
     (endMode === "after_count" && Number(occurrenceCount) < 2)
   );
-  const submit = () => {
+  const submit = async () => {
     const person = allPeople.find((item) => item.name === assignee);
     if (!title.trim() || !person || !dueDate || recurrenceInvalid) return;
-    addTask({
+    const result = await addTask({
       title: title.trim(),
       description: description.trim(),
       project,
@@ -115,10 +115,14 @@ export function NewTaskDialog({
         completed: false,
       })),
       dependencies,
-      attachments: files.map((file) => file.name),
+      files,
       recurrence: recurring ? recurrence : undefined,
       recurrenceSummary: recurring ? recurrenceSummary(recurrence, dueDate) : undefined,
     });
+    if (!result.ok) {
+      toast.error(result.error);
+      return;
+    }
     toast.success("Task created successfully");
     setTitle("");
     setDescription("");

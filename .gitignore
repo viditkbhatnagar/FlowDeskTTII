@@ -27,3 +27,6 @@ dist-ssr/
 # Supabase CLI scratch (local dev stack)
 supabase/.branches/
 supabase/.temp/
+
+# QA reports and other shared documents — internal, not source
+*.docx
