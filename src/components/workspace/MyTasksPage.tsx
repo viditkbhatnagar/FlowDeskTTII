@@ -11,32 +11,36 @@ import {
   Paperclip,
   MessageSquare,
   CheckCircle2,
-  Clock,
   Hash,
-  GitBranch,
-  Activity,
-  Send,
   Timer,
-  History,
-  Link2,
   Sparkles,
+  X,
 } from "lucide-react";
-import { projects, type Task, type Status, type Priority } from "@/lib/mock-data";
-import { useWorkspace, type WorkspaceTask } from "@/lib/workspace-data";
+import {
+  useWorkspace,
+  type Priority,
+  type Status,
+  type WorkspaceStatus,
+  type WorkspaceTask,
+} from "@/lib/workspace-data";
 import { supabase } from "@/integrations/supabase/client";
 import { useOrganizations } from "@/lib/organizations-data";
+import { useTaskSettings } from "@/lib/task-settings-data";
 import { todayIn } from "@/lib/today";
 import { WorkspaceState } from "@/components/workspace/WorkspaceState";
+import { TaskDetailDrawer } from "@/components/workspace/TaskDetailDrawer";
 import { cn } from "@/lib/utils";
-import { format, formatDistanceToNow } from "date-fns";
-import { Dialog, DialogContent } from "@/components/ui/dialog";
+import { format } from "date-fns";
 
-const columns: { id: Status | "waiting"; label: string; dot: string }[] = [
-  { id: "todo", label: "To Do", dot: "bg-status-todo" },
-  { id: "progress", label: "In Progress", dot: "bg-status-progress" },
-  { id: "waiting", label: "Waiting Approval", dot: "bg-status-review" },
-  { id: "done", label: "Completed", dot: "bg-status-done" },
+// Column names come from Settings › Task Status via statusLabel. They were
+// hardcoded, so the configured "Review" showed here as "Waiting Approval" (FD-018).
+const columns: { id: Status; dot: string }[] = [
+  { id: "todo", dot: "bg-status-todo" },
+  { id: "progress", dot: "bg-status-progress" },
+  { id: "review", dot: "bg-status-review" },
+  { id: "done", dot: "bg-status-done" },
 ];
+const statusValues: Status[] = columns.map((column) => column.id);
 
 const priorityChip: Record<Priority, string> = {
   low: "bg-priority-low/15 text-priority-low",
@@ -47,205 +51,399 @@ const priorityChip: Record<Priority, string> = {
 
 const priorityRank: Record<Priority, number> = { critical: 0, high: 1, medium: 2, low: 3 };
 
-// Map mock 'review' status to 'waiting' bucket for this page
-function bucket(t: Task): Status | "waiting" {
-  return t.status === "review" ? "waiting" : t.status;
-}
-
-// A work_tasks id is a 36-character uuid. Showing it whole made every card and every
-// drawer header start with an unreadable identifier. Show a short, stable reference
-// instead — enough to quote in a message, without the noise.
-const taskRef = (id: string) => (id.includes("-") && id.length >= 8 ? `#${id.slice(0, 8)}` : `#${id}`);
+const DAY_MS = 86_400_000;
 
 type View = "kanban" | "list" | "priority";
 
-const subtasksByTask: Record<string, { id: string; label: string; done: boolean }[]> = {
-  default: [
-    { id: "s1", label: "Draft initial spec", done: true },
-    { id: "s2", label: "Review with stakeholders", done: true },
-    { id: "s3", label: "Implement first pass", done: false },
-    { id: "s4", label: "Add unit tests", done: false },
-    { id: "s5", label: "Write release notes", done: false },
-  ],
-};
+interface MyTasksPageProps {
+  onNewTask: () => void;
+  dashboardFilter?: string;
+  /** Clears the filter the dashboard applied (FD-030). */
+  onClearFilter?: () => void;
+}
 
-const activity = [
-  { id: "a1", who: "Priya Shah", what: "moved this task to In Progress", when: "2h ago" },
-  { id: "a2", who: "Alex Morgan", what: "added a checklist item", when: "5h ago" },
-  { id: "a3", who: "Sam Chen", what: "attached design-v3.fig", when: "Yesterday" },
-  { id: "a4", who: "Jordan Lee", what: "created this task", when: "3d ago" },
-];
+/**
+ * Short, human-quotable references for task ids, unique within the loaded list.
+ *
+ * Was `#` + the first 8 characters of the uuid. Seeded ids share their prefix
+ * (5c120001-6e51-…-0000000000NN), so eight completed tasks all read #5c120001
+ * (FD-024). uuids differ at the tail, so take the last eight hex characters and
+ * lengthen only the ones that still collide.
+ */
+function buildTaskRefs(ids: string[]): Map<string, string> {
+  const hexById = new Map(ids.map((id) => [id, id.replace(/-/g, "")]));
+  const refs = new Map<string, string>();
+  for (let length = 8; refs.size < hexById.size && length <= 32; length++) {
+    const pending = [...hexById].filter(([id]) => !refs.has(id));
+    const counts = new Map<string, number>();
+    for (const [, hex] of pending) {
+      const suffix = hex.slice(-length);
+      counts.set(suffix, (counts.get(suffix) ?? 0) + 1);
+    }
+    for (const [id, hex] of pending) {
+      const suffix = hex.slice(-length);
+      if (counts.get(suffix) === 1) refs.set(id, `#${suffix}`);
+    }
+  }
+  for (const id of ids) if (!refs.has(id)) refs.set(id, `#${id}`);
+  return refs;
+}
 
-const comments = [
-  {
-    id: "c1",
-    who: "Priya Shah",
-    initials: "PS",
-    color: "oklch(0.72 0.15 30)",
-    text: "Pushed a draft — would love a quick look at the empty state.",
-    when: "1h ago",
-  },
-  {
-    id: "c2",
-    who: "Alex Morgan",
-    initials: "AM",
-    color: "oklch(0.7 0.15 265)",
-    text: "Looks great. Let's tighten the spacing on mobile and ship.",
-    when: "20m ago",
-  },
-];
+const cardDomId = (id: string) => `my-task-${id}`;
 
-export function MyTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () => void; dashboardFilter?: string }) {
-  // "My Tasks" means the tasks assigned to me. This used to read the whole
-  // workspace list under a "treat all tasks as mine for the demo" comment, so it
-  // was identical to Team Tasks and disagreed with the dashboard, which has
-  // always been assignee-scoped.
+const isOverdue = (task: WorkspaceTask, today: string) =>
+  task.status !== "done" && task.dueDate.slice(0, 10) < today;
+
+/** Same rules as the dashboard cards that link here, on the organization's date. */
+function matchesDashboardFilter(
+  task: WorkspaceTask,
+  filter: string | undefined,
+  today: string,
+): boolean {
+  switch (filter) {
+    case "open":
+      return task.status !== "done";
+    case "due-today":
+      return task.dueDate.slice(0, 10) === today;
+    case "overdue":
+      return isOverdue(task, today);
+    case "review":
+      return task.status === "review";
+    case "completed":
+      return task.status === "done";
+    case "blocked":
+      return task.blocked;
+    case "attention":
+      return (
+        task.blocked ||
+        task.status === "review" ||
+        task.priority === "critical" ||
+        isOverdue(task, today)
+      );
+    // "task:<id>" opens and highlights one task; it does not narrow the board (FD-029).
+    default:
+      return true;
+  }
+}
+
+function dashboardFilterLabel(filter: string, statusLabel: (value: string) => string): string {
+  switch (filter) {
+    case "open":
+      return "Open tasks";
+    case "due-today":
+      return "Due today";
+    case "overdue":
+      return "Overdue";
+    case "review":
+      return statusLabel("review");
+    case "completed":
+      return statusLabel("done");
+    case "blocked":
+      return "Blocked";
+    case "attention":
+      return "Needs attention";
+    default:
+      return filter;
+  }
+}
+
+/** yyyy-mm-dd of an instant in the organization's timezone (cf. todayIn). */
+function dateIn(iso: string, timezone?: string): string {
+  if (!timezone) return iso.slice(0, 10);
+  try {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date(iso));
+  } catch {
+    return iso.slice(0, 10);
+  }
+}
+
+/** Monday–Sunday week containing `today` (yyyy-mm-dd). */
+function weekOf(today: string): { start: string; end: string } {
+  const day = new Date(`${today}T00:00:00Z`);
+  const sinceMonday = (day.getUTCDay() + 6) % 7;
+  const start = new Date(day.getTime() - sinceMonday * DAY_MS);
+  const end = new Date(start.getTime() + 6 * DAY_MS);
+  return { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10) };
+}
+
+/**
+ * Productivity for this week: of the tasks due this week or completed this week,
+ * how many are done. Was completed / total over all time (11/21) under a
+ * "This week" label (FD-046). Null when nothing falls in the week.
+ */
+function weekProductivity(items: WorkspaceTask[], today: string, timezone?: string) {
+  const { start, end } = weekOf(today);
+  const inWeek = (day: string) => day >= start && day <= end;
+  const inScope = items.filter(
+    (task) =>
+      inWeek(task.dueDate.slice(0, 10)) ||
+      (task.status === "done" && task.completedAt
+        ? inWeek(dateIn(task.completedAt, timezone))
+        : false),
+  );
+  const done = inScope.filter((task) => task.status === "done").length;
+  return {
+    start,
+    end,
+    done,
+    scope: inScope.length,
+    stillDue: inScope.filter((task) => task.status !== "done").length,
+    score: inScope.length ? Math.round((done / inScope.length) * 100) : null,
+  };
+}
+
+export function MyTasksPage({ onNewTask, dashboardFilter, onClearFilter }: MyTasksPageProps) {
   const { tasks: allTasks, updateTask, status: loadStatus } = useWorkspace();
+  const { statusLabel } = useTaskSettings();
   // Due-date comparisons must use the organization's calendar date, not UTC's.
   const { organizations, activeOrgId } = useOrganizations();
   const orgTimezone = useMemo(
-    () =>
-      organizations.find((o) => o.id === activeOrgId)?.timezone ?? organizations[0]?.timezone,
+    () => organizations.find((o) => o.id === activeOrgId)?.timezone ?? organizations[0]?.timezone,
     [organizations, activeOrgId],
   );
-  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
+  const today = todayIn(orgTimezone);
+  // undefined while the session is read; null when nobody is signed in.
+  const [currentUserId, setCurrentUserId] = useState<string | null | undefined>(undefined);
 
   useEffect(() => {
     let active = true;
     void supabase.auth.getUser().then(({ data }) => {
       if (active) setCurrentUserId(data.user?.id ?? null);
     });
-    return () => { active = false; };
+    return () => {
+      active = false;
+    };
   }, []);
 
-  const items = useMemo(() => {
-    if (!currentUserId) return allTasks;
-    const mine = allTasks.filter((task) => task.assigneeId === currentUserId);
-    // A brand-new account has nothing assigned yet. Showing an empty board would
-    // read as breakage, so fall back to the full list until something is theirs.
-    return mine.length ? mine : allTasks;
-  }, [allTasks, currentUserId]);
+  // "My Tasks" means the tasks assigned to me — the same set as the dashboard's
+  // My Overview. It used to fall back to everyone's tasks while the user loaded
+  // and whenever nothing was assigned yet, so it listed Priya Shah's work (FD-020).
+  const items = useMemo(
+    () => (currentUserId ? allTasks.filter((task) => task.assigneeId === currentUserId) : []),
+    [allTasks, currentUserId],
+  );
+  const pageStatus: WorkspaceStatus =
+    currentUserId === undefined && loadStatus !== "error" ? "loading" : loadStatus;
+  const taskRefs = useMemo(() => buildTaskRefs(allTasks.map((task) => task.id)), [allTasks]);
+
   const [view, setView] = useState<View>("kanban");
   const [query, setQuery] = useState("");
   const [priorityFilter, setPriorityFilter] = useState<Priority | "all">("all");
   const [projectFilter, setProjectFilter] = useState<string>("all");
   const [sortBy, setSortBy] = useState<"due" | "priority" | "progress">("due");
-  const [selectedId, setSelectedId] = useState<string>(items[0]?.id ?? "");
+  const [selectedId, setSelectedId] = useState<string>("");
+  const [detailOpen, setDetailOpen] = useState(false);
   const [dragId, setDragId] = useState<string | null>(null);
   const [justCompleted, setJustCompleted] = useState<string | null>(null);
-  const [detailOpen, setDetailOpen] = useState(false);
+  const [scrollToId, setScrollToId] = useState<string | null>(null);
+
+  // Projects I actually have tasks in. This listed the demo projects from
+  // mock-data, whose names matched none of the real tasks.
+  const projectOptions = useMemo(() => {
+    const byKey = new Map<string, string>();
+    for (const task of items) byKey.set(task.projectId ?? task.project, task.project);
+    return [...byKey].sort((a, b) => a[1].localeCompare(b[1]));
+  }, [items]);
 
   const filtered = useMemo(() => {
-    let list = items.filter((t) => {
-      const today = todayIn(orgTimezone);
-      if (dashboardFilter === "open" && t.status === "done") return false;
-      if (dashboardFilter === "due-today" && t.dueDate.slice(0, 10) !== today) return false;
-      if (dashboardFilter === "overdue" && !(t.status !== "done" && t.dueDate.slice(0, 10) < today)) return false;
-      if (dashboardFilter === "review" && t.status !== "review") return false;
-      if (dashboardFilter === "completed" && t.status !== "done") return false;
-      if (dashboardFilter === "blocked" && !t.blocked) return false;
-      if (dashboardFilter === "attention" && !(t.blocked || t.status === "review" || t.priority === "critical" || (t.status !== "done" && t.dueDate.slice(0, 10) < today))) return false;
-      if (dashboardFilter?.startsWith("task:") && t.id !== dashboardFilter.slice(5)) return false;
+    const needle = query.trim().toLowerCase();
+    const list = items.filter((t) => {
+      if (!matchesDashboardFilter(t, dashboardFilter, today)) return false;
       if (priorityFilter !== "all" && t.priority !== priorityFilter) return false;
-      if (projectFilter !== "all" && t.project !== projectFilter) return false;
-      if (query && !`${t.title} ${t.project} ${t.id}`.toLowerCase().includes(query.toLowerCase()))
+      if (projectFilter !== "all" && (t.projectId ?? t.project) !== projectFilter) return false;
+      if (
+        needle &&
+        !`${t.title} ${t.project} ${taskRefs.get(t.id) ?? ""} ${(t.tags ?? []).join(" ")}`
+          .toLowerCase()
+          .includes(needle)
+      )
         return false;
       return true;
     });
-    list = [...list].sort((a, b) => {
+    return [...list].sort((a, b) => {
       if (sortBy === "due") return +new Date(a.dueDate) - +new Date(b.dueDate);
       if (sortBy === "priority") return priorityRank[a.priority] - priorityRank[b.priority];
       return b.progress - a.progress;
     });
-    return list;
-  }, [items, query, priorityFilter, projectFilter, sortBy, dashboardFilter, orgTimezone]);
+  }, [items, query, priorityFilter, projectFilter, sortBy, dashboardFilter, today, taskRefs]);
 
-  const counts = useMemo(() => {
-    const now = new Date();
-    return {
+  const counts = useMemo(
+    () => ({
       total: items.length,
       pending: items.filter((t) => t.status === "todo").length,
       progress: items.filter((t) => t.status === "progress").length,
       completed: items.filter((t) => t.status === "done").length,
-      overdue: items.filter((t) => new Date(t.dueDate) < now && t.status !== "done").length,
-    };
-  }, [items]);
+      overdue: items.filter((t) => isOverdue(t, today)).length,
+    }),
+    [items, today],
+  );
 
-  const productivity = Math.round((counts.completed / Math.max(counts.total, 1)) * 100);
-  const focus = filtered.filter((t) => t.status !== "done").slice(0, 3);
-  // `items` is empty while loading, on a query failure, and for a brand-new
-  // organization — so this can legitimately be undefined. Callers must handle it.
-  const selected: WorkspaceTask | undefined = items.find((t) => t.id === selectedId) ?? items[0];
+  const week = useMemo(
+    () => weekProductivity(items, today, orgTimezone),
+    [items, today, orgTimezone],
+  );
+
+  // Top three open tasks by priority, then due date. It used to take the first
+  // three of the board's current sort, so a Medium task beat High ones (FD-045).
+  const focus = useMemo(
+    () =>
+      filtered
+        .filter((t) => t.status !== "done")
+        .sort(
+          (a, b) =>
+            priorityRank[a.priority] - priorityRank[b.priority] ||
+            +new Date(a.dueDate) - +new Date(b.dueDate),
+        )
+        .slice(0, 3),
+    [filtered],
+  );
+  const hasOpenTasks = items.some((t) => t.status !== "done");
+
+  // Looked up in the whole workspace so a link to a task that is not assigned to
+  // me (e.g. from global search) still opens it.
+  const selected: WorkspaceTask | undefined = allTasks.find((t) => t.id === selectedId);
+  const linkedTaskId = dashboardFilter?.startsWith("task:") ? dashboardFilter.slice(5) : null;
+
+  const openTask = (id: string) => {
+    setSelectedId(id);
+    setDetailOpen(true);
+  };
+
+  // "task:<id>" (dashboard rows, global search): open that task and bring its card
+  // into view. It used to land on the board with nothing opened (FD-029).
+  useEffect(() => {
+    if (!linkedTaskId) return;
+    setSelectedId(linkedTaskId);
+    setDetailOpen(true);
+    setScrollToId(linkedTaskId);
+  }, [linkedTaskId]);
 
   useEffect(() => {
-    if (dashboardFilter?.startsWith("task:")) {
-      setSelectedId(dashboardFilter.slice(5));
-      setDetailOpen(true);
-    }
-  }, [dashboardFilter]);
+    if (!scrollToId) return;
+    // Not rendered yet while tasks load; the effect re-runs when they arrive.
+    const card = document.getElementById(cardDomId(scrollToId));
+    if (!card) return;
+    card.scrollIntoView({ block: "center", behavior: "smooth" });
+    setScrollToId(null);
+  }, [scrollToId, filtered, view]);
+
+  // A task deleted from the drawer disappears from the list; close the drawer too.
+  useEffect(() => {
+    if (detailOpen && selectedId && !selected && pageStatus === "ready") setDetailOpen(false);
+  }, [detailOpen, selectedId, selected, pageStatus]);
 
   const setStatus = (id: string, status: Status) => {
-    const task = items.find((item) => item.id === id);
-    updateTask(id, { status, progress: status === "done" ? 100 : task?.progress });
+    const task = allTasks.find((item) => item.id === id);
+    if (!task || task.status === status) return;
+    // Was `progress: status === "done" ? 100 : task.progress`, which wrote 100%
+    // back onto a reopened task (FD-025). The database now derives progress on
+    // reopen — the subtask ratio, or 0 without subtasks — and updateTask derives
+    // it locally from subtasks; mirror the no-subtask case so the card does not
+    // show 100% until the reload lands.
+    const reopenedWithoutSubtasks = task.status === "done" && !task.subtasks.length;
+    void updateTask(id, reopenedWithoutSubtasks ? { status, progress: 0 } : { status });
     if (status === "done") {
       setJustCompleted(id);
       setTimeout(() => setJustCompleted(null), 700);
     }
   };
 
-  const drop = (col: Status | "waiting") => {
+  const drop = (col: Status) => {
     if (!dragId) return;
-    setStatus(dragId, col === "waiting" ? "review" : col);
+    setStatus(dragId, col);
     setDragId(null);
   };
 
+  // FD-030: a filter applied from the dashboard is named on screen and clearable.
+  const filterChip = !dashboardFilter
+    ? null
+    : linkedTaskId
+      ? pageStatus !== "ready"
+        ? null
+        : selected
+          ? `Opened: ${selected.title}${selected.assigneeId === currentUserId ? "" : " (not assigned to you)"}`
+          : "The linked task was not found"
+      : `Filtered: ${dashboardFilterLabel(dashboardFilter, statusLabel)}`;
+
+  const focusEmptyText = hasOpenTasks
+    ? "No open tasks match the current filters."
+    : items.length
+      ? "Everything assigned to you is complete."
+      : "Nothing is assigned to you yet.";
+
   return (
     <div className="space-y-6">
-      <WorkspaceState status={loadStatus} hasTasks={items.length > 0} />
+      <WorkspaceState status={pageStatus} hasTasks={items.length > 0} />
       {/* Top heading */}
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <h2 className="text-2xl font-semibold tracking-tight">My Tasks</h2>
-          <p className="text-sm text-muted-foreground">Stay focused on what you own this week.</p>
+          {/* Was "what you own this week", but the list is every open and past task assigned to you (FD-020). */}
+          <p className="text-sm text-muted-foreground">
+            Everything assigned to you, across all your projects.
+          </p>
         </div>
         <div className="flex items-center gap-2">
           <button
+            type="button"
             onClick={onNewTask}
             className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground shadow-sm hover:bg-primary/90 transition"
           >
-            <Plus className="h-4 w-4" /> Quick Add Task
+            <Plus className="h-4 w-4" aria-hidden="true" /> Quick Add Task
           </button>
         </div>
       </div>
+
+      {pageStatus === "ready" && items.length === 0 && (
+        <div
+          className="rounded-xl border border-dashed border-border bg-card/60 px-4 py-6 text-center"
+          role="status"
+        >
+          <p className="text-sm font-medium">Nothing is assigned to you yet.</p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Tasks assigned to you will appear here. Use Quick Add Task to create one.
+          </p>
+        </div>
+      )}
 
       {/* Summary widgets */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
         {[
           {
+            key: "total",
             label: "Total",
             value: counts.total,
             accent: "text-foreground",
             dot: "bg-muted-foreground/40",
           },
           {
-            label: "Pending",
+            key: "todo",
+            label: statusLabel("todo"),
             value: counts.pending,
             accent: "text-foreground",
             dot: "bg-status-todo",
           },
           {
-            label: "In Progress",
+            key: "progress",
+            label: statusLabel("progress"),
             value: counts.progress,
             accent: "text-foreground",
             dot: "bg-status-progress",
           },
           {
-            label: "Completed",
+            key: "done",
+            label: statusLabel("done"),
             value: counts.completed,
             accent: "text-foreground",
             dot: "bg-status-done",
           },
           {
+            key: "overdue",
             label: "Overdue",
             value: counts.overdue,
             accent: "text-destructive",
@@ -253,14 +451,14 @@ export function MyTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () => v
           },
         ].map((s) => (
           <div
-            key={s.label}
+            key={s.key}
             className="group rounded-xl border border-border bg-card p-4 shadow-[var(--shadow-soft)] hover:shadow-[var(--shadow-card)] hover:-translate-y-0.5 transition"
           >
             <div className="flex items-center justify-between">
               <span className="text-[11px] uppercase tracking-wider text-muted-foreground">
                 {s.label}
               </span>
-              <span className={cn("h-1.5 w-1.5 rounded-full", s.dot)} />
+              <span className={cn("h-1.5 w-1.5 rounded-full", s.dot)} aria-hidden="true" />
             </div>
             <div className={cn("mt-2 text-2xl font-semibold tabular-nums", s.accent)}>
               {s.value}
@@ -272,7 +470,11 @@ export function MyTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () => v
       {/* Controls bar */}
       <div className="flex flex-col lg:flex-row lg:items-center gap-3 justify-between">
         <div className="flex items-center gap-2 flex-wrap">
-          <div className="inline-flex items-center rounded-lg border border-border bg-card p-1 shadow-[var(--shadow-soft)]">
+          <div
+            className="inline-flex items-center rounded-lg border border-border bg-card p-1 shadow-[var(--shadow-soft)]"
+            role="group"
+            aria-label="Board view"
+          >
             {[
               { id: "kanban", label: "Kanban", Icon: LayoutGrid },
               { id: "list", label: "List", Icon: List },
@@ -280,6 +482,8 @@ export function MyTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () => v
             ].map((v) => (
               <button
                 key={v.id}
+                type="button"
+                aria-pressed={view === v.id}
                 onClick={() => setView(v.id as View)}
                 className={cn(
                   "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition",
@@ -288,14 +492,15 @@ export function MyTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () => v
                     : "text-muted-foreground hover:text-foreground",
                 )}
               >
-                <v.Icon className="h-3.5 w-3.5" /> {v.label}
+                <v.Icon className="h-3.5 w-3.5" aria-hidden="true" /> {v.label}
               </button>
             ))}
           </div>
 
           <div className="inline-flex items-center gap-1 rounded-lg border border-border bg-card px-2 py-1 text-xs shadow-[var(--shadow-soft)]">
-            <Filter className="h-3.5 w-3.5 text-muted-foreground" />
+            <Filter className="h-3.5 w-3.5 text-muted-foreground" aria-hidden="true" />
             <select
+              aria-label="Filter by priority"
               value={priorityFilter}
               onChange={(e) => setPriorityFilter(e.target.value as Priority | "all")}
               className="bg-transparent outline-none text-xs py-1 pr-1"
@@ -309,24 +514,26 @@ export function MyTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () => v
           </div>
 
           <div className="inline-flex items-center gap-1 rounded-lg border border-border bg-card px-2 py-1 text-xs shadow-[var(--shadow-soft)]">
-            <Hash className="h-3.5 w-3.5 text-muted-foreground" />
+            <Hash className="h-3.5 w-3.5 text-muted-foreground" aria-hidden="true" />
             <select
+              aria-label="Filter by project"
               value={projectFilter}
               onChange={(e) => setProjectFilter(e.target.value)}
               className="bg-transparent outline-none text-xs py-1 pr-1"
             >
               <option value="all">All projects</option>
-              {projects.map((p) => (
-                <option key={p.id} value={p.name}>
-                  {p.name}
+              {projectOptions.map(([key, name]) => (
+                <option key={key} value={key}>
+                  {name}
                 </option>
               ))}
             </select>
           </div>
 
           <div className="inline-flex items-center gap-1 rounded-lg border border-border bg-card px-2 py-1 text-xs shadow-[var(--shadow-soft)]">
-            <ArrowUpDown className="h-3.5 w-3.5 text-muted-foreground" />
+            <ArrowUpDown className="h-3.5 w-3.5 text-muted-foreground" aria-hidden="true" />
             <select
+              aria-label="Sort tasks"
               value={sortBy}
               onChange={(e) => setSortBy(e.target.value as typeof sortBy)}
               className="bg-transparent outline-none text-xs py-1 pr-1"
@@ -336,11 +543,34 @@ export function MyTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () => v
               <option value="progress">Sort: Progress</option>
             </select>
           </div>
+
+          {filterChip && (
+            <span className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-primary/30 bg-primary/10 py-1 pl-2.5 pr-1.5 text-xs font-medium text-primary">
+              <Filter className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+              <span className="min-w-0 truncate" title={filterChip}>
+                {filterChip}
+              </span>
+              {onClearFilter && (
+                <button
+                  type="button"
+                  onClick={onClearFilter}
+                  aria-label="Clear dashboard filter"
+                  className="shrink-0 rounded-full p-0.5 transition hover:bg-primary/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <X className="h-3.5 w-3.5" aria-hidden="true" />
+                </button>
+              )}
+            </span>
+          )}
         </div>
 
         <div className="relative w-full lg:w-72">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+          <Search
+            className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground"
+            aria-hidden="true"
+          />
           <input
+            aria-label="Search my tasks"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search my tasks…"
@@ -351,280 +581,352 @@ export function MyTasksPage({ onNewTask, dashboardFilter }: { onNewTask: () => v
 
       {/* Daily focus + productivity */}
       <div className="grid gap-4 md:grid-cols-[1fr_280px]">
-        <div className="rounded-xl border border-border bg-card p-4 shadow-[var(--shadow-soft)]">
-          <div className="flex items-center justify-between">
+        <div className="min-w-0 rounded-xl border border-border bg-card p-4 shadow-[var(--shadow-soft)]">
+          <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
-              <Sparkles className="h-4 w-4 text-primary" />
+              <Sparkles className="h-4 w-4 text-primary" aria-hidden="true" />
               <h3 className="text-sm font-semibold">Today's Focus</h3>
             </div>
-            <span className="text-[11px] text-muted-foreground">Pick 3 high-impact tasks</span>
+            <span className="text-[11px] text-muted-foreground">
+              Top 3 open by priority, then due date
+            </span>
           </div>
-          <div className="mt-3 grid gap-2 sm:grid-cols-3">
-            {focus.map((t) => (
-              <button
-                key={t.id}
-                onClick={() => setSelectedId(t.id)}
-                className="text-left rounded-lg border border-border bg-secondary/40 p-3 hover:border-ring/40 hover:bg-secondary transition"
-              >
-                <div className="flex items-center justify-between">
-                  <span className="text-[10px] text-muted-foreground">{t.project}</span>
-                  <span
-                    className={cn(
-                      "rounded px-1.5 py-0.5 text-[10px] font-semibold capitalize",
-                      priorityChip[t.priority],
-                    )}
-                  >
-                    {t.priority}
-                  </span>
-                </div>
-                <div className="mt-1.5 text-xs font-medium line-clamp-2">{t.title}</div>
-                <div className="mt-2 flex items-center gap-1 text-[10px] text-muted-foreground">
-                  <CalIcon className="h-3 w-3" /> {format(new Date(t.dueDate), "MMM d")}
-                </div>
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="rounded-xl border border-border bg-card p-4 shadow-[var(--shadow-soft)]">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-semibold">Productivity Score</h3>
-            <span className="text-[11px] text-muted-foreground">This week</span>
-          </div>
-          <div className="mt-4 flex items-center gap-4">
-            <ProductivityRing value={productivity} />
-            <div className="space-y-1 text-xs">
-              <div className="flex items-center gap-1.5">
-                <span className="h-1.5 w-1.5 rounded-full bg-status-done" /> {counts.completed}{" "}
-                completed
-              </div>
-              <div className="flex items-center gap-1.5">
-                <span className="h-1.5 w-1.5 rounded-full bg-status-progress" /> {counts.progress}{" "}
-                in progress
-              </div>
-              <div className="flex items-center gap-1.5">
-                <span className="h-1.5 w-1.5 rounded-full bg-destructive" /> {counts.overdue}{" "}
-                overdue
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* Main split: tasks + details */}
-      <div className={cn("grid gap-4", view !== "kanban" && "xl:grid-cols-[1fr_380px]")}>
-        <div className="min-w-0">
-          {view === "kanban" && (
-            <div className="grid gap-4 grid-cols-1 md:grid-cols-2 xl:grid-cols-4">
-              {columns.map((col) => {
-                const colTasks = filtered.filter((t) => bucket(t) === col.id);
-                return (
-                  <div
-                    key={col.id}
-                    onDragOver={(e) => e.preventDefault()}
-                    onDrop={() => drop(col.id)}
-                    className="rounded-xl border border-border bg-secondary/40 p-3 flex flex-col min-h-[260px]"
-                  >
-                    <div className="flex items-center justify-between px-1 pb-3">
-                      <div className="flex items-center gap-2">
-                        <span className={cn("h-2 w-2 rounded-full", col.dot)} />
-                        <span className="text-xs font-semibold uppercase tracking-wide">
-                          {col.label}
-                        </span>
-                        <span className="rounded-md bg-card border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                          {colTasks.length}
-                        </span>
-                      </div>
-                      <button
-                        onClick={onNewTask}
-                        className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
-                      >
-                        <Plus className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                    <div className="flex flex-col gap-2 flex-1">
-                      {colTasks.map((t) => (
-                        <MyTaskCard
-                          key={t.id}
-                          task={t}
-                          active={selectedId === t.id}
-                          completedPulse={justCompleted === t.id}
-                          onSelect={() => {
-                            setSelectedId(t.id);
-                            setDetailOpen(true);
-                          }}
-                          onDragStart={() => setDragId(t.id)}
-                          onStatus={(s) => setStatus(t.id, s)}
-                        />
-                      ))}
-                      {colTasks.length === 0 && (
-                        <div className="flex-1 rounded-lg border border-dashed border-border/70 flex items-center justify-center text-[11px] text-muted-foreground py-6">
-                          Drop tasks here
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-
-          {view === "list" && (
-            <div className="rounded-xl border border-border bg-card shadow-[var(--shadow-soft)] overflow-hidden">
-              <div className="grid grid-cols-[1.5rem_1fr_8rem_7rem_7rem_5rem] gap-3 px-4 py-2.5 text-[11px] uppercase tracking-wider text-muted-foreground border-b border-border bg-secondary/30">
-                <div></div>
-                <div>Task</div>
-                <div>Project</div>
-                <div>Priority</div>
-                <div>Due</div>
-                <div className="text-right">Progress</div>
-              </div>
-              {filtered.map((t) => {
-                const overdue = new Date(t.dueDate) < new Date() && t.status !== "done";
-                return (
-                  <button
-                    key={t.id}
-                    onClick={() => setSelectedId(t.id)}
-                    className={cn(
-                      "w-full text-left grid grid-cols-[1.5rem_1fr_8rem_7rem_7rem_5rem] gap-3 items-center px-4 py-3 border-b border-border last:border-0 hover:bg-accent/40 transition",
-                      selectedId === t.id && "bg-accent/50",
-                      justCompleted === t.id && "animate-pulse",
-                    )}
-                  >
-                    <span
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setStatus(t.id, t.status === "done" ? "todo" : "done");
-                      }}
-                      className={cn(
-                        "inline-flex h-5 w-5 items-center justify-center rounded-full border transition",
-                        t.status === "done"
-                          ? "bg-status-done border-status-done text-white"
-                          : "border-border hover:border-primary",
-                      )}
-                    >
-                      {t.status === "done" && <CheckCircle2 className="h-3.5 w-3.5" />}
+          {focus.length ? (
+            <div className="mt-3 grid gap-2 sm:grid-cols-3">
+              {focus.map((t) => (
+                <button
+                  key={t.id}
+                  type="button"
+                  onClick={() => openTask(t.id)}
+                  title={t.title}
+                  className="min-w-0 text-left rounded-lg border border-border bg-secondary/40 p-3 hover:border-ring/40 hover:bg-secondary transition"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="min-w-0 truncate text-[10px] text-muted-foreground">
+                      {t.project}
                     </span>
-                    <div className="min-w-0">
-                      <div
-                        className={cn(
-                          "text-sm font-medium truncate",
-                          t.status === "done" && "line-through text-muted-foreground",
-                        )}
-                      >
-                        {t.title}
-                      </div>
-                      <div className="text-[10px] text-muted-foreground">
-                        {t.id} · {t.tags?.join(" · ")}
-                      </div>
-                    </div>
-                    <div className="text-xs text-muted-foreground truncate">{t.project}</div>
                     <span
                       className={cn(
-                        "inline-flex w-fit rounded px-1.5 py-0.5 text-[10px] font-semibold capitalize",
+                        "shrink-0 whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-semibold capitalize",
                         priorityChip[t.priority],
                       )}
                     >
                       {t.priority}
                     </span>
-                    <div
-                      className={cn(
-                        "text-xs",
-                        overdue ? "text-destructive font-medium" : "text-muted-foreground",
-                      )}
-                    >
-                      {format(new Date(t.dueDate), "MMM d")}
-                    </div>
-                    <div className="flex items-center justify-end gap-2">
-                      <div className="h-1.5 w-16 rounded-full bg-muted overflow-hidden">
-                        <div className="h-full bg-primary" style={{ width: `${t.progress}%` }} />
-                      </div>
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          )}
-
-          {view === "priority" && (
-            <div className="space-y-4">
-              {(["critical", "high", "medium", "low"] as Priority[]).map((p) => {
-                const list = filtered.filter((t) => t.priority === p);
-                if (!list.length) return null;
-                return (
-                  <div
-                    key={p}
-                    className="rounded-xl border border-border bg-card p-3 shadow-[var(--shadow-soft)]"
-                  >
-                    <div className="flex items-center justify-between px-1 pb-2">
-                      <div className="flex items-center gap-2">
-                        <span
-                          className={cn(
-                            "rounded px-1.5 py-0.5 text-[10px] font-semibold capitalize",
-                            priorityChip[p],
-                          )}
-                        >
-                          {p}
-                        </span>
-                        <span className="text-xs text-muted-foreground">{list.length} tasks</span>
-                      </div>
-                    </div>
-                    <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-                      {list.map((t) => (
-                        <MyTaskCard
-                          key={t.id}
-                          task={t}
-                          active={selectedId === t.id}
-                          completedPulse={justCompleted === t.id}
-                          onSelect={() => setSelectedId(t.id)}
-                          onStatus={(s) => setStatus(t.id, s)}
-                          compact
-                        />
-                      ))}
-                    </div>
                   </div>
-                );
-              })}
+                  <div className="mt-1.5 text-xs font-medium line-clamp-2 [overflow-wrap:anywhere]">
+                    {t.title}
+                  </div>
+                  <div
+                    className={cn(
+                      "mt-2 flex items-center gap-1 whitespace-nowrap text-[10px] text-muted-foreground",
+                      isOverdue(t, today) && "text-destructive font-medium",
+                    )}
+                  >
+                    <CalIcon className="h-3 w-3" aria-hidden="true" />{" "}
+                    {format(new Date(t.dueDate), "MMM d")}
+                  </div>
+                </button>
+              ))}
             </div>
+          ) : (
+            <p className="mt-3 rounded-lg border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground">
+              {focusEmptyText}
+            </p>
           )}
         </div>
 
-        {/* Right detail panel — docked beside List/Priority, centered modal over Kanban */}
-        {view !== "kanban" && selected && (
-          <TaskDetailPanel
-            task={selected}
-            onClose={() => {
-              /* no-op on desktop */
-            }}
-            onStatus={(s) => setStatus(selected.id, s)}
-          />
-        )}
-        {view === "kanban" && (
-          <Dialog open={detailOpen} onOpenChange={setDetailOpen}>
-            <DialogContent className="max-h-[calc(100dvh-2rem)] w-[calc(100%-2rem)] max-w-2xl overflow-hidden gap-0 p-0">
-              {selected && (
-                <TaskDetailPanel
-                  bare
-                  task={selected}
-                  onClose={() => setDetailOpen(false)}
-                  onStatus={(s) => setStatus(selected.id, s)}
-                />
+        <div className="rounded-xl border border-border bg-card p-4 shadow-[var(--shadow-soft)]">
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="text-sm font-semibold">Productivity Score</h3>
+            <span
+              className="whitespace-nowrap text-[11px] text-muted-foreground"
+              title={`${format(new Date(`${week.start}T00:00:00`), "EEE MMM d")} – ${format(new Date(`${week.end}T00:00:00`), "EEE MMM d")}`}
+            >
+              This week
+            </span>
+          </div>
+          <div className="mt-4 flex items-center gap-4">
+            <ProductivityRing value={week.score} />
+            <div className="space-y-1 text-xs">
+              {week.scope ? (
+                <>
+                  <div className="flex items-center gap-1.5">
+                    <span className="h-1.5 w-1.5 rounded-full bg-status-done" aria-hidden="true" />{" "}
+                    {week.done} of {week.scope} done
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span
+                      className="h-1.5 w-1.5 rounded-full bg-status-progress"
+                      aria-hidden="true"
+                    />{" "}
+                    {week.stillDue} still due this week
+                  </div>
+                </>
+              ) : (
+                <div className="text-muted-foreground">Nothing due or completed this week.</div>
               )}
-            </DialogContent>
-          </Dialog>
+              <div className="flex items-center gap-1.5">
+                <span className="h-1.5 w-1.5 rounded-full bg-destructive" aria-hidden="true" />{" "}
+                {counts.overdue} overdue
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Tasks. Detail opens in the shared TaskDetailDrawer: a modal over the Kanban
+          board so columns don't reflow, a side sheet beside List/Priority. This page
+          had its own panel with a generated description, five fake subtasks and
+          demo activity, comments, files and time logs (FD-003, FD-004, FD-005). */}
+      <div className="min-w-0">
+        {view === "kanban" && (
+          <div className="grid gap-4 grid-cols-1 md:grid-cols-2 xl:grid-cols-4">
+            {columns.map((col) => {
+              const colTasks = filtered.filter((t) => t.status === col.id);
+              const label = statusLabel(col.id);
+              return (
+                <section
+                  key={col.id}
+                  aria-label={label}
+                  onDragOver={(e) => e.preventDefault()}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    drop(col.id);
+                  }}
+                  className="min-w-0 rounded-xl border border-border bg-secondary/40 p-3 flex flex-col min-h-[260px]"
+                >
+                  <div className="flex items-center justify-between px-1 pb-3">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <span
+                        className={cn("h-2 w-2 shrink-0 rounded-full", col.dot)}
+                        aria-hidden="true"
+                      />
+                      <span className="truncate text-xs font-semibold uppercase tracking-wide">
+                        {label}
+                      </span>
+                      <span className="rounded-md bg-card border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                        {colTasks.length}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={onNewTask}
+                      aria-label="New task"
+                      title="New task"
+                      className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+                    >
+                      <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+                    </button>
+                  </div>
+                  <div className="flex flex-col gap-2 flex-1">
+                    {colTasks.map((t) => (
+                      <MyTaskCard
+                        key={t.id}
+                        task={t}
+                        reference={taskRefs.get(t.id) ?? ""}
+                        today={today}
+                        active={selectedId === t.id}
+                        completedPulse={justCompleted === t.id}
+                        onSelect={() => openTask(t.id)}
+                        onDragStart={() => setDragId(t.id)}
+                        onStatus={(s) => setStatus(t.id, s)}
+                      />
+                    ))}
+                    {colTasks.length === 0 && (
+                      <div className="flex-1 rounded-lg border border-dashed border-border/70 flex items-center justify-center text-[11px] text-muted-foreground py-6">
+                        Drop tasks here
+                      </div>
+                    )}
+                  </div>
+                </section>
+              );
+            })}
+          </div>
+        )}
+
+        {view === "list" && (
+          <div className="rounded-xl border border-border bg-card shadow-[var(--shadow-soft)] overflow-hidden">
+            <div className="grid grid-cols-[1.5rem_1fr_8rem_7rem_7rem_5rem] gap-3 px-4 py-2.5 text-[11px] uppercase tracking-wider text-muted-foreground border-b border-border bg-secondary/30">
+              <div></div>
+              <div>Task</div>
+              <div>Project</div>
+              <div>Priority</div>
+              <div>Due</div>
+              <div className="text-right">Progress</div>
+            </div>
+            {filtered.map((t) => {
+              const done = t.status === "done";
+              const tags = t.tags ?? [];
+              return (
+                // A <div> row: the completion toggle is a real button now, and a
+                // button cannot sit inside another button (FD-054).
+                <div
+                  key={t.id}
+                  id={cardDomId(t.id)}
+                  onClick={() => openTask(t.id)}
+                  className={cn(
+                    "w-full cursor-pointer text-left grid grid-cols-[1.5rem_1fr_8rem_7rem_7rem_5rem] gap-3 items-center px-4 py-3 border-b border-border last:border-0 hover:bg-accent/40 transition",
+                    selectedId === t.id && "bg-accent/50",
+                    justCompleted === t.id && "animate-pulse",
+                  )}
+                >
+                  <button
+                    type="button"
+                    aria-label={done ? `Reopen “${t.title}”` : `Mark “${t.title}” complete`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setStatus(t.id, done ? "todo" : "done");
+                    }}
+                    className={cn(
+                      "inline-flex h-5 w-5 items-center justify-center rounded-full border transition",
+                      done
+                        ? "bg-status-done border-status-done text-white"
+                        : "border-border hover:border-primary",
+                    )}
+                  >
+                    {done && <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />}
+                  </button>
+                  <div className="min-w-0">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openTask(t.id);
+                      }}
+                      title={t.title}
+                      className={cn(
+                        "block w-full truncate text-left text-sm font-medium rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                        done && "line-through text-muted-foreground",
+                      )}
+                    >
+                      {t.title}
+                    </button>
+                    {/* Was the full uuid followed by " · " even with no tags. */}
+                    <div className="truncate text-[10px] text-muted-foreground">
+                      {taskRefs.get(t.id)}
+                      {tags.length > 0 && ` · ${tags.join(" · ")}`}
+                    </div>
+                  </div>
+                  <div className="text-xs text-muted-foreground truncate">{t.project}</div>
+                  <span
+                    className={cn(
+                      "inline-flex w-fit whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-semibold capitalize",
+                      priorityChip[t.priority],
+                    )}
+                  >
+                    {t.priority}
+                  </span>
+                  <div
+                    className={cn(
+                      "whitespace-nowrap text-xs",
+                      isOverdue(t, today)
+                        ? "text-destructive font-medium"
+                        : "text-muted-foreground",
+                    )}
+                  >
+                    {format(new Date(t.dueDate), "MMM d")}
+                  </div>
+                  <div className="flex items-center justify-end gap-2">
+                    <div
+                      className="h-1.5 w-16 rounded-full bg-muted overflow-hidden"
+                      role="progressbar"
+                      aria-label={`Progress of “${t.title}”`}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={t.progress}
+                    >
+                      <div className="h-full bg-primary" style={{ width: `${t.progress}%` }} />
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+            {filtered.length === 0 && (
+              <div className="px-4 py-8 text-center text-xs text-muted-foreground">
+                {items.length
+                  ? "No tasks match the current filters."
+                  : "Nothing is assigned to you yet."}
+              </div>
+            )}
+          </div>
+        )}
+
+        {view === "priority" && (
+          <div className="space-y-4">
+            {(["critical", "high", "medium", "low"] as Priority[]).map((p) => {
+              const list = filtered.filter((t) => t.priority === p);
+              if (!list.length) return null;
+              return (
+                <div
+                  key={p}
+                  className="rounded-xl border border-border bg-card p-3 shadow-[var(--shadow-soft)]"
+                >
+                  <div className="flex items-center justify-between px-1 pb-2">
+                    <div className="flex items-center gap-2">
+                      <span
+                        className={cn(
+                          "rounded px-1.5 py-0.5 text-[10px] font-semibold capitalize",
+                          priorityChip[p],
+                        )}
+                      >
+                        {p}
+                      </span>
+                      <span className="text-xs text-muted-foreground">{list.length} tasks</span>
+                    </div>
+                  </div>
+                  <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                    {list.map((t) => (
+                      <MyTaskCard
+                        key={t.id}
+                        task={t}
+                        reference={taskRefs.get(t.id) ?? ""}
+                        today={today}
+                        active={selectedId === t.id}
+                        completedPulse={justCompleted === t.id}
+                        onSelect={() => openTask(t.id)}
+                        onStatus={(s) => setStatus(t.id, s)}
+                        compact
+                      />
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+            {filtered.length === 0 && (
+              <div className="rounded-xl border border-dashed border-border px-4 py-8 text-center text-xs text-muted-foreground">
+                {items.length
+                  ? "No tasks match the current filters."
+                  : "Nothing is assigned to you yet."}
+              </div>
+            )}
+          </div>
         )}
       </div>
+
+      <TaskDetailDrawer
+        task={selected}
+        open={detailOpen && Boolean(selected)}
+        onOpenChange={setDetailOpen}
+        variant={view === "kanban" ? "modal" : "sheet"}
+      />
     </div>
   );
 }
 
-function ProductivityRing({ value }: { value: number }) {
+function ProductivityRing({ value }: { value: number | null }) {
   const r = 26;
   const c = 2 * Math.PI * r;
-  const off = c - (value / 100) * c;
+  const off = c - ((value ?? 0) / 100) * c;
   return (
-    <div className="relative h-20 w-20">
-      <svg viewBox="0 0 64 64" className="h-20 w-20 -rotate-90">
+    <div
+      className="relative h-20 w-20 shrink-0"
+      role="img"
+      aria-label={
+        value === null ? "No productivity score this week" : `Productivity score ${value}%`
+      }
+    >
+      <svg viewBox="0 0 64 64" className="h-20 w-20 -rotate-90" aria-hidden="true">
         <circle cx="32" cy="32" r={r} stroke="var(--muted)" strokeWidth="6" fill="none" />
         <circle
           cx="32"
@@ -639,8 +941,11 @@ function ProductivityRing({ value }: { value: number }) {
           className="transition-all duration-700"
         />
       </svg>
-      <div className="absolute inset-0 flex items-center justify-center text-sm font-semibold tabular-nums">
-        {value}%
+      <div
+        className="absolute inset-0 flex items-center justify-center text-sm font-semibold tabular-nums"
+        aria-hidden="true"
+      >
+        {value === null ? "—" : `${value}%`}
       </div>
     </div>
   );
@@ -648,6 +953,8 @@ function ProductivityRing({ value }: { value: number }) {
 
 function MyTaskCard({
   task,
+  reference,
+  today,
   active,
   compact,
   completedPulse,
@@ -655,7 +962,9 @@ function MyTaskCard({
   onDragStart,
   onStatus,
 }: {
-  task: Task;
+  task: WorkspaceTask;
+  reference: string;
+  today: string;
   active?: boolean;
   compact?: boolean;
   completedPulse?: boolean;
@@ -663,27 +972,36 @@ function MyTaskCard({
   onDragStart?: () => void;
   onStatus: (s: Status) => void;
 }) {
-  const overdue = new Date(task.dueDate) < new Date() && task.status !== "done";
-  const checklistDone = Math.round(task.progress / 20);
-  const checklistTotal = 5;
+  const { statusLabel } = useTaskSettings();
+  const overdue = isOverdue(task, today);
+  // Real subtasks. This was progress / 20 out of a fixed 5, so a task with no
+  // subtasks at 100% read "5/5" (FD-023).
+  const subtasksDone = task.subtasks.filter((s) => s.completed).length;
+  const tags = task.tags ?? [];
   return (
     <div
+      id={cardDomId(task.id)}
       draggable={!!onDragStart}
-      onDragStart={onDragStart}
+      onDragStart={(e) => {
+        // Firefox starts no drag without data on the transfer.
+        e.dataTransfer.setData("text/plain", task.id);
+        e.dataTransfer.effectAllowed = "move";
+        onDragStart?.();
+      }}
       onClick={onSelect}
       className={cn(
-        "group cursor-pointer rounded-lg border bg-card p-3 shadow-[var(--shadow-soft)] hover:shadow-[var(--shadow-card)] hover:-translate-y-0.5 transition-all",
+        "group min-w-0 cursor-pointer rounded-lg border bg-card p-3 shadow-[var(--shadow-soft)] hover:shadow-[var(--shadow-card)] hover:-translate-y-0.5 transition-all",
         active ? "border-primary/60 ring-2 ring-primary/15" : "border-border",
         completedPulse && "animate-pulse",
       )}
     >
       <div className="flex items-center justify-between gap-2">
-        <span className="text-[10px] font-medium text-muted-foreground">
-          {taskRef(task.id)} · {task.project}
+        <span className="min-w-0 truncate text-[10px] font-medium text-muted-foreground">
+          {reference} · {task.project}
         </span>
         <span
           className={cn(
-            "rounded px-1.5 py-0.5 text-[10px] font-semibold capitalize",
+            "shrink-0 whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-semibold capitalize",
             priorityChip[task.priority],
           )}
         >
@@ -696,11 +1014,24 @@ function MyTaskCard({
           task.status === "done" && "line-through text-muted-foreground",
         )}
       >
-        {task.title}
+        {/* The title is the keyboard way in (FD-054). Clamped to three lines with
+            the full text on hover; a 280-character title made a ~170px block (FD-047). */}
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onSelect();
+          }}
+          title={task.title}
+          className="block w-full rounded-sm text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <span className="line-clamp-3 [overflow-wrap:anywhere]">{task.title}</span>
+        </button>
       </h4>
       {!compact && (
-        <p className="mt-1 text-[11px] text-muted-foreground line-clamp-2">
-          Owned by {task.assignee.name}. Tagged {task.tags?.join(", ") ?? "general"}.
+        // Was "Tagged ." on untagged tasks (FD-044).
+        <p className="mt-1 text-[11px] text-muted-foreground line-clamp-2 [overflow-wrap:anywhere]">
+          Owned by {task.assignee.name}.{tags.length > 0 && ` Tagged ${tags.join(", ")}.`}
         </p>
       )}
 
@@ -709,7 +1040,7 @@ function MyTaskCard({
           <span>Progress</span>
           <span className="font-medium text-foreground">{task.progress}%</span>
         </div>
-        <div className="h-1 rounded-full bg-muted overflow-hidden">
+        <div className="h-1 rounded-full bg-muted overflow-hidden" aria-hidden="true">
           <div
             className="h-full rounded-full bg-primary transition-all"
             style={{ width: `${task.progress}%` }}
@@ -718,344 +1049,80 @@ function MyTaskCard({
       </div>
 
       <div className="mt-3 flex items-center justify-between gap-2">
-        <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+        <div className="flex min-w-0 items-center gap-2 text-[10px] text-muted-foreground">
           <span
             className={cn(
-              "inline-flex items-center gap-0.5",
+              "inline-flex items-center gap-0.5 whitespace-nowrap",
               overdue && "text-destructive font-medium",
             )}
           >
-            <CalIcon className="h-3 w-3" /> {format(new Date(task.dueDate), "MMM d")}
+            <CalIcon className="h-3 w-3" aria-hidden="true" />
+            <span className="sr-only">{overdue ? "Overdue, due" : "Due"} </span>
+            {format(new Date(task.dueDate), "MMM d")}
           </span>
-          <span className="inline-flex items-center gap-0.5">
-            <CheckCircle2 className="h-3 w-3" />
-            {checklistDone}/{checklistTotal}
-          </span>
-          <span className="inline-flex items-center gap-0.5">
-            <Timer className="h-3 w-3" />
-            {task.estimatedHours ?? 0}h
+          {task.subtasks.length > 0 && (
+            <span
+              className="inline-flex items-center gap-0.5 whitespace-nowrap"
+              title={`${subtasksDone} of ${task.subtasks.length} subtasks done`}
+            >
+              <CheckCircle2 className="h-3 w-3" aria-hidden="true" />
+              {subtasksDone}/{task.subtasks.length}
+              <span className="sr-only"> subtasks done</span>
+            </span>
+          )}
+          <span className="inline-flex items-center gap-0.5 whitespace-nowrap">
+            <Timer className="h-3 w-3" aria-hidden="true" />
+            {task.estimatedHours ?? 0}h<span className="sr-only"> estimated</span>
           </span>
         </div>
-        <div className="flex items-center gap-1.5 text-muted-foreground">
-          <span className="inline-flex items-center gap-0.5 text-[10px]">
-            <Paperclip className="h-3 w-3" />2
-          </span>
-          <span className="inline-flex items-center gap-0.5 text-[10px]">
-            <MessageSquare className="h-3 w-3" />4
-          </span>
+        {/* Real counts, hidden at zero. Both were hardcoded to 2 and 4 (FD-022). */}
+        <div className="flex shrink-0 items-center gap-1.5 text-muted-foreground">
+          {task.attachments.length > 0 && (
+            <span
+              className="inline-flex items-center gap-0.5 text-[10px]"
+              title={`${task.attachments.length} attachment${task.attachments.length === 1 ? "" : "s"}`}
+            >
+              <Paperclip className="h-3 w-3" aria-hidden="true" />
+              {task.attachments.length}
+              <span className="sr-only"> attachments</span>
+            </span>
+          )}
+          {task.comments > 0 && (
+            <span
+              className="inline-flex items-center gap-0.5 text-[10px]"
+              title={`${task.comments} comment${task.comments === 1 ? "" : "s"}`}
+            >
+              <MessageSquare className="h-3 w-3" aria-hidden="true" />
+              {task.comments}
+              <span className="sr-only"> comments</span>
+            </span>
+          )}
           <div
             className="flex h-5 w-5 items-center justify-center rounded-full text-[9px] font-semibold text-white ring-2 ring-card"
             style={{ background: task.assignee.color }}
             title={task.assignee.name}
+            role="img"
+            aria-label={`Assigned to ${task.assignee.name}`}
           >
-            {task.assignee.initials}
+            <span aria-hidden="true">{task.assignee.initials}</span>
           </div>
         </div>
       </div>
 
       <div className="mt-2.5 flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
         <select
+          aria-label={`Status of “${task.title}”`}
           value={task.status}
           onChange={(e) => onStatus(e.target.value as Status)}
           className="text-[10px] rounded border border-border bg-background px-1.5 py-0.5 outline-none focus:border-ring"
         >
-          <option value="todo">To Do</option>
-          <option value="progress">In Progress</option>
-          <option value="review">Waiting Approval</option>
-          <option value="done">Completed</option>
+          {statusValues.map((value) => (
+            <option key={value} value={value}>
+              {statusLabel(value)}
+            </option>
+          ))}
         </select>
       </div>
-    </div>
-  );
-}
-
-function TaskDetailPanel({
-  task,
-  onStatus,
-  bare,
-}: {
-  task: Task;
-  onClose: () => void;
-  onStatus: (s: Status) => void;
-  /** bare removes the docked/sticky frame so the panel can sit inside a modal. */
-  bare?: boolean;
-}) {
-  const { tasks: items } = useWorkspace();
-  const [subs, setSubs] = useState(subtasksByTask.default);
-  const [draft, setDraft] = useState("");
-  const [localComments, setLocalComments] = useState(comments);
-
-  const toggle = (id: string) =>
-    setSubs((prev) => prev.map((s) => (s.id === id ? { ...s, done: !s.done } : s)));
-
-  const send = () => {
-    if (!draft.trim()) return;
-    setLocalComments((prev) => [
-      ...prev,
-      {
-        id: `c${prev.length + 1}`,
-        who: "Alex Morgan",
-        initials: "AM",
-        color: "oklch(0.7 0.15 265)",
-        text: draft,
-        when: "now",
-      },
-    ]);
-    setDraft("");
-  };
-
-  return (
-    <aside
-      className={cn(
-        "rounded-xl border border-border bg-card shadow-[var(--shadow-soft)]",
-        !bare && "xl:sticky xl:top-20 xl:max-h-[calc(100vh-6rem)] xl:overflow-y-auto",
-        bare && "max-h-[calc(100dvh-2rem)] overflow-y-auto border-0 shadow-none",
-      )}
-    >
-      <div className={cn("flex items-center justify-between px-4 py-3 border-b border-border", bare && "pr-16")}>
-        <div className="min-w-0">
-          <div className="text-[10px] text-muted-foreground">
-            {taskRef(task.id)} · {task.project}
-          </div>
-          <h3 className="text-sm font-semibold truncate">{task.title}</h3>
-        </div>
-        <span
-          className={cn(
-            "rounded px-1.5 py-0.5 text-[10px] font-semibold capitalize",
-            priorityChip[task.priority],
-          )}
-        >
-          {task.priority}
-        </span>
-      </div>
-
-      <div className="p-4 space-y-5">
-        {/* Status quick actions */}
-        <div className="flex flex-wrap gap-1.5">
-          {[
-            { id: "todo", label: "To Do" },
-            { id: "progress", label: "In Progress" },
-            { id: "review", label: "Waiting" },
-            { id: "done", label: "Complete" },
-          ].map((s) => (
-            <button
-              key={s.id}
-              onClick={() => onStatus(s.id as Status)}
-              className={cn(
-                "rounded-md border px-2 py-1 text-[11px] transition",
-                task.status === s.id
-                  ? "bg-primary text-primary-foreground border-primary"
-                  : "border-border text-muted-foreground hover:text-foreground hover:bg-accent",
-              )}
-            >
-              {s.label}
-            </button>
-          ))}
-        </div>
-
-        <div>
-          <div className="text-[11px] uppercase tracking-wider text-muted-foreground mb-1.5">
-            Description
-          </div>
-          <p className="text-sm leading-relaxed text-foreground/90">
-            We're refining {task.title.toLowerCase()} for the {task.project} workstream. Focus on
-            accessibility, consistency with the design system, and motion polish. Pair with QA
-            before shipping.
-          </p>
-        </div>
-
-        <div className="grid grid-cols-2 gap-3 text-xs">
-          <Meta label="Due" value={format(new Date(task.dueDate), "MMM d, yyyy")} />
-          <Meta label="Estimate" value={`${task.estimatedHours ?? 0}h`} />
-          <Meta label="Assignee" value={task.assignee.name} />
-          <Meta label="Recurring" value={("recurrenceSummary" in task && typeof task.recurrenceSummary === "string") ? task.recurrenceSummary : "No"} />
-        </div>
-
-        {/* Subtasks */}
-        <Section title="Subtasks" icon={<CheckCircle2 className="h-3.5 w-3.5" />}>
-          <ul className="space-y-1.5">
-            {subs.map((s) => (
-              <li key={s.id} className="flex items-center gap-2">
-                <button
-                  onClick={() => toggle(s.id)}
-                  className={cn(
-                    "inline-flex h-4 w-4 items-center justify-center rounded border transition",
-                    s.done
-                      ? "bg-status-done border-status-done text-white"
-                      : "border-border hover:border-primary",
-                  )}
-                >
-                  {s.done && <CheckCircle2 className="h-3 w-3" />}
-                </button>
-                <span className={cn("text-sm", s.done && "line-through text-muted-foreground")}>
-                  {s.label}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </Section>
-
-        {/* Activity */}
-        <Section title="Activity" icon={<Activity className="h-3.5 w-3.5" />}>
-          <ol className="relative border-l border-border ml-1.5 pl-4 space-y-3">
-            {activity.map((a) => (
-              <li key={a.id} className="relative">
-                <span className="absolute -left-[1.4rem] top-1 h-2 w-2 rounded-full bg-primary/70 ring-2 ring-card" />
-                <p className="text-xs">
-                  <span className="font-medium">{a.who}</span>{" "}
-                  <span className="text-muted-foreground">{a.what}</span>
-                </p>
-                <p className="text-[10px] text-muted-foreground">{a.when}</p>
-              </li>
-            ))}
-          </ol>
-        </Section>
-
-        {/* Comments */}
-        <Section title="Comments" icon={<MessageSquare className="h-3.5 w-3.5" />}>
-          <div className="space-y-2.5">
-            {localComments.map((c) => (
-              <div key={c.id} className="flex gap-2">
-                <div
-                  className="h-6 w-6 shrink-0 rounded-full text-[10px] font-semibold text-white flex items-center justify-center"
-                  style={{ background: c.color }}
-                >
-                  {c.initials}
-                </div>
-                <div className="flex-1 rounded-lg border border-border bg-secondary/40 px-2.5 py-1.5">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[11px] font-medium">{c.who}</span>
-                    <span className="text-[10px] text-muted-foreground">{c.when}</span>
-                  </div>
-                  <p className="text-xs mt-0.5">{c.text}</p>
-                </div>
-              </div>
-            ))}
-            <div className="flex items-center gap-2">
-              <input
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && send()}
-                placeholder="Write a comment…"
-                className="h-8 flex-1 rounded-md border border-input bg-background px-2 text-xs outline-none focus:border-ring focus:ring-2 focus:ring-ring/20"
-              />
-              <button
-                onClick={send}
-                className="inline-flex h-8 w-8 items-center justify-center rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition"
-              >
-                <Send className="h-3.5 w-3.5" />
-              </button>
-            </div>
-          </div>
-        </Section>
-
-        {/* Attachments */}
-        <Section title="Attachments" icon={<Paperclip className="h-3.5 w-3.5" />}>
-          <div className="grid gap-1.5">
-            {["spec-v3.pdf", "wireframes.fig", "research.csv"].map((f) => (
-              <div
-                key={f}
-                className="flex items-center justify-between rounded-md border border-border bg-secondary/30 px-2.5 py-1.5"
-              >
-                <div className="flex items-center gap-2 text-xs">
-                  <Paperclip className="h-3 w-3 text-muted-foreground" />
-                  {f}
-                </div>
-                <span className="text-[10px] text-muted-foreground">
-                  2.{Math.floor(Math.random() * 9)}MB
-                </span>
-              </div>
-            ))}
-          </div>
-        </Section>
-
-        {/* Time logs */}
-        <Section title="Time Logs" icon={<Clock className="h-3.5 w-3.5" />}>
-          <div className="space-y-1.5 text-xs">
-            {[
-              { who: "Alex Morgan", h: "1h 45m", when: "Today" },
-              { who: "Priya Shah", h: "3h 10m", when: "Yesterday" },
-              { who: "Sam Chen", h: "45m", when: "2 days ago" },
-            ].map((l, i) => (
-              <div
-                key={i}
-                className="flex items-center justify-between rounded-md bg-secondary/30 px-2.5 py-1.5"
-              >
-                <span>{l.who}</span>
-                <span className="text-muted-foreground">
-                  {l.h} · {l.when}
-                </span>
-              </div>
-            ))}
-          </div>
-        </Section>
-
-        {/* History */}
-        <Section title="Task History" icon={<History className="h-3.5 w-3.5" />}>
-          <div className="space-y-1 text-[11px] text-muted-foreground">
-            <div>Created {formatDistanceToNow(new Date(Date.now() - 1000 * 60 * 60 * 72))} ago</div>
-            <div>Last updated 2h ago</div>
-            <div>Priority changed Medium → {task.priority} · Yesterday</div>
-          </div>
-        </Section>
-
-        {/* Related */}
-        <Section title="Related Tasks" icon={<Link2 className="h-3.5 w-3.5" />}>
-          <div className="space-y-1.5">
-            {items
-              .filter((t) => t.project === task.project && t.id !== task.id)
-              .slice(0, 3)
-              .map((t) => (
-                <div
-                  key={t.id}
-                  className="flex items-center justify-between rounded-md border border-border bg-secondary/30 px-2.5 py-1.5"
-                >
-                  <div className="text-xs truncate">
-                    <GitBranch className="inline h-3 w-3 mr-1 text-muted-foreground" />
-                    {t.title}
-                  </div>
-                  <span
-                    className={cn(
-                      "rounded px-1 py-0.5 text-[10px] font-semibold capitalize",
-                      priorityChip[t.priority],
-                    )}
-                  >
-                    {t.priority}
-                  </span>
-                </div>
-              ))}
-          </div>
-        </Section>
-      </div>
-    </aside>
-  );
-}
-
-function Meta({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-lg border border-border bg-secondary/30 px-2.5 py-1.5">
-      <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</div>
-      <div className="text-xs font-medium truncate">{value}</div>
-    </div>
-  );
-}
-
-function Section({
-  title,
-  icon,
-  children,
-}: {
-  title: string;
-  icon: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <div>
-      <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-muted-foreground mb-2">
-        {icon}
-        {title}
-      </div>
-      {children}
     </div>
   );
 }

@@ -1,4 +1,4 @@
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, redirect, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState, type FormEvent } from "react";
 import {
   ArrowLeft,
@@ -17,8 +17,40 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
+import { hasLiveSession } from "@/components/workspace/account/session";
+
+type AuthSearch = { redirect?: string };
+
+/**
+ * The page to return to after sign-in: a path on this site only. Anything else
+ * ("https://...", "//host", "/auth" itself) is dropped, so the parameter cannot
+ * be used to send someone off-site.
+ */
+function safeRedirect(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value.startsWith("/")) return undefined;
+  if (value.startsWith("//") || value.startsWith("/\\")) return undefined;
+  if (/^\/auth(?:[/?#]|$)/.test(value)) return undefined;
+  return value;
+}
+
+/** A password-recovery link signs the user in; they still have to set the new password here. */
+const isRecoveryLink = () =>
+  typeof window !== "undefined" && window.location.hash.includes("type=recovery");
 
 export const Route = createFileRoute("/auth")({
+  // Rendered in the browser so the session check below runs on every visit,
+  // including a reload or a typed URL; on the server there is no session to see.
+  ssr: false,
+  validateSearch: (search: Record<string, unknown>): AuthSearch => {
+    const target = safeRedirect(search.redirect);
+    return target ? { redirect: target } : {};
+  },
+  // Browser Back from the workspace used to land on this form with the session
+  // still active (FD-039). Someone already signed in goes straight back in.
+  beforeLoad: async ({ search }) => {
+    if (isRecoveryLink()) return;
+    if (await hasLiveSession()) throw redirect({ href: search.redirect ?? "/", replace: true });
+  },
   head: () => ({
     meta: [
       { title: "Sign in — Flowdesk Operations Suite" },
@@ -44,6 +76,7 @@ const RESEND_SECONDS = 60;
 
 function AuthPage() {
   const navigate = useNavigate();
+  const { redirect: returnTo } = Route.useSearch();
   const [step, setStep] = useState<AuthStep>("sign-in");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -90,7 +123,9 @@ function AuthPage() {
         .select("id", { count: "exact", head: true })
         .eq("user_id", data.user.id)
         .eq("status", "active");
-      await navigate({ to: count ? "/" : "/no-organization" });
+      // replace, so Back from the workspace does not return to this form (FD-039).
+      if (count) await navigate({ href: returnTo ?? "/", replace: true });
+      else await navigate({ to: "/no-organization", replace: true });
     });
   };
 

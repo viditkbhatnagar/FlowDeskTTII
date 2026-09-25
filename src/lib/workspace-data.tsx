@@ -128,7 +128,8 @@ function mapRow(row: TaskRow, personFor: (id: string | null | undefined) => Pers
     startDate: row.start_date ? `${row.start_date}T00:00:00` : row.created_at,
     hasStartDate: Boolean(row.start_date),
     progress: row.progress,
-    estimatedHours: row.estimated_hours ?? 0,
+    // No estimate stays "no estimate"; turning it into 0 showed "0h" on cards.
+    estimatedHours: row.estimated_hours ?? undefined,
     tags: row.tags ?? [],
     subtasks: [...(row.task_subtasks ?? [])]
       .sort((a, b) => a.sort_order - b.sort_order)
@@ -236,7 +237,19 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       .limit(1)
       .maybeSingle();
     if (!membership) return { ok: false, error: "You are not a member of an active organization." };
-    const organizationId = membership.organization_id;
+
+    // A task belongs to its project's organization. Using the creator's primary
+    // organization would file a task for another organization's project in the
+    // wrong place (RLS would then hide it from that project's members).
+    let organizationId = membership.organization_id;
+    if (input.projectId) {
+      const { data: owner } = await supabase
+        .from("work_projects")
+        .select("organization_id")
+        .eq("id", input.projectId)
+        .maybeSingle();
+      if (owner) organizationId = owner.organization_id;
+    }
 
     const projectId =
       input.projectId ??
@@ -352,6 +365,13 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     if (!before) return false;
 
     const next: WorkspaceTask = { ...before, ...updates };
+    // Clearing the start date falls back to the creation time, as on load.
+    if (updates.startDate !== undefined && !updates.startDate) {
+      next.startDate = before.createdAt;
+      next.hasStartDate = false;
+    } else if (updates.startDate) {
+      next.hasStartDate = true;
+    }
     if (updates.assigneeId !== undefined) {
       const person = personFor(updates.assigneeId);
       next.assignee = { name: person.name, initials: person.initials, color: person.color };
@@ -370,7 +390,12 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     if (updates.reviewerId !== undefined) payload.reviewer_id = updates.reviewerId;
     if (updates.blocked !== undefined) payload.blocked = updates.blocked;
     if (updates.blockedReason !== undefined) payload.blocked_reason = updates.blockedReason || null;
-    if (updates.dueDate !== undefined) payload.due_date = updates.dueDate.slice(0, 10);
+    if (updates.dueDate !== undefined) {
+      payload.due_date = updates.dueDate.slice(0, 10);
+      // The table allows only one of due_at / due_date. Rows that carry due_at
+      // (the seeded ones do) refused every due-date edit until it was cleared.
+      payload.due_at = null;
+    }
     if (updates.startDate !== undefined) payload.start_date = updates.startDate ? updates.startDate.slice(0, 10) : null;
     if (updates.estimatedHours !== undefined) payload.estimated_hours = updates.estimatedHours;
     if (updates.tags !== undefined) payload.tags = updates.tags;

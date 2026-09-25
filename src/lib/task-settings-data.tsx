@@ -241,6 +241,10 @@ export function TaskSettingsProvider({ children }: { children: ReactNode }) {
       setTaskStatuses(
         loaded.statuses.map((row) => ({
           id: row.id,
+          // The built-in column this status maps to. Missing before, so
+          // defaultTaskStatus?.key was always undefined once settings loaded and
+          // "Set as default" had no effect on the New Task form.
+          key: row.value === "cancelled" ? undefined : (row.value as TaskStatusConfig["key"]),
           name: row.label,
           // The enum value is the type; a status cannot exist outside it.
           type: (row.value === "todo" ? "open"

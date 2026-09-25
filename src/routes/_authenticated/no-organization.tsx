@@ -1,7 +1,7 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { Building2, LogOut, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { supabase } from "@/integrations/supabase/client";
+import { signOutEverywhere } from "@/components/workspace/account/session";
 
 export const Route = createFileRoute("/_authenticated/no-organization")({
   head: () => ({
@@ -20,7 +20,8 @@ export const Route = createFileRoute("/_authenticated/no-organization")({
 function NoOrganizationPage() {
   const navigate = useNavigate();
   const signOut = async () => {
-    await supabase.auth.signOut();
+    // Revoked on the server as well, like Log out in the workspace (FD-069).
+    await signOutEverywhere();
     await navigate({ to: "/auth", replace: true });
   };
 
@@ -38,7 +39,7 @@ function NoOrganizationPage() {
           Your account is active, but it has not been assigned to an organization. Contact your organization administrator for access.
         </p>
         <Button variant="outline" className="mt-8" onClick={signOut}>
-          <LogOut /> Sign out
+          <LogOut aria-hidden="true" /> Sign out
         </Button>
       </div>
     </main>

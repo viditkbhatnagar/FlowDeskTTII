@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import {
   Plus, MoreHorizontal, Pencil, Ban, CheckCircle2, GripVertical, Lock, Circle, Tag as TagIcon,
+  ArrowUp, ArrowDown,
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -11,10 +12,9 @@ import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useOrganizations } from "@/lib/organizations-data";
-import { projects as demoProjects } from "@/lib/mock-data";
 import {
-  useTaskSettings, taskStatusTypeOptions, projectCategoryRotation,
-  type ConfigStatus, type ProjectCategory, type TaskStatusConfig, type TaskStatusType, type TagConfig,
+  useTaskSettings, taskStatusTypeOptions,
+  type ConfigStatus, type ProjectCategory, type TaskStatusConfig, type TagConfig,
 } from "@/lib/task-settings-data";
 
 const inputClass =
@@ -68,6 +68,7 @@ export function TaskProjectSettingsPage() {
           <button
             key={item.id}
             onClick={() => setTab(item.id)}
+            aria-pressed={tab === item.id}
             className={cn(
               "rounded-md px-3 py-1.5 text-xs font-medium transition",
               tab === item.id
@@ -92,20 +93,21 @@ export function TaskProjectSettingsPage() {
 /* ---------------------------------- Task Status ---------------------------------- */
 
 function TaskStatusTab() {
-  const {
-    taskStatuses, reorderTaskStatuses, setTaskStatusActive, setDefaultTaskStatus,
-    setCompletedTaskStatus,
-  } = useTaskSettings();
-  const [drawer, setDrawer] = useState<TaskStatusConfig | "new" | null>(null);
+  const { taskStatuses, reorderTaskStatuses, setTaskStatusActive, setDefaultTaskStatus } = useTaskSettings();
+  const [drawer, setDrawer] = useState<TaskStatusConfig | null>(null);
   const [dragId, setDragId] = useState<string | null>(null);
+  const noteId = useId();
 
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="text-xs text-muted-foreground">
-          Drag to reorder. One status is the default for new tasks and one marks work as complete.
+        <p id={noteId} className="max-w-2xl text-xs text-muted-foreground">
+          Drag to reorder, or use Move up / Move down in a row's menu. Statuses are a fixed workflow that
+          every task is saved against, so you can rename, reorder and deactivate them, but not add new ones.
         </p>
-        <button className={primaryBtn} onClick={() => setDrawer("new")}>
+        {/* "Add Status" used to create a status only this screen could see: tasks
+            are stored against a fixed set of statuses, so nothing else offered it (FD-018). */}
+        <button className={primaryBtn} disabled aria-describedby={noteId}>
           <Plus className="h-4 w-4" /> Add Status
         </button>
       </div>
@@ -124,7 +126,7 @@ function TaskStatusTab() {
               </tr>
             </thead>
             <tbody>
-              {taskStatuses.map((status) => (
+              {taskStatuses.map((status, index) => (
                 <tr
                   key={status.id}
                   draggable
@@ -150,7 +152,7 @@ function TaskStatusTab() {
                           Default
                         </span>
                       )}
-                      {status.isCompletedState && (
+                      {status.type === "completed" && (
                         <span className="rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
                           Completed state
                         </span>
@@ -166,12 +168,28 @@ function TaskStatusTab() {
                   </td>
                   <td className={cn(tdClass, "text-right")}>
                     <DropdownMenu>
-                      <DropdownMenuTrigger className="rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground">
+                      <DropdownMenuTrigger
+                        aria-label={`Actions for ${status.name}`}
+                        className="rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground"
+                      >
                         <MoreHorizontal className="h-4 w-4" />
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end" className="w-52">
                         <DropdownMenuItem onClick={() => setDrawer(status)}>
                           <Pencil className="mr-2 h-3.5 w-3.5" /> Edit
+                        </DropdownMenuItem>
+                        {/* Keyboard alternative to dragging. */}
+                        <DropdownMenuItem
+                          disabled={index === 0}
+                          onClick={() => reorderTaskStatuses(status.id, taskStatuses[index - 1].id)}
+                        >
+                          <ArrowUp className="mr-2 h-3.5 w-3.5" /> Move up
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          disabled={index === taskStatuses.length - 1}
+                          onClick={() => reorderTaskStatuses(status.id, taskStatuses[index + 1].id)}
+                        >
+                          <ArrowDown className="mr-2 h-3.5 w-3.5" /> Move down
                         </DropdownMenuItem>
                         <DropdownMenuItem
                           disabled={status.isDefault}
@@ -182,18 +200,11 @@ function TaskStatusTab() {
                         >
                           <Circle className="mr-2 h-3.5 w-3.5" /> Set as default
                         </DropdownMenuItem>
-                        <DropdownMenuItem
-                          disabled={status.isCompletedState}
-                          onClick={() => {
-                            setCompletedTaskStatus(status.id);
-                            toast.success(`${status.name} now marks tasks complete.`);
-                          }}
-                        >
-                          <CheckCircle2 className="mr-2 h-3.5 w-3.5" /> Set as completed state
-                        </DropdownMenuItem>
+                        {/* "Set as completed state" is gone: a task is complete when it
+                            is in the Completed step of the workflow, whatever it is called. */}
                         {status.status === "active" ? (
                           <DropdownMenuItem
-                            disabled={status.isDefault || status.isCompletedState}
+                            disabled={status.isDefault || status.type === "completed"}
                             onClick={() => {
                               setTaskStatusActive(status.id, "inactive");
                               toast.success(`${status.name} deactivated. Existing tasks keep this status.`);
@@ -229,36 +240,36 @@ function TaskStatusDrawer({
   target,
   onClose,
 }: {
-  target: TaskStatusConfig | "new" | null;
+  target: TaskStatusConfig | null;
   onClose: () => void;
 }) {
-  const { addTaskStatus, updateTaskStatus, isTaskStatusNameTaken } = useTaskSettings();
-  const editing = target && target !== "new" ? target : null;
+  const { updateTaskStatus, isTaskStatusNameTaken } = useTaskSettings();
+  const editing = target;
+  const fieldId = useId();
   const [name, setName] = useState("");
-  const [type, setType] = useState<TaskStatusType>("open");
   const [status, setStatus] = useState<ConfigStatus>("active");
   const [error, setError] = useState<string | null>(null);
   const [key, setKey] = useState(0);
 
-  const targetKey = editing?.id ?? (target === "new" ? "new" : "none");
+  const targetKey = editing?.id ?? "none";
   useEffect(() => {
     setName(editing?.name ?? "");
-    setType(editing?.type ?? "open");
     setStatus(editing?.status ?? "active");
     setError(null);
     setKey((k) => k + 1);
   }, [targetKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // The default and the completed step must stay available.
+  const locked = !!editing && (editing.isDefault || editing.type === "completed");
+
   const submit = () => {
+    if (!editing) return;
     if (!name.trim()) return setError("Status name is required.");
-    if (isTaskStatusNameTaken(name, editing?.id)) return setError("That status name already exists.");
-    if (editing) {
-      updateTaskStatus(editing.id, { name: name.trim(), type, status });
-      toast.success("Status updated.");
-    } else {
-      addTaskStatus({ name, type, status });
-      toast.success("Status added.");
-    }
+    if (isTaskStatusNameTaken(name, editing.id)) return setError("That status name already exists.");
+    // The type is not sent: it is the workflow step this status IS, and changing
+    // it here only relabelled a different step on this screen.
+    updateTaskStatus(editing.id, { name: name.trim(), status: locked ? "active" : status });
+    toast.success("Status updated.");
     onClose();
   };
 
@@ -266,33 +277,39 @@ function TaskStatusDrawer({
     <Sheet open={!!target} onOpenChange={(open) => !open && onClose()}>
       <SheetContent className="w-full sm:max-w-md overflow-y-auto" key={key}>
         <SheetHeader>
-          <SheetTitle>{editing ? "Edit Status" : "Add Status"}</SheetTitle>
+          <SheetTitle>Edit Status</SheetTitle>
           <SheetDescription>Statuses appear as columns and filters across task views.</SheetDescription>
         </SheetHeader>
         <div className="space-y-4 p-4">
           <div className="space-y-1.5">
-            <div className={labelClass}>Status Name*</div>
-            <input className={inputClass} value={name} onChange={(e) => setName(e.target.value)} />
+            <label htmlFor={`${fieldId}-name`} className={labelClass}>Status Name*</label>
+            <input
+              id={`${fieldId}-name`}
+              className={inputClass}
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+            />
           </div>
           <div className="space-y-1.5">
-            <div className={labelClass}>Type</div>
-            <select
-              className={inputClass}
-              value={type}
-              onChange={(e) => setType(e.target.value as TaskStatusType)}
-            >
+            <label htmlFor={`${fieldId}-type`} className={labelClass}>Workflow Step</label>
+            <select id={`${fieldId}-type`} className={inputClass} value={editing?.type ?? "open"} disabled>
               {taskStatusTypeOptions.map((option) => (
                 <option key={option.value} value={option.value}>
                   {option.label}
                 </option>
               ))}
             </select>
+            <p className="flex items-center gap-1 text-[11px] text-muted-foreground">
+              <Lock className="h-3 w-3" /> Fixed. Tasks are saved against this step, so only its name changes.
+            </p>
           </div>
           <div className="space-y-1.5">
-            <div className={labelClass}>Status</div>
+            <label htmlFor={`${fieldId}-status`} className={labelClass}>Status</label>
             <select
+              id={`${fieldId}-status`}
               className={inputClass}
-              value={status}
+              value={locked ? "active" : status}
+              disabled={locked}
               onChange={(e) => setStatus(e.target.value as ConfigStatus)}
             >
               <option value="active">Active</option>
@@ -305,7 +322,7 @@ function TaskStatusDrawer({
               Cancel
             </button>
             <button className={primaryBtn} onClick={submit}>
-              {editing ? "Save Changes" : "Add Status"}
+              Save Changes
             </button>
           </div>
         </div>
@@ -371,17 +388,23 @@ function PriorityTab() {
 
 function CategoryTab() {
   const { projectCategories, setCategoryStatus } = useTaskSettings();
-  const { organizations } = useOrganizations();
+  const { organizations, projects, reloadProjects } = useOrganizations();
   const [drawer, setDrawer] = useState<ProjectCategory | "new" | null>(null);
 
+  useEffect(() => {
+    void reloadProjects();
+  }, [reloadProjects]);
+
+  // Real projects per category. Was the demo project list spread round-robin
+  // over five category names, so every count was invented.
   const activeProjects = useMemo(() => {
     const counts = new Map<string, number>();
-    demoProjects.forEach((_, index) => {
-      const name = projectCategoryRotation[index % projectCategoryRotation.length];
-      counts.set(name, (counts.get(name) ?? 0) + 1);
-    });
+    for (const project of projects) {
+      if (!project.active || !project.categoryId) continue;
+      counts.set(project.categoryId, (counts.get(project.categoryId) ?? 0) + 1);
+    }
     return counts;
-  }, []);
+  }, [projects]);
 
   const orgLabel = (category: ProjectCategory) =>
     category.scope === "global"
@@ -419,14 +442,17 @@ function CategoryTab() {
                   <td className={cn(tdClass, "font-medium")}>{category.name}</td>
                   <td className={cn(tdClass, "text-muted-foreground")}>{orgLabel(category)}</td>
                   <td className={cn(tdClass, "text-muted-foreground")}>
-                    {activeProjects.get(category.name) ?? 0}
+                    {activeProjects.get(category.id) ?? 0}
                   </td>
                   <td className={tdClass}>
                     <StatusPill status={category.status} />
                   </td>
                   <td className={cn(tdClass, "text-right")}>
                     <DropdownMenu>
-                      <DropdownMenuTrigger className="rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground">
+                      <DropdownMenuTrigger
+                        aria-label={`Actions for ${category.name}`}
+                        className="rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground"
+                      >
                         <MoreHorizontal className="h-4 w-4" />
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end" className="w-44">
@@ -471,6 +497,7 @@ function CategoryDrawer({
 }) {
   const { addCategory, updateCategory, isCategoryNameTaken } = useTaskSettings();
   const { organizations } = useOrganizations();
+  const fieldId = useId();
   const editing = target && target !== "new" ? target : null;
   const [name, setName] = useState("");
   const [scope, setScope] = useState<"global" | "selected">("global");
@@ -514,12 +541,13 @@ function CategoryDrawer({
         </SheetHeader>
         <div className="space-y-4 p-4">
           <div className="space-y-1.5">
-            <div className={labelClass}>Category Name*</div>
-            <input className={inputClass} value={name} onChange={(e) => setName(e.target.value)} />
+            <label htmlFor={`${fieldId}-name`} className={labelClass}>Category Name*</label>
+            <input id={`${fieldId}-name`} className={inputClass} value={name} onChange={(e) => setName(e.target.value)} />
           </div>
           <div className="space-y-1.5">
-            <div className={labelClass}>Available For</div>
+            <label htmlFor={`${fieldId}-scope`} className={labelClass}>Available For</label>
             <select
+              id={`${fieldId}-scope`}
               className={inputClass}
               value={scope}
               onChange={(e) => setScope(e.target.value as "global" | "selected")}
@@ -553,8 +581,9 @@ function CategoryDrawer({
             </div>
           )}
           <div className="space-y-1.5">
-            <div className={labelClass}>Status</div>
+            <label htmlFor={`${fieldId}-status`} className={labelClass}>Status</label>
             <select
+              id={`${fieldId}-status`}
               className={inputClass}
               value={status}
               onChange={(e) => setStatus(e.target.value as ConfigStatus)}
@@ -639,6 +668,7 @@ function TagsTab() {
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-2">
         <input
+          aria-label="New tag name"
           className={cn(inputClass, "max-w-xs")}
           placeholder="New tag name"
           value={draft}
@@ -666,6 +696,7 @@ function TagsTab() {
                   {editing?.id === tag.id ? (
                     <div className="flex items-center gap-2">
                       <input
+                        aria-label={`Rename ${tag.name}`}
                         className={cn(inputClass, "max-w-xs")}
                         value={editName}
                         onChange={(e) => setEditName(e.target.value)}
@@ -700,7 +731,10 @@ function TagsTab() {
                 </td>
                 <td className={cn(tdClass, "text-right")}>
                   <DropdownMenu>
-                    <DropdownMenuTrigger className="rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground">
+                    <DropdownMenuTrigger
+                      aria-label={`Actions for ${tag.name}`}
+                      className="rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground"
+                    >
                       <MoreHorizontal className="h-4 w-4" />
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end" className="w-40">

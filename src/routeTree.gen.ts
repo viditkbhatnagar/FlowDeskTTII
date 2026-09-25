@@ -11,8 +11,19 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as AuthRouteImport } from './routes/auth'
 import { Route as AuthenticatedRouteRouteImport } from './routes/_authenticated/route'
-import { Route as AuthenticatedIndexRouteImport } from './routes/_authenticated/index'
 import { Route as AuthenticatedNoOrganizationRouteImport } from './routes/_authenticated/no-organization'
+import { Route as AuthenticatedWorkspaceRouteRouteImport } from './routes/_authenticated/_workspace/route'
+import { Route as AuthenticatedWorkspaceIndexRouteImport } from './routes/_authenticated/_workspace/index'
+import { Route as AuthenticatedWorkspaceTeamRouteImport } from './routes/_authenticated/_workspace/team'
+import { Route as AuthenticatedWorkspaceProjectsRouteImport } from './routes/_authenticated/_workspace/projects'
+import { Route as AuthenticatedWorkspaceMyTasksRouteImport } from './routes/_authenticated/_workspace/my-tasks'
+import { Route as AuthenticatedWorkspaceSettingsRouteRouteImport } from './routes/_authenticated/_workspace/settings/route'
+import { Route as AuthenticatedWorkspaceSettingsIndexRouteImport } from './routes/_authenticated/_workspace/settings/index'
+import { Route as AuthenticatedWorkspaceSettingsUsersRouteImport } from './routes/_authenticated/_workspace/settings/users'
+import { Route as AuthenticatedWorkspaceSettingsTasksRouteImport } from './routes/_authenticated/_workspace/settings/tasks'
+import { Route as AuthenticatedWorkspaceSettingsStructureRouteImport } from './routes/_authenticated/_workspace/settings/structure'
+import { Route as AuthenticatedWorkspaceSettingsRolesRouteImport } from './routes/_authenticated/_workspace/settings/roles'
+import { Route as AuthenticatedWorkspaceSettingsOrganizationsRouteImport } from './routes/_authenticated/_workspace/settings/organizations'
 
 const AuthRoute = AuthRouteImport.update({
   id: '/auth',
@@ -23,46 +34,178 @@ const AuthenticatedRouteRoute = AuthenticatedRouteRouteImport.update({
   id: '/_authenticated',
   getParentRoute: () => rootRouteImport,
 } as any)
-const AuthenticatedIndexRoute = AuthenticatedIndexRouteImport.update({
-  id: '/',
-  path: '/',
-  getParentRoute: () => AuthenticatedRouteRoute,
-} as any)
 const AuthenticatedNoOrganizationRoute =
   AuthenticatedNoOrganizationRouteImport.update({
     id: '/no-organization',
     path: '/no-organization',
     getParentRoute: () => AuthenticatedRouteRoute,
   } as any)
+const AuthenticatedWorkspaceRouteRoute =
+  AuthenticatedWorkspaceRouteRouteImport.update({
+    id: '/_workspace',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
+const AuthenticatedWorkspaceIndexRoute =
+  AuthenticatedWorkspaceIndexRouteImport.update({
+    id: '/',
+    path: '/',
+    getParentRoute: () => AuthenticatedWorkspaceRouteRoute,
+  } as any)
+const AuthenticatedWorkspaceTeamRoute =
+  AuthenticatedWorkspaceTeamRouteImport.update({
+    id: '/team',
+    path: '/team',
+    getParentRoute: () => AuthenticatedWorkspaceRouteRoute,
+  } as any)
+const AuthenticatedWorkspaceProjectsRoute =
+  AuthenticatedWorkspaceProjectsRouteImport.update({
+    id: '/projects',
+    path: '/projects',
+    getParentRoute: () => AuthenticatedWorkspaceRouteRoute,
+  } as any)
+const AuthenticatedWorkspaceMyTasksRoute =
+  AuthenticatedWorkspaceMyTasksRouteImport.update({
+    id: '/my-tasks',
+    path: '/my-tasks',
+    getParentRoute: () => AuthenticatedWorkspaceRouteRoute,
+  } as any)
+const AuthenticatedWorkspaceSettingsRouteRoute =
+  AuthenticatedWorkspaceSettingsRouteRouteImport.update({
+    id: '/settings',
+    path: '/settings',
+    getParentRoute: () => AuthenticatedWorkspaceRouteRoute,
+  } as any)
+const AuthenticatedWorkspaceSettingsIndexRoute =
+  AuthenticatedWorkspaceSettingsIndexRouteImport.update({
+    id: '/',
+    path: '/',
+    getParentRoute: () => AuthenticatedWorkspaceSettingsRouteRoute,
+  } as any)
+const AuthenticatedWorkspaceSettingsUsersRoute =
+  AuthenticatedWorkspaceSettingsUsersRouteImport.update({
+    id: '/users',
+    path: '/users',
+    getParentRoute: () => AuthenticatedWorkspaceSettingsRouteRoute,
+  } as any)
+const AuthenticatedWorkspaceSettingsTasksRoute =
+  AuthenticatedWorkspaceSettingsTasksRouteImport.update({
+    id: '/tasks',
+    path: '/tasks',
+    getParentRoute: () => AuthenticatedWorkspaceSettingsRouteRoute,
+  } as any)
+const AuthenticatedWorkspaceSettingsStructureRoute =
+  AuthenticatedWorkspaceSettingsStructureRouteImport.update({
+    id: '/structure',
+    path: '/structure',
+    getParentRoute: () => AuthenticatedWorkspaceSettingsRouteRoute,
+  } as any)
+const AuthenticatedWorkspaceSettingsRolesRoute =
+  AuthenticatedWorkspaceSettingsRolesRouteImport.update({
+    id: '/roles',
+    path: '/roles',
+    getParentRoute: () => AuthenticatedWorkspaceSettingsRouteRoute,
+  } as any)
+const AuthenticatedWorkspaceSettingsOrganizationsRoute =
+  AuthenticatedWorkspaceSettingsOrganizationsRouteImport.update({
+    id: '/organizations',
+    path: '/organizations',
+    getParentRoute: () => AuthenticatedWorkspaceSettingsRouteRoute,
+  } as any)
 
 export interface FileRoutesByFullPath {
-  '/': typeof AuthenticatedIndexRoute
+  '/': typeof AuthenticatedWorkspaceIndexRoute
   '/auth': typeof AuthRoute
   '/no-organization': typeof AuthenticatedNoOrganizationRoute
+  '/settings': typeof AuthenticatedWorkspaceSettingsRouteRouteWithChildren
+  '/my-tasks': typeof AuthenticatedWorkspaceMyTasksRoute
+  '/projects': typeof AuthenticatedWorkspaceProjectsRoute
+  '/team': typeof AuthenticatedWorkspaceTeamRoute
+  '/settings/organizations': typeof AuthenticatedWorkspaceSettingsOrganizationsRoute
+  '/settings/roles': typeof AuthenticatedWorkspaceSettingsRolesRoute
+  '/settings/structure': typeof AuthenticatedWorkspaceSettingsStructureRoute
+  '/settings/tasks': typeof AuthenticatedWorkspaceSettingsTasksRoute
+  '/settings/users': typeof AuthenticatedWorkspaceSettingsUsersRoute
+  '/settings/': typeof AuthenticatedWorkspaceSettingsIndexRoute
 }
 export interface FileRoutesByTo {
+  '/': typeof AuthenticatedWorkspaceIndexRoute
   '/auth': typeof AuthRoute
   '/no-organization': typeof AuthenticatedNoOrganizationRoute
-  '/': typeof AuthenticatedIndexRoute
+  '/my-tasks': typeof AuthenticatedWorkspaceMyTasksRoute
+  '/projects': typeof AuthenticatedWorkspaceProjectsRoute
+  '/team': typeof AuthenticatedWorkspaceTeamRoute
+  '/settings/organizations': typeof AuthenticatedWorkspaceSettingsOrganizationsRoute
+  '/settings/roles': typeof AuthenticatedWorkspaceSettingsRolesRoute
+  '/settings/structure': typeof AuthenticatedWorkspaceSettingsStructureRoute
+  '/settings/tasks': typeof AuthenticatedWorkspaceSettingsTasksRoute
+  '/settings/users': typeof AuthenticatedWorkspaceSettingsUsersRoute
+  '/settings': typeof AuthenticatedWorkspaceSettingsIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_authenticated': typeof AuthenticatedRouteRouteWithChildren
   '/auth': typeof AuthRoute
+  '/_authenticated/_workspace': typeof AuthenticatedWorkspaceRouteRouteWithChildren
   '/_authenticated/no-organization': typeof AuthenticatedNoOrganizationRoute
-  '/_authenticated/': typeof AuthenticatedIndexRoute
+  '/_authenticated/_workspace/settings': typeof AuthenticatedWorkspaceSettingsRouteRouteWithChildren
+  '/_authenticated/_workspace/my-tasks': typeof AuthenticatedWorkspaceMyTasksRoute
+  '/_authenticated/_workspace/projects': typeof AuthenticatedWorkspaceProjectsRoute
+  '/_authenticated/_workspace/team': typeof AuthenticatedWorkspaceTeamRoute
+  '/_authenticated/_workspace/': typeof AuthenticatedWorkspaceIndexRoute
+  '/_authenticated/_workspace/settings/organizations': typeof AuthenticatedWorkspaceSettingsOrganizationsRoute
+  '/_authenticated/_workspace/settings/roles': typeof AuthenticatedWorkspaceSettingsRolesRoute
+  '/_authenticated/_workspace/settings/structure': typeof AuthenticatedWorkspaceSettingsStructureRoute
+  '/_authenticated/_workspace/settings/tasks': typeof AuthenticatedWorkspaceSettingsTasksRoute
+  '/_authenticated/_workspace/settings/users': typeof AuthenticatedWorkspaceSettingsUsersRoute
+  '/_authenticated/_workspace/settings/': typeof AuthenticatedWorkspaceSettingsIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/auth' | '/no-organization'
+  fullPaths:
+    | '/'
+    | '/auth'
+    | '/no-organization'
+    | '/settings'
+    | '/my-tasks'
+    | '/projects'
+    | '/team'
+    | '/settings/organizations'
+    | '/settings/roles'
+    | '/settings/structure'
+    | '/settings/tasks'
+    | '/settings/users'
+    | '/settings/'
   fileRoutesByTo: FileRoutesByTo
-  to: '/auth' | '/no-organization' | '/'
+  to:
+    | '/'
+    | '/auth'
+    | '/no-organization'
+    | '/my-tasks'
+    | '/projects'
+    | '/team'
+    | '/settings/organizations'
+    | '/settings/roles'
+    | '/settings/structure'
+    | '/settings/tasks'
+    | '/settings/users'
+    | '/settings'
   id:
     | '__root__'
     | '/_authenticated'
     | '/auth'
+    | '/_authenticated/_workspace'
     | '/_authenticated/no-organization'
-    | '/_authenticated/'
+    | '/_authenticated/_workspace/settings'
+    | '/_authenticated/_workspace/my-tasks'
+    | '/_authenticated/_workspace/projects'
+    | '/_authenticated/_workspace/team'
+    | '/_authenticated/_workspace/'
+    | '/_authenticated/_workspace/settings/organizations'
+    | '/_authenticated/_workspace/settings/roles'
+    | '/_authenticated/_workspace/settings/structure'
+    | '/_authenticated/_workspace/settings/tasks'
+    | '/_authenticated/_workspace/settings/users'
+    | '/_authenticated/_workspace/settings/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -86,13 +229,6 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedRouteRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/_authenticated/': {
-      id: '/_authenticated/'
-      path: '/'
-      fullPath: '/'
-      preLoaderRoute: typeof AuthenticatedIndexRouteImport
-      parentRoute: typeof AuthenticatedRouteRoute
-    }
     '/_authenticated/no-organization': {
       id: '/_authenticated/no-organization'
       path: '/no-organization'
@@ -100,17 +236,155 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedNoOrganizationRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
+    '/_authenticated/_workspace': {
+      id: '/_authenticated/_workspace'
+      path: ''
+      fullPath: '/'
+      preLoaderRoute: typeof AuthenticatedWorkspaceRouteRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/_workspace/': {
+      id: '/_authenticated/_workspace/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof AuthenticatedWorkspaceIndexRouteImport
+      parentRoute: typeof AuthenticatedWorkspaceRouteRoute
+    }
+    '/_authenticated/_workspace/team': {
+      id: '/_authenticated/_workspace/team'
+      path: '/team'
+      fullPath: '/team'
+      preLoaderRoute: typeof AuthenticatedWorkspaceTeamRouteImport
+      parentRoute: typeof AuthenticatedWorkspaceRouteRoute
+    }
+    '/_authenticated/_workspace/projects': {
+      id: '/_authenticated/_workspace/projects'
+      path: '/projects'
+      fullPath: '/projects'
+      preLoaderRoute: typeof AuthenticatedWorkspaceProjectsRouteImport
+      parentRoute: typeof AuthenticatedWorkspaceRouteRoute
+    }
+    '/_authenticated/_workspace/my-tasks': {
+      id: '/_authenticated/_workspace/my-tasks'
+      path: '/my-tasks'
+      fullPath: '/my-tasks'
+      preLoaderRoute: typeof AuthenticatedWorkspaceMyTasksRouteImport
+      parentRoute: typeof AuthenticatedWorkspaceRouteRoute
+    }
+    '/_authenticated/_workspace/settings': {
+      id: '/_authenticated/_workspace/settings'
+      path: '/settings'
+      fullPath: '/settings'
+      preLoaderRoute: typeof AuthenticatedWorkspaceSettingsRouteRouteImport
+      parentRoute: typeof AuthenticatedWorkspaceRouteRoute
+    }
+    '/_authenticated/_workspace/settings/': {
+      id: '/_authenticated/_workspace/settings/'
+      path: '/'
+      fullPath: '/settings/'
+      preLoaderRoute: typeof AuthenticatedWorkspaceSettingsIndexRouteImport
+      parentRoute: typeof AuthenticatedWorkspaceSettingsRouteRoute
+    }
+    '/_authenticated/_workspace/settings/users': {
+      id: '/_authenticated/_workspace/settings/users'
+      path: '/users'
+      fullPath: '/settings/users'
+      preLoaderRoute: typeof AuthenticatedWorkspaceSettingsUsersRouteImport
+      parentRoute: typeof AuthenticatedWorkspaceSettingsRouteRoute
+    }
+    '/_authenticated/_workspace/settings/tasks': {
+      id: '/_authenticated/_workspace/settings/tasks'
+      path: '/tasks'
+      fullPath: '/settings/tasks'
+      preLoaderRoute: typeof AuthenticatedWorkspaceSettingsTasksRouteImport
+      parentRoute: typeof AuthenticatedWorkspaceSettingsRouteRoute
+    }
+    '/_authenticated/_workspace/settings/structure': {
+      id: '/_authenticated/_workspace/settings/structure'
+      path: '/structure'
+      fullPath: '/settings/structure'
+      preLoaderRoute: typeof AuthenticatedWorkspaceSettingsStructureRouteImport
+      parentRoute: typeof AuthenticatedWorkspaceSettingsRouteRoute
+    }
+    '/_authenticated/_workspace/settings/roles': {
+      id: '/_authenticated/_workspace/settings/roles'
+      path: '/roles'
+      fullPath: '/settings/roles'
+      preLoaderRoute: typeof AuthenticatedWorkspaceSettingsRolesRouteImport
+      parentRoute: typeof AuthenticatedWorkspaceSettingsRouteRoute
+    }
+    '/_authenticated/_workspace/settings/organizations': {
+      id: '/_authenticated/_workspace/settings/organizations'
+      path: '/organizations'
+      fullPath: '/settings/organizations'
+      preLoaderRoute: typeof AuthenticatedWorkspaceSettingsOrganizationsRouteImport
+      parentRoute: typeof AuthenticatedWorkspaceSettingsRouteRoute
+    }
   }
 }
 
+interface AuthenticatedWorkspaceSettingsRouteRouteChildren {
+  AuthenticatedWorkspaceSettingsOrganizationsRoute: typeof AuthenticatedWorkspaceSettingsOrganizationsRoute
+  AuthenticatedWorkspaceSettingsRolesRoute: typeof AuthenticatedWorkspaceSettingsRolesRoute
+  AuthenticatedWorkspaceSettingsStructureRoute: typeof AuthenticatedWorkspaceSettingsStructureRoute
+  AuthenticatedWorkspaceSettingsTasksRoute: typeof AuthenticatedWorkspaceSettingsTasksRoute
+  AuthenticatedWorkspaceSettingsUsersRoute: typeof AuthenticatedWorkspaceSettingsUsersRoute
+  AuthenticatedWorkspaceSettingsIndexRoute: typeof AuthenticatedWorkspaceSettingsIndexRoute
+}
+
+const AuthenticatedWorkspaceSettingsRouteRouteChildren: AuthenticatedWorkspaceSettingsRouteRouteChildren =
+  {
+    AuthenticatedWorkspaceSettingsOrganizationsRoute:
+      AuthenticatedWorkspaceSettingsOrganizationsRoute,
+    AuthenticatedWorkspaceSettingsRolesRoute:
+      AuthenticatedWorkspaceSettingsRolesRoute,
+    AuthenticatedWorkspaceSettingsStructureRoute:
+      AuthenticatedWorkspaceSettingsStructureRoute,
+    AuthenticatedWorkspaceSettingsTasksRoute:
+      AuthenticatedWorkspaceSettingsTasksRoute,
+    AuthenticatedWorkspaceSettingsUsersRoute:
+      AuthenticatedWorkspaceSettingsUsersRoute,
+    AuthenticatedWorkspaceSettingsIndexRoute:
+      AuthenticatedWorkspaceSettingsIndexRoute,
+  }
+
+const AuthenticatedWorkspaceSettingsRouteRouteWithChildren =
+  AuthenticatedWorkspaceSettingsRouteRoute._addFileChildren(
+    AuthenticatedWorkspaceSettingsRouteRouteChildren,
+  )
+
+interface AuthenticatedWorkspaceRouteRouteChildren {
+  AuthenticatedWorkspaceSettingsRouteRoute: typeof AuthenticatedWorkspaceSettingsRouteRouteWithChildren
+  AuthenticatedWorkspaceMyTasksRoute: typeof AuthenticatedWorkspaceMyTasksRoute
+  AuthenticatedWorkspaceProjectsRoute: typeof AuthenticatedWorkspaceProjectsRoute
+  AuthenticatedWorkspaceTeamRoute: typeof AuthenticatedWorkspaceTeamRoute
+  AuthenticatedWorkspaceIndexRoute: typeof AuthenticatedWorkspaceIndexRoute
+}
+
+const AuthenticatedWorkspaceRouteRouteChildren: AuthenticatedWorkspaceRouteRouteChildren =
+  {
+    AuthenticatedWorkspaceSettingsRouteRoute:
+      AuthenticatedWorkspaceSettingsRouteRouteWithChildren,
+    AuthenticatedWorkspaceMyTasksRoute: AuthenticatedWorkspaceMyTasksRoute,
+    AuthenticatedWorkspaceProjectsRoute: AuthenticatedWorkspaceProjectsRoute,
+    AuthenticatedWorkspaceTeamRoute: AuthenticatedWorkspaceTeamRoute,
+    AuthenticatedWorkspaceIndexRoute: AuthenticatedWorkspaceIndexRoute,
+  }
+
+const AuthenticatedWorkspaceRouteRouteWithChildren =
+  AuthenticatedWorkspaceRouteRoute._addFileChildren(
+    AuthenticatedWorkspaceRouteRouteChildren,
+  )
+
 interface AuthenticatedRouteRouteChildren {
+  AuthenticatedWorkspaceRouteRoute: typeof AuthenticatedWorkspaceRouteRouteWithChildren
   AuthenticatedNoOrganizationRoute: typeof AuthenticatedNoOrganizationRoute
-  AuthenticatedIndexRoute: typeof AuthenticatedIndexRoute
 }
 
 const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
+  AuthenticatedWorkspaceRouteRoute:
+    AuthenticatedWorkspaceRouteRouteWithChildren,
   AuthenticatedNoOrganizationRoute: AuthenticatedNoOrganizationRoute,
-  AuthenticatedIndexRoute: AuthenticatedIndexRoute,
 }
 
 const AuthenticatedRouteRouteWithChildren =

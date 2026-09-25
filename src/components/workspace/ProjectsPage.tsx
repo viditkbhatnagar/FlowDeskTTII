@@ -1,4 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   Plus,
   Search,
@@ -7,39 +16,45 @@ import {
   List as ListIcon,
   GanttChart,
   Calendar,
-  Users,
   AlertTriangle,
   ChevronRight,
-  MoreHorizontal,
   CheckCircle2,
   Clock,
   FolderKanban,
   FileText,
-  MessageSquare,
   Activity,
   Paperclip,
-  ArrowLeft,
   ChevronsUpDown,
   UserPlus,
   X,
   Loader2,
-  ClipboardCheck,
 } from "lucide-react";
 import { differenceInCalendarDays, format } from "date-fns";
 import { toast } from "sonner";
 import { z } from "zod";
 import { cn } from "@/lib/utils";
-import { tasks, allPeople, type Project } from "@/lib/mock-data";
 import {
   archiveProjectRow,
   createProjectRow,
   loadProjects,
+  projectColor,
+  setProjectMembers,
   updateProjectRow,
   type LoadedProject,
+  type ProjectLifecycle,
 } from "@/lib/admin-api";
+import { healthLabel, type ProjectHealth } from "@/lib/project-metrics";
+import {
+  FILE_RULES,
+  formatBytes,
+  uploadProjectDocuments,
+  validateFile,
+  type PersonRef,
+} from "@/lib/task-api";
 import { useOrganizations } from "@/lib/organizations-data";
-import { useTaskSettings, projectCategoryRotation } from "@/lib/task-settings-data";
-import { ProjectWorkspace } from "./ProjectWorkspace";
+import { useTaskSettings } from "@/lib/task-settings-data";
+import { useWorkspace } from "@/lib/workspace-data";
+import { ProjectWorkspace, type WorkspaceProject } from "./ProjectWorkspace";
 import {
   Dialog,
   DialogContent,
@@ -62,11 +77,25 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-type ProjectExt = Project & {
-  client: string;
+type ProjectPerson = { id?: string; name: string; initials: string; color: string };
+
+type ProjectExt = {
+  id: string;
+  name: string;
+  color: string;
+  /** projectProgress(...).percent, from admin-api loadProjects. */
+  progress: number;
+  taskCount: number;
+  members: number;
+  deadline: string;
   startDate: string;
-  manager: { name: string; initials: string; color: string };
-  team: { name: string; initials: string; color: string }[];
+  /** projectHealth(...) — the only health this screen shows (FD-014, FD-056). */
+  health: ProjectHealth;
+  client: string;
+  manager: ProjectPerson;
+  managerId?: string | null;
+  team: ProjectPerson[];
+  teamIds?: string[];
   pendingTasks: number;
   risk: "low" | "medium" | "high";
   category: string;
@@ -74,10 +103,11 @@ type ProjectExt = Project & {
   projectId?: string;
   projectType?: "internal" | "client";
   department?: string;
+  departmentId?: string | null;
+  teamId?: string | null;
   priority?: "low" | "medium" | "high" | "critical";
-  creationStatus?: "planning" | "active" | "on-hold";
+  creationStatus?: ProjectLifecycle;
   attachmentNames?: string[];
-  createdBy?: string;
   createdAt?: string;
   updatedAt?: string;
   isNew?: boolean;
@@ -85,8 +115,8 @@ type ProjectExt = Project & {
   orgId?: string;
 };
 
-const clients = ["Northwind Co.", "Lumen Labs", "Pioneer Bank", "Atlas Studios", "Helix Health"];
-const categories = projectCategoryRotation;
+/** A short, stable reference derived from the real row id. */
+const displayId = (id: string) => id.slice(0, 8).toUpperCase();
 
 /** Widen a project loaded from Supabase into the shape this screen renders. */
 const fromLoaded = (p: LoadedProject): ProjectExt => ({
@@ -94,38 +124,46 @@ const fromLoaded = (p: LoadedProject): ProjectExt => ({
   name: p.name,
   color: p.color,
   progress: p.progress,
+  taskCount: p.taskCount,
   members: p.members,
   deadline: p.deadline,
-  status: p.status,
-  client: p.client || (p.projectType === "client" ? "Client" : "Internal"),
   startDate: p.startDate,
+  health: p.health,
+  // The real client_name, or the project type. The card used to show an
+  // invented client company (FD-014).
+  client: p.projectType === "client" ? p.client || "Client" : "Internal",
   manager: p.manager,
+  managerId: p.managerId,
   team: p.team,
+  teamIds: p.teamIds,
   pendingTasks: p.pendingTasks,
   risk: p.risk,
   category: p.category,
   description: p.description,
-  projectId: p.id.slice(0, 8).toUpperCase(),
+  projectId: displayId(p.id),
   projectType: p.projectType,
+  department: p.department,
+  departmentId: p.departmentId,
+  teamId: p.teamId,
   priority: p.priority,
   creationStatus: p.creationStatus,
+  createdAt: p.createdAt,
+  updatedAt: p.updatedAt,
   orgId: p.organizationId,
 });
 
-const statusStyles: Record<Project["status"], string> = {
+const healthStyles: Record<ProjectHealth, string> = {
+  completed: "bg-primary/10 text-primary border-primary/30",
   "on-track":
     "bg-[color:var(--status-done)]/15 text-[color:var(--status-done)] border-[color:var(--status-done)]/30",
   "at-risk":
     "bg-[color:var(--priority-medium)]/15 text-[color:var(--priority-medium)] border-[color:var(--priority-medium)]/30",
   delayed:
     "bg-[color:var(--priority-critical)]/15 text-[color:var(--priority-critical)] border-[color:var(--priority-critical)]/30",
+  "no-tasks": "bg-muted text-muted-foreground border-border",
 };
 
-const statusLabel: Record<Project["status"], string> = {
-  "on-track": "On track",
-  "at-risk": "At risk",
-  delayed: "Delayed",
-};
+const HEALTH_ORDER: ProjectHealth[] = ["on-track", "at-risk", "delayed", "completed", "no-tasks"];
 
 const riskColor: Record<ProjectExt["risk"], string> = {
   low: "text-[color:var(--status-done)]",
@@ -133,169 +171,403 @@ const riskColor: Record<ProjectExt["risk"], string> = {
   high: "text-[color:var(--priority-critical)]",
 };
 
+const hasDate = (iso?: string) => Boolean(iso) && !Number.isNaN(new Date(iso as string).getTime());
+
 function fmtDate(iso: string) {
+  // A project without a date used to render "Invalid Date".
+  if (!hasDate(iso)) return "No date";
   return new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
-export function ProjectsPage({ onNewTask: _onNewTask, dashboardFilter }: { onNewTask?: () => void; dashboardFilter?: string }) {
+/** "Internal · Technology" — the same line the project detail header shows. */
+const projectSubtitle = (project: ProjectExt) =>
+  [project.client, project.department ?? project.category].filter(Boolean).join(" · ");
+
+/** A yyyy-mm-dd date in local time, as the date columns store it. */
+const localDate = (date: Date) => format(date, "yyyy-MM-dd");
+
+/** Upload files picked in the project form and report any the bucket refused. */
+async function attachProjectFiles(project: { id: string; organizationId: string }, files: File[]) {
+  if (!files.length) return;
+  const result = await uploadProjectDocuments(project, files);
+  if (result.rejected.length) {
+    toast.error(
+      `Not attached: ${result.rejected.map((file) => `${file.name} (${file.reason})`).join(", ")}`,
+    );
+  }
+}
+
+/* ---------- Dashboard filter (contract C2) ---------- */
+type ProjectsFilter =
+  | { kind: "project"; target: string }
+  | { kind: "health"; health: ProjectHealth };
+
+/**
+ * "project:<id or name>" opens that project; "health:<value>" (or the bare
+ * value, e.g. "delayed") narrows the list. Anything else is ignored rather than
+ * applied invisibly.
+ */
+function parseProjectsFilter(filter?: string): ProjectsFilter | null {
+  if (!filter) return null;
+  if (filter.startsWith("project:")) {
+    const raw = filter.slice("project:".length);
+    let target = raw;
+    try {
+      target = decodeURIComponent(raw);
+    } catch {
+      // A malformed escape is still a usable name.
+    }
+    return target ? { kind: "project", target } : null;
+  }
+  const key = filter.startsWith("health:") ? filter.slice("health:".length) : filter;
+  return (HEALTH_ORDER as string[]).includes(key)
+    ? { kind: "health", health: key as ProjectHealth }
+    : null;
+}
+
+const matchesTarget = (project: ProjectExt, target: string) =>
+  project.id === target || project.name === target;
+
+/**
+ * The project currently open in ProjectWorkspace.
+ *
+ * ProjectWorkspace renders the Edit Project form but only ever knew the project
+ * by its display fields, so "Save Changes" merged into local state and nothing
+ * reached the database (FD-052). The form reads the open row from here and
+ * persists the edit itself.
+ */
+type EditingProject = { project: ProjectExt; onSaved: (project: ProjectExt) => void };
+const EditingProjectContext = createContext<EditingProject | null>(null);
+
+/**
+ * The organization a new project goes into: the one selected in the switcher,
+ * else the user's own. With "All organizations" selected (the default) every
+ * create used to fail with "Could not tell which organization".
+ */
+function useDefaultOrgId(): string | undefined {
+  const { activeOrgId, organizations, accessibleOrganizations, currentUser } = useOrganizations();
+  if (activeOrgId !== "all") return activeOrgId;
+  return currentUser?.primaryOrgId || accessibleOrganizations[0]?.id || organizations[0]?.id;
+}
+
+export function ProjectsPage({
+  onNewTask: _onNewTask,
+  dashboardFilter,
+  onClearFilter,
+}: {
+  onNewTask?: () => void;
+  dashboardFilter?: string;
+  onClearFilter?: () => void;
+}) {
   // Loaded from work_projects. This screen used to render five hardcoded
   // projects from mock-data.ts while the five real rows sat unread.
   const [projectItems, setProjectItems] = useState<ProjectExt[]>([]);
   const [projectsStatus, setProjectsStatus] = useState<"loading" | "ready" | "error">("loading");
 
-  useEffect(() => {
-    let active = true;
-    void loadProjects().then((rows) => {
-      if (!active) return;
-      if (rows) {
-        setProjectItems(rows.map(fromLoaded));
-        setProjectsStatus("ready");
-      } else {
-        setProjectsStatus("error");
-      }
-    });
-    return () => { active = false; };
+  const refreshProjects = useCallback(async (): Promise<boolean> => {
+    const rows = await loadProjects();
+    if (!rows) return false;
+    setProjectItems(rows.map(fromLoaded));
+    setProjectsStatus("ready");
+    return true;
   }, []);
+
+  const retryLoad = useCallback(() => {
+    setProjectsStatus("loading");
+    void refreshProjects().then((ok) => {
+      if (!ok) setProjectsStatus("error");
+    });
+  }, [refreshProjects]);
+
+  useEffect(() => {
+    retryLoad();
+  }, [retryLoad]);
+
   const [view, setView] = useState<"grid" | "list" | "timeline">("grid");
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [createOpen, setCreateOpen] = useState(false);
   const [selected, setSelected] = useState<ProjectExt | null>(null);
+  // An archive still in flight when the user goes back; the reload waits for it
+  // so the archived project does not reappear.
+  const pendingArchive = useRef<Promise<unknown>>(Promise.resolve());
 
-  const { activeOrgId, projects: orgProjects } = useOrganizations();
+  const { activeOrgId } = useOrganizations();
+  const defaultOrgId = useDefaultOrgId();
 
+  // The dashboard filter stays visible and clearable (FD-030). Clearing also
+  // works before the route wires onClearFilter, so the chip can never get stuck.
+  const [dismissedFilter, setDismissedFilter] = useState<string>();
+  const activeFilterKey =
+    dashboardFilter && dashboardFilter !== dismissedFilter ? dashboardFilter : undefined;
+  const dashboardScope = useMemo(() => parseProjectsFilter(activeFilterKey), [activeFilterKey]);
+  const clearDashboardFilter = useCallback(() => {
+    setDismissedFilter(dashboardFilter);
+    onClearFilter?.();
+  }, [dashboardFilter, onClearFilter]);
+
+  // Open the project a dashboard row pointed at — once per filter, so reloading
+  // the list afterwards cannot pull the user back into it.
+  const openedFor = useRef<string | undefined>(undefined);
   useEffect(() => {
-    if (!dashboardFilter?.startsWith("project:")) return;
-    const projectName = decodeURIComponent(dashboardFilter.slice(8));
-    const match = projectItems.find((project) => project.name === projectName);
+    if (dashboardScope?.kind !== "project" || projectsStatus !== "ready") return;
+    if (openedFor.current === activeFilterKey) return;
+    openedFor.current = activeFilterKey;
+    const match = projectItems.find((project) => matchesTarget(project, dashboardScope.target));
     if (match) setSelected(match);
-  }, [dashboardFilter, projectItems]);
+  }, [dashboardScope, activeFilterKey, projectsStatus, projectItems]);
+
+  // Scoped by each project's own organization. This used to look projects up in
+  // a hardcoded list of five sample projects ("P-1".."P-5", Operations in a
+  // second organization), so Total counted five while four cards rendered (FD-015).
+  const scoped = useMemo(
+    () =>
+      activeOrgId === "all"
+        ? projectItems
+        : projectItems.filter((project) => project.orgId === activeOrgId),
+    [projectItems, activeOrgId],
+  );
 
   const filtered = useMemo(() => {
-    return projectItems.filter((p) => {
-      if (activeOrgId !== "all") {
-        const link = orgProjects.find((op) => op.id === p.id);
-        // Projects created in-session without an organization link stay visible.
-        if (link && link.orgId !== activeOrgId) return false;
-      }
-      const q = query.trim().toLowerCase();
-      if (q && !p.name.toLowerCase().includes(q) && !p.client.toLowerCase().includes(q))
+    const q = query.trim().toLowerCase();
+    return scoped.filter((p) => {
+      if (q && !`${p.name} ${projectSubtitle(p)}`.toLowerCase().includes(q)) return false;
+      if (statusFilter !== "all" && p.health !== statusFilter) return false;
+      if (dashboardScope?.kind === "health" && p.health !== dashboardScope.health) return false;
+      if (dashboardScope?.kind === "project" && !matchesTarget(p, dashboardScope.target))
         return false;
-      if (statusFilter !== "all" && p.status !== statusFilter) return false;
       return true;
     });
-  }, [projectItems, query, statusFilter, activeOrgId, orgProjects]);
+  }, [scoped, query, statusFilter, dashboardScope]);
 
+  // One list, one health per project: Total = Active + Completed + Delayed, so
+  // the tiles always add up and a Delayed count always has Delayed cards (FD-015).
   const metrics = useMemo(() => {
-    const total = projectItems.length;
-    const active = projectItems.filter((p) => p.progress < 100 && p.status !== "delayed").length;
-    const completed = projectItems.filter((p) => p.progress === 100).length;
-    const delayed = projectItems.filter((p) => p.status === "delayed").length;
-    return { total, active, completed, delayed };
-  }, [projectItems]);
+    const completed = scoped.filter((p) => p.health === "completed").length;
+    const delayed = scoped.filter((p) => p.health === "delayed").length;
+    return {
+      total: scoped.length,
+      active: scoped.length - completed - delayed,
+      completed,
+      delayed,
+    };
+  }, [scoped]);
 
-  const handleProjectCreated = (project: ProjectExt) => {
-    setProjectItems((current) => [project, ...current]);
-    setCreateOpen(false);
-    setSelected(project);
+  const filterChipLabel = !dashboardScope
+    ? undefined
+    : dashboardScope.kind === "health"
+      ? healthLabel[dashboardScope.health]
+      : (projectItems.find((project) => matchesTarget(project, dashboardScope.target))?.name ??
+        dashboardScope.target);
 
-    // Persist it. The dialog builds the object client-side, so until this
-    // resolves the card on screen is not yet a row in the database — which is
-    // exactly what used to be true forever.
-    const orgId = activeOrgId !== "all" ? activeOrgId : project.orgId;
+  const handleProjectCreated = async (project: ProjectExt, files: File[]): Promise<boolean> => {
+    // Saved first, shown second. The card used to appear straight away under a
+    // made-up id (PRJ-00121...) and quietly vanish if the insert failed.
+    const orgId = project.orgId ?? defaultOrgId;
     if (!orgId) {
       toast.error("Could not tell which organization this project belongs to.");
-      return;
+      return false;
     }
-    void createProjectRow({
+    const realId = await createProjectRow({
       orgId,
       name: project.name,
       description: project.description,
       startDate: project.startDate,
       dueDate: project.deadline,
-      categoryName: project.category,
+      categoryName: project.category || undefined,
       priority: project.priority,
       projectType: project.projectType,
       clientName: project.projectType === "client" ? project.client : undefined,
       status: project.creationStatus,
-    }).then((realId) => {
-      if (!realId) {
-        setProjectItems((current) => current.filter((item) => item.id !== project.id));
-        setSelected(null);
-        toast.error("Project could not be saved. Nothing was created.");
-        return;
-      }
-      const saved = { ...project, id: realId, projectId: realId.slice(0, 8).toUpperCase() };
-      setProjectItems((current) => current.map((item) => (item.id === project.id ? saved : item)));
-      setSelected((current) => (current && current.id === project.id ? saved : current));
-      toast.success("Project created successfully");
+      managerId: project.managerId,
+      departmentId: project.departmentId,
+      teamId: project.teamId,
     });
+    if (!realId) {
+      toast.error("Project could not be saved. Nothing was created.");
+      return false;
+    }
+    if (project.teamIds?.length && !(await setProjectMembers(realId, project.teamIds))) {
+      toast.error("The project was created, but its team members could not be saved.");
+    }
+    await attachProjectFiles({ id: realId, organizationId: orgId }, files);
+    const saved: ProjectExt = { ...project, id: realId, projectId: displayId(realId), orgId };
+    setProjectItems((current) => [saved, ...current]);
+    setCreateOpen(false);
+    setSelected(saved);
+    toast.success("Project created successfully");
+    return true;
+  };
+
+  /** Keep the list in step with an edit saved from the project workspace. */
+  const handleProjectEdited = useCallback((updated: ProjectExt) => {
+    const merge = (item: ProjectExt): ProjectExt =>
+      item.id !== updated.id
+        ? item
+        : {
+            ...item,
+            ...updated,
+            // Figures come from the tasks, not the form; the reload on the way
+            // back recomputes them.
+            id: item.id,
+            projectId: item.projectId,
+            orgId: item.orgId,
+            color: item.color,
+            progress: item.progress,
+            taskCount: item.taskCount,
+            pendingTasks: item.pendingTasks,
+            health: item.health,
+            risk: item.risk,
+            isNew: item.isNew,
+          };
+    setProjectItems((current) => current.map(merge));
+    setSelected((current) => (current ? merge(current) : current));
+  }, []);
+
+  /**
+   * ProjectWorkspace's own onUpdated (status changes, saved edits). Its project
+   * state was copied from ours on mount, so only the display fields are taken:
+   * its ids (manager, department, team) can be stale.
+   */
+  const handleWorkspaceUpdated = useCallback((updated: WorkspaceProject) => {
+    const merge = (item: ProjectExt): ProjectExt =>
+      item.id !== updated.id
+        ? item
+        : {
+            ...item,
+            name: updated.name,
+            description: updated.description,
+            projectType: updated.projectType,
+            client: updated.client,
+            category: updated.category,
+            department: updated.department,
+            priority: updated.priority,
+            creationStatus: updated.creationStatus,
+            startDate: updated.startDate,
+            deadline: updated.deadline,
+            manager: updated.manager,
+            team: updated.team,
+            members: updated.team.length,
+          };
+    setProjectItems((current) => current.map(merge));
+    setSelected((current) => (current ? merge(current) : current));
+  }, []);
+
+  const duplicateProject = async (source: WorkspaceProject) => {
+    const original = projectItems.find((item) => item.id === source.id);
+    // onDuplicate hands back a WorkspaceProject, which carries no organization
+    // or ids, so resolve them from the list we loaded.
+    const orgId = original?.orgId ?? defaultOrgId;
+    if (!orgId) {
+      toast.error("Could not tell which organization the copy belongs to.");
+      return;
+    }
+    const name = `${source.name} Copy`;
+    const realId = await createProjectRow({
+      orgId,
+      name,
+      description: source.description,
+      startDate: source.startDate,
+      dueDate: source.deadline,
+      categoryName: source.category || undefined,
+      priority: source.priority,
+      projectType: source.projectType,
+      clientName: source.projectType === "client" ? source.client : undefined,
+      status: "planning",
+      managerId: original?.managerId ?? undefined,
+      departmentId: original?.departmentId ?? null,
+      teamId: original?.teamId ?? null,
+    });
+    if (!realId) {
+      toast.error("The copy could not be saved.");
+      return;
+    }
+    const teamIds = original?.teamIds ?? [];
+    if (teamIds.length && !(await setProjectMembers(realId, teamIds))) {
+      toast.error("The copy was created, but its team members could not be copied.");
+    }
+    // A copy is a fresh project: no tasks, 0%, planning. It used to spread the
+    // source, carrying its 62% progress, and number itself PRJ-00126 (FD-035).
+    const copy: ProjectExt = {
+      id: realId,
+      projectId: displayId(realId),
+      name,
+      color: projectColor(name),
+      description: source.description,
+      startDate: source.startDate,
+      deadline: source.deadline,
+      category: source.category,
+      client: source.client,
+      projectType: source.projectType,
+      department: original ? original.department : source.department,
+      departmentId: original?.departmentId ?? null,
+      teamId: original?.teamId ?? null,
+      priority: source.priority,
+      creationStatus: "planning",
+      // The same people the ids above were copied from.
+      manager: original?.manager ?? source.manager,
+      managerId: original?.managerId ?? null,
+      team: original?.team ?? source.team,
+      teamIds,
+      members: teamIds.length,
+      progress: 0,
+      taskCount: 0,
+      pendingTasks: 0,
+      health: "no-tasks",
+      risk: "low",
+      orgId,
+      isNew: true,
+    };
+    setProjectItems((current) => [copy, ...current]);
+    setSelected(copy);
+  };
+
+  const backToList = () => {
+    setSelected(null);
+    if (dashboardScope?.kind === "project") clearDashboardFilter();
+    // Pick up edits, task changes and archives made inside the project.
+    void pendingArchive.current.then(() =>
+      refreshProjects().then((ok) => {
+        if (!ok) toast.error("Projects could not be refreshed. Showing the last loaded list.");
+      }),
+    );
   };
 
   if (selected) {
     return (
       <>
-        <ProjectWorkspace
-          project={selected}
-          onBack={() => setSelected(null)}
-          onDuplicate={(source) => {
-            const duplicate = {
-              ...source,
-              id: `P-${projectItems.length + 1}`,
-              projectId: `PRJ-${String(projectItems.length + 121).padStart(5, "0")}`,
-              name: `${source.name} Copy`,
-              isNew: true,
-            };
-            setProjectItems((current) => [duplicate as ProjectExt, ...current]);
-            setSelected(duplicate as ProjectExt);
-            // onDuplicate hands back a WorkspaceProject, which carries no
-            // organization, so resolve it from the list we loaded.
-            const orgId =
-              activeOrgId !== "all"
-                ? activeOrgId
-                : projectItems.find((item) => item.id === source.id)?.orgId;
-            if (orgId) {
-              void createProjectRow({
-                orgId,
-                name: duplicate.name,
-                description: source.description,
-                startDate: source.startDate,
-                dueDate: source.deadline,
-                categoryName: source.category,
-                priority: source.priority,
-                projectType: source.projectType,
-                clientName: source.projectType === "client" ? source.client : undefined,
-                status: "planning",
-              }).then((realId) => {
-                if (!realId) {
-                  setProjectItems((current) => current.filter((item) => item.id !== duplicate.id));
-                  toast.error("The copy could not be saved.");
-                  return;
-                }
-                const saved = { ...(duplicate as ProjectExt), id: realId };
-                setProjectItems((current) => current.map((item) => (item.id === duplicate.id ? saved : item)));
-                setSelected((current) => (current && current.id === duplicate.id ? saved : current));
+        <EditingProjectContext.Provider value={{ project: selected, onSaved: handleProjectEdited }}>
+          {/* Keyed so a duplicate opens as itself: ProjectWorkspace copies its
+              project prop into state once, on mount. */}
+          <ProjectWorkspace
+            key={selected.id}
+            project={selected}
+            onBack={backToList}
+            onDuplicate={(source) => void duplicateProject(source)}
+            onUpdated={handleWorkspaceUpdated}
+            onDelete={(projectId) => {
+              const removed = projectItems.find((item) => item.id === projectId);
+              setProjectItems((current) => current.filter((item) => item.id !== projectId));
+              // Archived, not deleted: work_tasks reference the project, and
+              // removing it would take their history with it.
+              pendingArchive.current = archiveProjectRow(projectId).then((ok) => {
+                if (ok) return;
+                toast.error("The project could not be archived.");
+                if (removed) setProjectItems((current) => [removed, ...current]);
               });
-            }
-          }}
-          onDelete={(projectId) => {
-            setProjectItems((current) => current.filter((item) => item.id !== projectId));
-            // Archived, not deleted: work_tasks reference the project, and
-            // removing it would take their history with it.
-            void archiveProjectRow(projectId).then((ok) => {
-              if (!ok) toast.error("The project could not be archived.");
-            });
-          }}
-        />
+            }}
+          />
+        </EditingProjectContext.Provider>
         <ProjectFormDialog
           open={createOpen}
           onClose={() => setCreateOpen(false)}
           onSubmit={handleProjectCreated}
-          nextNumber={projectItems.length + 120}
         />
       </>
     );
   }
+
+  const ready = projectsStatus === "ready";
 
   return (
     <>
@@ -305,7 +577,11 @@ export function ProjectsPage({ onNewTask: _onNewTask, dashboardFilter }: { onNew
           <div>
             <h2 className="text-xl font-semibold tracking-tight">Projects</h2>
             <p className="text-sm text-muted-foreground">
-              {projectItems.length} projects • {metrics.active} active this quarter
+              {ready
+                ? `${metrics.total} ${metrics.total === 1 ? "project" : "projects"} • ${metrics.active} active`
+                : projectsStatus === "loading"
+                  ? "Loading projects…"
+                  : "Projects could not be loaded"}
             </p>
           </div>
           <div className="flex items-center gap-2 flex-wrap">
@@ -315,26 +591,29 @@ export function ProjectsPage({ onNewTask: _onNewTask, dashboardFilter }: { onNew
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="Search projects…"
+                aria-label="Search projects"
                 className="h-9 w-56 rounded-lg border border-border bg-card pl-8 pr-3 text-sm outline-none focus:ring-2 focus:ring-ring/40"
               />
             </div>
             <Select value={statusFilter} onValueChange={setStatusFilter}>
-              <SelectTrigger className="h-9 w-[140px] text-xs">
+              <SelectTrigger className="h-9 w-[140px] text-xs" aria-label="Filter by health">
                 <Filter className="h-3.5 w-3.5 mr-1" />
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">All status</SelectItem>
-                <SelectItem value="on-track">On track</SelectItem>
-                <SelectItem value="at-risk">At risk</SelectItem>
-                <SelectItem value="delayed">Delayed</SelectItem>
+                {HEALTH_ORDER.map((health) => (
+                  <SelectItem key={health} value={health}>
+                    {healthLabel[health]}
+                  </SelectItem>
+                ))}
               </SelectContent>
             </Select>
             <div className="inline-flex items-center rounded-lg border border-border bg-card p-1 shadow-[var(--shadow-soft)]">
               {[
-                { id: "grid", Icon: LayoutGrid },
-                { id: "list", Icon: ListIcon },
-                { id: "timeline", Icon: GanttChart },
+                { id: "grid", label: "Grid view", Icon: LayoutGrid },
+                { id: "list", label: "List view", Icon: ListIcon },
+                { id: "timeline", label: "Timeline view", Icon: GanttChart },
               ].map((v) => (
                 <button
                   key={v.id}
@@ -345,7 +624,8 @@ export function ProjectsPage({ onNewTask: _onNewTask, dashboardFilter }: { onNew
                       ? "bg-primary text-primary-foreground"
                       : "text-muted-foreground hover:text-foreground",
                   )}
-                  aria-label={v.id}
+                  aria-label={v.label}
+                  aria-pressed={view === v.id}
                 >
                   <v.Icon className="h-3.5 w-3.5" />
                 </button>
@@ -357,33 +637,108 @@ export function ProjectsPage({ onNewTask: _onNewTask, dashboardFilter }: { onNew
           </div>
         </div>
 
+        {filterChipLabel && (
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-primary/30 bg-primary/10 py-1 pl-3 pr-1.5 text-xs font-medium text-primary">
+              Filtered: {filterChipLabel}
+              <button
+                type="button"
+                onClick={clearDashboardFilter}
+                aria-label={`Clear filter: ${filterChipLabel}`}
+                className="inline-flex h-4 w-4 items-center justify-center rounded-full hover:bg-primary/20"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </span>
+          </div>
+        )}
+
         {/* Metrics */}
         <div className="grid gap-3 grid-cols-2 md:grid-cols-4">
-          <Metric icon={FolderKanban} label="Total" value={metrics.total} tint="primary" />
-          <Metric icon={Activity} label="Active" value={metrics.active} tint="primary" />
-          <Metric icon={CheckCircle2} label="Completed" value={metrics.completed} tint="done" />
-          <Metric icon={AlertTriangle} label="Delayed" value={metrics.delayed} tint="critical" />
+          <Metric
+            icon={FolderKanban}
+            label="Total"
+            value={ready ? metrics.total : "—"}
+            tint="primary"
+          />
+          <Metric
+            icon={Activity}
+            label="Active"
+            value={ready ? metrics.active : "—"}
+            tint="primary"
+          />
+          <Metric
+            icon={CheckCircle2}
+            label="Completed"
+            value={ready ? metrics.completed : "—"}
+            tint="done"
+          />
+          <Metric
+            icon={AlertTriangle}
+            label="Delayed"
+            value={ready ? metrics.delayed : "—"}
+            tint="critical"
+          />
         </div>
 
         {/* Views */}
-        {view === "grid" && (
+        {projectsStatus === "loading" && (
+          <StatePanel>
+            <Loader2 className="mx-auto mb-2 h-4 w-4 animate-spin" />
+            Loading projects…
+          </StatePanel>
+        )}
+        {projectsStatus === "error" && (
+          <StatePanel>
+            <p>Projects could not be loaded.</p>
+            <Button variant="outline" size="sm" className="mt-3" onClick={retryLoad}>
+              Try again
+            </Button>
+          </StatePanel>
+        )}
+        {ready && filtered.length === 0 && (
+          <StatePanel>
+            {scoped.length ? (
+              <p>No projects match these filters.</p>
+            ) : (
+              <>
+                <p>No projects yet.</p>
+                <Button size="sm" className="mt-3" onClick={() => setCreateOpen(true)}>
+                  <Plus className="h-3.5 w-3.5" /> New Project
+                </Button>
+              </>
+            )}
+          </StatePanel>
+        )}
+        {ready && filtered.length > 0 && view === "grid" && (
           <div className="grid gap-4 grid-cols-1 md:grid-cols-2 xl:grid-cols-3">
             {filtered.map((p) => (
               <ProjectCard key={p.id} project={p} onOpen={() => setSelected(p)} />
             ))}
           </div>
         )}
-        {view === "list" && <ProjectList items={filtered} onOpen={(p) => setSelected(p)} />}
-        {view === "timeline" && <ProjectTimeline items={filtered} onOpen={(p) => setSelected(p)} />}
+        {ready && filtered.length > 0 && view === "list" && (
+          <ProjectList items={filtered} onOpen={(p) => setSelected(p)} />
+        )}
+        {ready && filtered.length > 0 && view === "timeline" && (
+          <ProjectTimeline items={filtered} onOpen={(p) => setSelected(p)} />
+        )}
       </div>
 
       <ProjectFormDialog
         open={createOpen}
         onClose={() => setCreateOpen(false)}
         onSubmit={handleProjectCreated}
-        nextNumber={projectItems.length + 120}
       />
     </>
+  );
+}
+
+function StatePanel({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="rounded-xl border border-border bg-card p-10 text-center text-sm text-muted-foreground shadow-[var(--shadow-soft)]">
+      {children}
+    </div>
   );
 }
 
@@ -423,6 +778,20 @@ function Metric({
   );
 }
 
+function HealthBadge({ health, className }: { health: ProjectHealth; className?: string }) {
+  return (
+    <span
+      className={cn(
+        "rounded-md border px-2 py-0.5 text-[10px] font-medium",
+        healthStyles[health],
+        className,
+      )}
+    >
+      {healthLabel[health]}
+    </span>
+  );
+}
+
 /* ---------- Project Card ---------- */
 function ProjectCard({ project, onOpen }: { project: ProjectExt; onOpen: () => void }) {
   return (
@@ -440,17 +809,10 @@ function ProjectCard({ project, onOpen }: { project: ProjectExt; onOpen: () => v
           </span>
           <div className="min-w-0">
             <div className="font-semibold truncate">{project.name}</div>
-            <div className="text-xs text-muted-foreground truncate">{project.client}</div>
+            <div className="text-xs text-muted-foreground truncate">{projectSubtitle(project)}</div>
           </div>
         </div>
-        <span
-          className={cn(
-            "rounded-md border px-2 py-0.5 text-[10px] font-medium shrink-0",
-            statusStyles[project.status],
-          )}
-        >
-          {statusLabel[project.status]}
-        </span>
+        <HealthBadge health={project.health} className="shrink-0" />
       </div>
 
       <div className="mt-4 flex items-center gap-2 text-[11px] text-muted-foreground">
@@ -460,7 +822,14 @@ function ProjectCard({ project, onOpen }: { project: ProjectExt; onOpen: () => v
 
       <div className="mt-4">
         <div className="flex items-center justify-between text-xs">
-          <span className="text-muted-foreground">Progress</span>
+          <span className="text-muted-foreground">
+            Progress
+            {project.taskCount > 0 && (
+              <span className="ml-1">
+                · {project.taskCount - project.pendingTasks}/{project.taskCount} tasks
+              </span>
+            )}
+          </span>
           <span className="font-medium">{project.progress}%</span>
         </div>
         <div className="mt-1.5 h-1.5 rounded-full bg-muted overflow-hidden">
@@ -474,10 +843,13 @@ function ProjectCard({ project, onOpen }: { project: ProjectExt; onOpen: () => v
       <div className="mt-4 flex items-center justify-between">
         <AvatarStack people={project.team} />
         <div className="flex items-center gap-3 text-[11px] text-muted-foreground">
-          <span className="inline-flex items-center gap-1">
+          <span className="inline-flex items-center gap-1" title="Open tasks">
             <Clock className="h-3 w-3" /> {project.pendingTasks}
           </span>
-          <span className={cn("inline-flex items-center gap-1", riskColor[project.risk])}>
+          <span
+            className={cn("inline-flex items-center gap-1", riskColor[project.risk])}
+            title={`Risk: ${project.risk}`}
+          >
             <AlertTriangle className="h-3 w-3" /> {project.risk}
           </span>
           <ChevronRight className="h-3.5 w-3.5 opacity-0 group-hover:opacity-100 transition" />
@@ -488,6 +860,9 @@ function ProjectCard({ project, onOpen }: { project: ProjectExt; onOpen: () => v
 }
 
 function AvatarStack({ people }: { people: { initials: string; color: string; name: string }[] }) {
+  if (!people.length) {
+    return <span className="text-[11px] text-muted-foreground">No team yet</span>;
+  }
   return (
     <div className="flex -space-x-2">
       {people.slice(0, 4).map((p, i) => (
@@ -531,18 +906,11 @@ function ProjectList({ items, onOpen }: { items: ProjectExt[]; onOpen: (p: Proje
             <span className="h-7 w-7 rounded-md shrink-0" style={{ background: p.color }} />
             <div className="min-w-0">
               <div className="font-medium truncate">{p.name}</div>
-              <div className="text-xs text-muted-foreground truncate">{p.client}</div>
+              <div className="text-xs text-muted-foreground truncate">{projectSubtitle(p)}</div>
             </div>
           </div>
           <div>
-            <span
-              className={cn(
-                "rounded-md border px-2 py-0.5 text-[10px] font-medium",
-                statusStyles[p.status],
-              )}
-            >
-              {statusLabel[p.status]}
-            </span>
+            <HealthBadge health={p.health} />
           </div>
           <div className="text-xs text-muted-foreground self-center">{fmtDate(p.deadline)}</div>
           <div className="self-center">
@@ -581,15 +949,20 @@ function ProjectTimeline({
   items: ProjectExt[];
   onOpen: (p: ProjectExt) => void;
 }) {
-  const min = Math.min(...items.map((p) => new Date(p.startDate).getTime()));
-  const max = Math.max(...items.map((p) => new Date(p.deadline).getTime()));
+  // Only projects with both dates can be placed; one without used to turn the
+  // whole scale into NaN.
+  const dated = items.filter((p) => hasDate(p.startDate) && hasDate(p.deadline));
+  const min = dated.length ? Math.min(...dated.map((p) => new Date(p.startDate).getTime())) : 0;
+  const max = dated.length ? Math.max(...dated.map((p) => new Date(p.deadline).getTime())) : 0;
   const span = max - min || 1;
   const months: string[] = [];
-  const cursor = new Date(min);
-  cursor.setDate(1);
-  while (cursor.getTime() <= max) {
-    months.push(cursor.toLocaleDateString(undefined, { month: "short" }));
-    cursor.setMonth(cursor.getMonth() + 1);
+  if (dated.length) {
+    const cursor = new Date(min);
+    cursor.setDate(1);
+    while (cursor.getTime() <= max) {
+      months.push(cursor.toLocaleDateString(undefined, { month: "short" }));
+      cursor.setMonth(cursor.getMonth() + 1);
+    }
   }
 
   return (
@@ -600,7 +973,7 @@ function ProjectTimeline({
         </div>
         <div
           className="grid border-l border-border"
-          style={{ gridTemplateColumns: `repeat(${months.length}, 1fr)` }}
+          style={{ gridTemplateColumns: `repeat(${Math.max(months.length, 1)}, 1fr)` }}
         >
           {months.map((m, i) => (
             <div
@@ -613,8 +986,9 @@ function ProjectTimeline({
         </div>
       </div>
       {items.map((p) => {
-        const start = ((new Date(p.startDate).getTime() - min) / span) * 100;
-        const end = ((new Date(p.deadline).getTime() - min) / span) * 100;
+        const placed = hasDate(p.startDate) && hasDate(p.deadline);
+        const start = placed ? ((new Date(p.startDate).getTime() - min) / span) * 100 : 0;
+        const end = placed ? ((new Date(p.deadline).getTime() - min) / span) * 100 : 0;
         return (
           <button
             key={p.id}
@@ -626,18 +1000,25 @@ function ProjectTimeline({
               <span className="text-sm font-medium truncate">{p.name}</span>
             </div>
             <div className="relative h-10 border-l border-border">
-              <div
-                className="absolute top-1/2 -translate-y-1/2 h-5 rounded-md flex items-center px-2 text-[10px] font-medium text-white shadow-sm"
-                style={{
-                  left: `${start}%`,
-                  width: `${Math.max(4, end - start)}%`,
-                  background: p.color,
-                  opacity: p.status === "delayed" ? 0.7 : 1,
-                  outline: p.status === "delayed" ? "1px dashed var(--priority-critical)" : "none",
-                }}
-              >
-                {p.progress}%
-              </div>
+              {placed ? (
+                <div
+                  className="absolute top-1/2 -translate-y-1/2 h-5 rounded-md flex items-center px-2 text-[10px] font-medium text-white shadow-sm"
+                  style={{
+                    left: `${start}%`,
+                    width: `${Math.max(4, end - start)}%`,
+                    background: p.color,
+                    opacity: p.health === "delayed" ? 0.7 : 1,
+                    outline:
+                      p.health === "delayed" ? "1px dashed var(--priority-critical)" : "none",
+                  }}
+                >
+                  {p.progress}%
+                </div>
+              ) : (
+                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-[11px] text-muted-foreground">
+                  No dates set
+                </span>
+              )}
             </div>
           </button>
         );
@@ -647,77 +1028,66 @@ function ProjectTimeline({
 }
 
 /* ---------- Create Project Dialog ---------- */
-type PersonOption = (typeof allPeople)[number] & {
+/**
+ * A real user, from useWorkspace().people, with the designation, department and
+ * team their membership records. The pickers used to list six invented people
+ * with made-up titles, so searching for a real colleague found nothing (FD-034).
+ */
+type PersonOption = PersonRef & {
   title: string;
   department: string;
   team: string;
+  departmentId?: string;
+  teamId?: string;
 };
 
-const peopleOptions: PersonOption[] = allPeople.map((person, index) => ({
-  ...person,
-  title:
-    [
-      "Operations Lead",
-      "Product Manager",
-      "Software Engineer",
-      "Creative Director",
-      "Finance Analyst",
-    ][index] ?? "Team Member",
-  department:
-    ["Operations", "Technology", "Technology", "Marketing", "Finance"][index] ?? "Operations",
-  team:
-    ["Operations", "Product", "Development Team", "Creative Team", "Finance"][index] ??
-    "Operations",
-}));
+const toPerson = ({ id, name, initials, color }: PersonOption): ProjectPerson => ({
+  id,
+  name,
+  initials,
+  color,
+});
 
-const clientOptions = [
-  "Northwind Co.",
-  "Lumen Labs",
-  "Pioneer Bank",
-  "Atlas Studios",
-  "Helix Health",
-];
-const departmentOptions = [
-  { value: "Operations", group: "Departments" },
-  { value: "Technology", group: "Departments" },
-  { value: "Marketing", group: "Departments" },
-  { value: "Finance", group: "Departments" },
-  { value: "Development Team", group: "Teams", detail: "Technology" },
-  { value: "Creative Team", group: "Teams", detail: "Marketing" },
-];
+const personDetail = (person: PersonOption) =>
+  [person.title, person.department].filter(Boolean).join(" · ") || undefined;
 
-const projectFormSchema = z
-  .object({
-    name: z
-      .string()
-      .trim()
-      .min(1, "Project name is required.")
-      .max(120, "Project name must be 120 characters or fewer."),
-    projectType: z.enum(["internal", "client"]),
-    category: z.string().min(1, "Please select a category."),
-    client: z.string(),
-    manager: z.string().min(1, "Please select a project manager."),
-    department: z.string().min(1, "Please select a department or team."),
-    status: z.enum(["planning", "active", "on-hold"]),
-    startDate: z.date({ required_error: "Please select a start date." }),
-    endDate: z.date({ required_error: "Please select a target end date." }),
-  })
-  .superRefine((value, context) => {
-    if (value.projectType === "client" && !value.client) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["client"],
-        message: "Please select a client for a client project.",
-      });
-    }
-    if (value.endDate < value.startDate) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["endDate"],
-        message: "Target end date cannot be earlier than the start date.",
-      });
-    }
-  });
+const makeProjectFormSchema = (requireCategory: boolean) =>
+  z
+    .object({
+      name: z
+        .string()
+        .trim()
+        .min(1, "Project name is required.")
+        .max(120, "Project name must be 120 characters or fewer."),
+      projectType: z.enum(["internal", "client"]),
+      // Required when creating. A project saved before categories existed has
+      // none, and must stay editable (FD-052).
+      category: requireCategory ? z.string().min(1, "Please select a category.") : z.string(),
+      client: z.string().trim().max(120, "Client name must be 120 characters or fewer."),
+      manager: z.string().min(1, "Please select a project manager."),
+      // Optional: seeded projects have no department, and a required one kept
+      // Save disabled on every one of them (FD-052).
+      department: z.string(),
+      status: z.enum(["planning", "active", "on-hold"]),
+      startDate: z.date({ required_error: "Please select a start date." }),
+      endDate: z.date({ required_error: "Please select a target end date." }),
+    })
+    .superRefine((value, context) => {
+      if (value.projectType === "client" && !value.client.trim()) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["client"],
+          message: "Please enter the client for a client project.",
+        });
+      }
+      if (value.endDate < value.startDate) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["endDate"],
+          message: "Target end date cannot be earlier than the start date.",
+        });
+      }
+    });
 
 type FormField =
   | "name"
@@ -725,37 +1095,62 @@ type FormField =
   | "client"
   | "manager"
   | "department"
+  | "members"
   | "status"
   | "startDate"
   | "endDate";
 
 export type ProjectFormInitial = {
+  /** The row being edited. Inside ProjectsPage the open project supplies it. */
+  id?: string;
+  orgId?: string;
   name: string;
   description?: string;
   projectType?: "internal" | "client";
   category?: string;
   client?: string;
+  /** Manager display name; resolved to a user id against useWorkspace().people. */
   manager: string;
+  managerId?: string | null;
+  /** Department or team name. */
   department?: string;
+  departmentId?: string | null;
+  teamId?: string | null;
   priority?: "low" | "medium" | "high" | "critical";
   creationStatus?: "planning" | "active" | "on-hold";
   startDate?: string;
   deadline?: string;
   teamNames?: string[];
+  teamIds?: string[];
+};
+
+/** Department / Team picker values: "department:<id>" or "team:<id>". */
+const scopeKey = (kind: "department" | "team", id: string) => `${kind}:${id}`;
+const parseScope = (value: string) => {
+  const [kind, id] = value.split(":");
+  return {
+    departmentId: kind === "department" && id ? id : null,
+    teamId: kind === "team" && id ? id : null,
+  };
 };
 
 export function ProjectFormDialog({
   open,
   onClose,
   onSubmit,
-  nextNumber,
   mode = "create",
   initial,
 }: {
   open: boolean;
   onClose: () => void;
-  onSubmit: (project: ProjectExt) => void;
-  nextNumber: number;
+  /**
+   * Awaited while the button shows progress; the caller closes the dialog when
+   * it is done, or leaves it open and says why. `files` are the attachments
+   * picked in create mode — in edit mode the form uploads them itself.
+   */
+  onSubmit: (project: ProjectExt, files: File[]) => void | boolean | Promise<void | boolean>;
+  /** No longer used: ids come from the database, not a running counter (FD-035). */
+  nextNumber?: number;
   mode?: "create" | "edit";
   initial?: ProjectFormInitial;
 }) {
@@ -764,12 +1159,22 @@ export function ProjectFormDialog({
     date.setHours(0, 0, 0, 0);
     return date;
   }, []);
+  // Field ids for label association; unique even if two forms are mounted.
+  const uid = useId();
+  const editing = useContext(EditingProjectContext);
+  const editingProject = mode === "edit" ? editing?.project : undefined;
+  const rowId = mode === "edit" ? (initial?.id ?? editingProject?.id) : undefined;
+
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [projectType, setProjectType] = useState<"internal" | "client">("internal");
-  const { activeOrgId } = useOrganizations();
+  const { departments, teams, users } = useOrganizations();
+  const { people } = useWorkspace();
+  const defaultOrgId = useDefaultOrgId();
+  // Pickers are scoped to the organization the project belongs to, so a
+  // department from another organization cannot be attached to it.
+  const formOrgId = initial?.orgId ?? editingProject?.orgId ?? defaultOrgId;
   const { categoriesFor } = useTaskSettings();
-  const categoryOptions = categoriesFor(activeOrgId);
   const [category, setCategory] = useState("");
   const [client, setClient] = useState("");
   const [manager, setManager] = useState("");
@@ -784,26 +1189,155 @@ export function ProjectFormDialog({
   const [submitting, setSubmitting] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
 
+  const categoryOptions = useMemo(() => {
+    const options = categoriesFor(formOrgId).map((item) => ({ id: item.id, name: item.name }));
+    // Keep a project's current category selectable even if it was deactivated.
+    return category && !options.some((item) => item.name === category)
+      ? [...options, { id: `current-${category}`, name: category }]
+      : options;
+  }, [categoriesFor, formOrgId, category]);
+
+  // Departments and teams from Teams & Departments — the one list (FD-036).
+  const orgDepartments = useMemo(
+    () =>
+      departments.filter(
+        (item) =>
+          (item.status === "active" || department === scopeKey("department", item.id)) &&
+          (!formOrgId || item.orgId === formOrgId),
+      ),
+    [departments, formOrgId, department],
+  );
+  const orgTeams = useMemo(
+    () =>
+      teams.filter(
+        (item) =>
+          (item.status === "active" || department === scopeKey("team", item.id)) &&
+          (!formOrgId || item.orgId === formOrgId),
+      ),
+    [teams, formOrgId, department],
+  );
+  const departmentOptions: SearchOption[] = useMemo(
+    () => [
+      ...(department ? [{ value: "", label: "No department or team" }] : []),
+      ...orgDepartments.map((item) => ({
+        value: scopeKey("department", item.id),
+        label: item.name,
+        group: "Departments",
+      })),
+      ...orgTeams.map((item) => ({
+        value: scopeKey("team", item.id),
+        label: item.name,
+        group: "Teams",
+        detail: departments.find((d) => d.id === item.departmentId)?.name,
+      })),
+    ],
+    [orgDepartments, orgTeams, departments, department],
+  );
+
+  const directory = useMemo<PersonOption[]>(
+    () =>
+      people
+        .map((person) => {
+          const user = users.find((item) => item.id === person.id);
+          const membership =
+            user?.memberships.find((item) => item.orgId === formOrgId) ?? user?.memberships[0];
+          return {
+            ...person,
+            title: user?.designation ?? "",
+            department: departments.find((d) => d.id === membership?.departmentId)?.name ?? "",
+            team: teams.find((t) => t.id === membership?.teamId)?.name ?? "",
+            departmentId: membership?.departmentId,
+            teamId: membership?.teamId,
+            // Unknown to the admin snapshot means we cannot tell, so keep them.
+            eligible:
+              !user ||
+              (user.status !== "inactive" &&
+                (!formOrgId || user.memberships.some((item) => item.orgId === formOrgId))),
+          };
+        })
+        .filter((person) => person.eligible || person.id === manager || members.includes(person.id))
+        .map(({ eligible: _eligible, ...person }) => person),
+    [people, users, departments, teams, formOrgId, manager, members],
+  );
+
+  // Resolve the names ProjectWorkspace passes in to real ids, preferring the
+  // ids of the project that is open.
+  const resolveManager = () => {
+    if (initial?.managerId) return initial.managerId;
+    if (editingProject?.managerId && editingProject.manager.name === initial?.manager) {
+      return editingProject.managerId;
+    }
+    return people.find((person) => person.name === initial?.manager)?.id ?? "";
+  };
+  const resolveMembers = () => {
+    if (initial?.teamIds) return initial.teamIds;
+    return (initial?.teamNames ?? [])
+      .map(
+        (memberName) =>
+          editingProject?.team.find((person) => person.name === memberName && person.id)?.id ??
+          people.find((person) => person.name === memberName)?.id,
+      )
+      .filter((id): id is string => Boolean(id));
+  };
+  const resolveDepartment = () => {
+    const teamId =
+      initial?.teamId ??
+      (editingProject?.department === initial?.department ? editingProject?.teamId : null);
+    if (teamId) return scopeKey("team", teamId);
+    const departmentId =
+      initial?.departmentId ??
+      (editingProject?.department === initial?.department ? editingProject?.departmentId : null);
+    if (departmentId) return scopeKey("department", departmentId);
+    if (!initial?.department) return "";
+    const byDepartment = departments.find(
+      (item) => item.name === initial.department && (!formOrgId || item.orgId === formOrgId),
+    );
+    if (byDepartment) return scopeKey("department", byDepartment.id);
+    const byTeam = teams.find(
+      (item) => item.name === initial.department && (!formOrgId || item.orgId === formOrgId),
+    );
+    return byTeam ? scopeKey("team", byTeam.id) : "";
+  };
+
   useEffect(() => {
     if (!open) return;
     setName(initial?.name ?? "");
     setDescription(initial?.description ?? "");
     setProjectType(initial?.projectType ?? "internal");
     setCategory(initial?.category ?? "");
-    setClient(initial?.client && initial.client !== "Internal" ? initial.client : "");
-    setManager(initial?.manager ?? "");
-    setDepartment(initial?.department ?? "");
+    setClient(
+      initial?.client && initial.client !== "Internal" && initial.client !== "Client"
+        ? initial.client
+        : "",
+    );
+    setManager(resolveManager());
+    setDepartment(resolveDepartment());
     setPriority(initial?.priority ?? "medium");
     setStatus(initial?.creationStatus ?? "planning");
-    setStartDate(initial?.startDate ? new Date(initial.startDate) : today);
-    setEndDate(initial?.deadline ? new Date(initial.deadline) : undefined);
-    setMembers(initial?.teamNames ?? []);
+    setStartDate(
+      initial?.startDate && hasDate(initial.startDate) ? new Date(initial.startDate) : today,
+    );
+    setEndDate(
+      initial?.deadline && hasDate(initial.deadline) ? new Date(initial.deadline) : undefined,
+    );
+    setMembers(resolveMembers());
     setFiles([]);
     setTouched({});
     setSubmitting(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
+  // People and departments can arrive after the dialog opens; fill in whatever
+  // could not be resolved yet, without overriding anything the user picked.
+  useEffect(() => {
+    if (!open || !initial) return;
+    if (!manager && !touched.manager) setManager(resolveManager());
+    if (!department && !touched.department) setDepartment(resolveDepartment());
+    if (!members.length && !touched.members) setMembers(resolveMembers());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, people.length, departments.length, teams.length]);
+
+  const projectFormSchema = useMemo(() => makeProjectFormSchema(mode === "create"), [mode]);
   const result = projectFormSchema.safeParse({
     name,
     projectType,
@@ -823,6 +1357,50 @@ export function ProjectFormDialog({
     if (!submitting) onClose();
   };
 
+  const addFiles = (picked: File[]) => {
+    const refused = picked
+      .map((file) => ({ file, reason: validateFile(file) }))
+      .filter((item) => item.reason);
+    if (refused.length) {
+      toast.error(refused.map((item) => `${item.file.name} ${item.reason}`).join("; "));
+    }
+    const accepted = picked.filter((file) => !validateFile(file));
+    if (accepted.length) setFiles((current) => [...current, ...accepted]);
+  };
+
+  /** Write an edit to work_projects and project_members. */
+  const persistEdit = async (id: string, project: ProjectExt): Promise<boolean> => {
+    const saved = await updateProjectRow(id, {
+      name: project.name,
+      description: project.description ?? "",
+      startDate: project.startDate,
+      dueDate: project.deadline,
+      priority: project.priority,
+      projectType: project.projectType,
+      clientName: project.projectType === "client" ? project.client : "",
+      categoryName: project.category !== (initial?.category ?? "") ? project.category : undefined,
+      managerId: project.managerId,
+      departmentId: project.departmentId,
+      teamId: project.teamId,
+      // Only when changed: ProjectWorkspace folds completed and cancelled into
+      // "active" before opening this form, so re-sending an untouched status
+      // would silently reopen a finished project.
+      status: status !== (initial?.creationStatus ?? "planning") ? status : undefined,
+    });
+    if (!saved) {
+      toast.error("Your changes could not be saved.");
+      return false;
+    }
+    if (!(await setProjectMembers(id, project.teamIds ?? []))) {
+      toast.error("The project was saved, but its team members could not be updated.");
+    }
+    if (files.length && project.orgId) {
+      await attachProjectFiles({ id, organizationId: project.orgId }, files);
+    }
+    editing?.onSaved(project);
+    return true;
+  };
+
   const submit = async () => {
     setTouched({
       name: true,
@@ -835,55 +1413,79 @@ export function ProjectFormDialog({
       endDate: true,
     });
     if (!result.success || !endDate || submitting) return;
-    const selectedManager = peopleOptions.find((person) => person.name === manager);
-    if (!selectedManager) return;
-    setSubmitting(true);
-    await new Promise((resolve) => setTimeout(resolve, 650));
-    const selectedTeam = peopleOptions.filter((person) => members.includes(person.name));
-    const team = [
-      selectedManager,
-      ...selectedTeam.filter((person) => person.name !== selectedManager.name),
-    ];
-    const mappedStatus: Project["status"] = status === "on-hold" ? "at-risk" : "on-track";
-    onSubmit({
-      id: `P-${nextNumber}`,
-      projectId: `PRJ-${String(nextNumber).padStart(5, "0")}`,
-      name: name.trim(),
+    const selectedManager = directory.find((person) => person.id === manager);
+    if (!selectedManager) {
+      toast.error("The selected project manager is no longer available. Please pick another.");
+      return;
+    }
+    const selectedTeam = directory.filter(
+      (person) => members.includes(person.id) && person.id !== selectedManager.id,
+    );
+    const team = [selectedManager, ...selectedTeam];
+    const scope = parseScope(department);
+    const trimmedName = name.trim();
+    const now = new Date().toISOString();
+    const project: ProjectExt = {
+      // In create mode the caller replaces this with the id the database returns.
+      id: rowId ?? "",
+      projectId: rowId ? displayId(rowId) : undefined,
+      name: trimmedName,
       description: description.trim(),
       projectType,
-      client: projectType === "client" ? client : "Internal",
+      client: projectType === "client" ? client.trim() : "Internal",
       category,
-      manager: selectedManager,
-      department,
+      manager: toPerson(selectedManager),
+      managerId: selectedManager.id,
+      department: departmentOptions.find((item) => item.value === department && item.value)?.label,
+      departmentId: scope.departmentId,
+      teamId: scope.teamId,
       priority,
       creationStatus: status,
       attachmentNames: files.map((file) => file.name),
-      createdBy: manager,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      status: mappedStatus,
-      startDate: startDate.toISOString(),
-      deadline: endDate.toISOString(),
-      team,
+      createdAt: editingProject?.createdAt ?? now,
+      updatedAt: now,
+      // Stored as the local calendar day. toISOString() used to shift a
+      // midnight date into the previous day for anyone east of UTC.
+      startDate: `${localDate(startDate)}T00:00:00`,
+      deadline: `${localDate(endDate)}T23:59:59`,
+      team: team.map(toPerson),
+      teamIds: team.map((person) => person.id),
       members: team.length,
-      progress: 0,
-      pendingTasks: 0,
-      risk: "low",
-      color: selectedManager.color,
-      isNew: true,
-    });
-    setSubmitting(false);
+      progress: editingProject?.progress ?? 0,
+      taskCount: editingProject?.taskCount ?? 0,
+      pendingTasks: editingProject?.pendingTasks ?? 0,
+      health: editingProject?.health ?? "no-tasks",
+      risk: editingProject?.risk ?? "low",
+      color: editingProject?.color ?? projectColor(trimmedName),
+      orgId: formOrgId,
+      isNew: mode === "create",
+    };
+    setSubmitting(true);
+    try {
+      if (mode === "edit" && rowId && !(await persistEdit(rowId, project))) return;
+      await onSubmit(project, mode === "create" ? files : []);
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
     <Dialog open={open} onOpenChange={(value) => !value && close()}>
-      <DialogContent className="max-h-[88vh] max-w-2xl grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0">
+      <DialogContent
+        aria-describedby={undefined}
+        className="max-h-[88vh] max-w-2xl grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0"
+      >
         <DialogHeader className="border-b border-border px-6 py-5">
           <DialogTitle>{mode === "edit" ? "Edit Project" : "Create New Project"}</DialogTitle>
         </DialogHeader>
         <div className="grid min-h-0 gap-5 overflow-y-auto px-6 py-5">
-          <FormControl label="Project Name*" error={touched.name ? errors.name?.[0] : undefined}>
+          <FormControl
+            id={`${uid}-name`}
+            label="Project Name*"
+            error={touched.name ? errors.name?.[0] : undefined}
+          >
             <Input
+              id={`${uid}-name`}
               value={name}
               maxLength={120}
               onBlur={() => setTouched((value) => ({ ...value, name: true }))}
@@ -893,8 +1495,9 @@ export function ProjectFormDialog({
             />
           </FormControl>
           <div className="grid gap-2">
-            <Label>Description</Label>
+            <Label htmlFor={`${uid}-description`}>Description</Label>
             <Textarea
+              id={`${uid}-description`}
               value={description}
               onChange={(event) => setDescription(event.target.value)}
               placeholder="Briefly describe the objective, scope and expected outcome..."
@@ -905,7 +1508,7 @@ export function ProjectFormDialog({
 
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="grid gap-2">
-              <Label>Project Type*</Label>
+              <Label htmlFor={`${uid}-type`}>Project Type*</Label>
               <Select
                 value={projectType}
                 onValueChange={(value: "internal" | "client") => {
@@ -913,7 +1516,7 @@ export function ProjectFormDialog({
                   if (value === "internal") setClient("");
                 }}
               >
-                <SelectTrigger>
+                <SelectTrigger id={`${uid}-type`}>
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -923,7 +1526,8 @@ export function ProjectFormDialog({
               </Select>
             </div>
             <FormControl
-              label="Category*"
+              id={`${uid}-category`}
+              label={mode === "create" ? "Category*" : "Category"}
               error={touched.category ? errors.category?.[0] : undefined}
             >
               <Select
@@ -933,7 +1537,7 @@ export function ProjectFormDialog({
                   setTouched((state) => ({ ...state, category: true }));
                 }}
               >
-                <SelectTrigger>
+                <SelectTrigger id={`${uid}-category`}>
                   <SelectValue placeholder="Select category" />
                 </SelectTrigger>
                 <SelectContent>
@@ -948,68 +1552,71 @@ export function ProjectFormDialog({
           </div>
 
           {projectType === "client" && (
-            <FormControl label="Client*" error={touched.client ? errors.client?.[0] : undefined}>
-              <SearchableSingle
+            // Free text: there is no clients table, and the old picker offered
+            // five invented companies (FD-014).
+            <FormControl
+              id={`${uid}-client`}
+              label="Client*"
+              error={touched.client ? errors.client?.[0] : undefined}
+            >
+              <Input
+                id={`${uid}-client`}
                 value={client}
-                onChange={(value) => {
-                  setClient(value);
-                  setTouched((state) => ({ ...state, client: true }));
-                }}
-                placeholder="Select client"
-                options={clientOptions.map((item) => ({ value: item, label: item }))}
+                maxLength={120}
+                onBlur={() => setTouched((state) => ({ ...state, client: true }))}
+                onChange={(event) => setClient(event.target.value)}
+                placeholder="Client or organization name"
+                aria-invalid={Boolean(touched.client && errors.client)}
               />
             </FormControl>
           )}
 
           <div className="grid gap-4 sm:grid-cols-2">
             <FormControl
+              id={`${uid}-manager`}
               label="Project Manager*"
               error={touched.manager ? errors.manager?.[0] : undefined}
             >
               <SearchableSingle
+                id={`${uid}-manager`}
                 value={manager}
                 onChange={(value) => {
                   setManager(value);
                   setTouched((state) => ({ ...state, manager: true }));
                 }}
                 placeholder="Assign project manager"
-                options={peopleOptions.map((person) => ({
-                  value: person.name,
+                emptyText={people.length ? "No people match." : "No people found yet."}
+                options={directory.map((person) => ({
+                  value: person.id,
                   label: person.name,
-                  detail: `${person.title} · ${person.department}`,
+                  detail: personDetail(person),
                   person,
                 }))}
               />
             </FormControl>
-            <FormControl
-              label="Department / Team*"
-              error={touched.department ? errors.department?.[0] : undefined}
-            >
+            <FormControl id={`${uid}-department`} label="Department / Team">
               <SearchableSingle
+                id={`${uid}-department`}
                 value={department}
                 onChange={(value) => {
                   setDepartment(value);
                   setTouched((state) => ({ ...state, department: true }));
                 }}
                 placeholder="Select department or team"
-                options={departmentOptions.map((item) => ({
-                  value: item.value,
-                  label: item.value,
-                  detail: item.detail,
-                  group: item.group,
-                }))}
+                emptyText="No departments or teams set up yet."
+                options={departmentOptions}
               />
             </FormControl>
           </div>
 
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="grid gap-2">
-              <Label>Priority</Label>
+              <Label htmlFor={`${uid}-priority`}>Priority</Label>
               <Select
                 value={priority}
                 onValueChange={(value: typeof priority) => setPriority(value)}
               >
-                <SelectTrigger>
+                <SelectTrigger id={`${uid}-priority`}>
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -1020,9 +1627,9 @@ export function ProjectFormDialog({
                 </SelectContent>
               </Select>
             </div>
-            <FormControl label="Status*">
+            <FormControl id={`${uid}-status`} label="Status*">
               <Select value={status} onValueChange={(value: typeof status) => setStatus(value)}>
-                <SelectTrigger>
+                <SelectTrigger id={`${uid}-status`}>
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -1037,10 +1644,12 @@ export function ProjectFormDialog({
           <div>
             <div className="grid gap-4 sm:grid-cols-2">
               <FormControl
+                id={`${uid}-start`}
                 label="Start Date*"
                 error={touched.startDate ? errors.startDate?.[0] : undefined}
               >
                 <DatePicker
+                  id={`${uid}-start`}
                   value={startDate}
                   onChange={(value) => {
                     if (value) setStartDate(value);
@@ -1050,10 +1659,12 @@ export function ProjectFormDialog({
                 />
               </FormControl>
               <FormControl
+                id={`${uid}-end`}
                 label="Target End Date*"
                 error={touched.endDate ? errors.endDate?.[0] : undefined}
               >
                 <DatePicker
+                  id={`${uid}-end`}
                   value={endDate}
                   onChange={(value) => {
                     setEndDate(value);
@@ -1071,12 +1682,19 @@ export function ProjectFormDialog({
           </div>
 
           <div className="grid gap-2">
-            <Label>Team Members</Label>
+            <Label htmlFor={`${uid}-members`}>Team Members</Label>
             <TeamMemberPicker
+              id={`${uid}-members`}
               selected={members}
-              onChange={setMembers}
-              department={department}
+              onChange={(value) => {
+                setMembers(value);
+                setTouched((state) => ({ ...state, members: true }));
+              }}
+              directory={directory}
+              scope={department}
               manager={manager}
+              departmentChoices={orgDepartments}
+              teamChoices={orgTeams}
             />
           </div>
 
@@ -1086,9 +1704,13 @@ export function ProjectFormDialog({
               className="hidden"
               type="file"
               multiple
-              onChange={(event) =>
-                setFiles((current) => [...current, ...Array.from(event.target.files ?? [])])
-              }
+              accept={FILE_RULES.accept}
+              aria-label="Attach files"
+              onChange={(event) => {
+                addFiles(Array.from(event.target.files ?? []));
+                // Let the same file be picked again after removing it.
+                event.target.value = "";
+              }}
             />
             <Button
               type="button"
@@ -1099,6 +1721,7 @@ export function ProjectFormDialog({
             >
               <Paperclip className="h-3.5 w-3.5" /> Attach files
             </Button>
+            <p className="text-[11px] text-muted-foreground">{FILE_RULES.label}</p>
             {files.map((file, index) => (
               <div
                 key={`${file.name}-${index}`}
@@ -1106,7 +1729,7 @@ export function ProjectFormDialog({
               >
                 <FileText className="h-4 w-4 text-muted-foreground" />
                 <span className="min-w-0 flex-1 truncate">{file.name}</span>
-                <span className="text-muted-foreground">{formatFileSize(file.size)}</span>
+                <span className="text-muted-foreground">{formatBytes(file.size)}</span>
                 <Button
                   type="button"
                   variant="ghost"
@@ -1127,7 +1750,7 @@ export function ProjectFormDialog({
           <Button variant="ghost" onClick={close} disabled={submitting}>
             Cancel
           </Button>
-          <Button onClick={submit} disabled={!result.success || submitting}>
+          <Button onClick={() => void submit()} disabled={!result.success || submitting}>
             {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
             {submitting
               ? mode === "edit"
@@ -1144,19 +1767,25 @@ export function ProjectFormDialog({
 }
 
 function FormControl({
+  id,
   label,
   error,
   children,
 }: {
+  id: string;
   label: string;
   error?: string;
   children: React.ReactNode;
 }) {
   return (
     <div className="grid gap-2">
-      <Label>{label}</Label>
+      <Label htmlFor={id}>{label}</Label>
       {children}
-      {error && <p className="text-xs text-destructive">{error}</p>}
+      {error && (
+        <p id={`${id}-error`} className="text-xs text-destructive">
+          {error}
+        </p>
+      )}
     </div>
   );
 }
@@ -1170,15 +1799,19 @@ type SearchOption = {
 };
 
 function SearchableSingle({
+  id,
   value,
   onChange,
   placeholder,
   options,
+  emptyText = "No results found.",
 }: {
+  id?: string;
   value: string;
   onChange: (value: string) => void;
   placeholder: string;
   options: SearchOption[];
+  emptyText?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -1186,11 +1819,12 @@ function SearchableSingle({
     `${option.label} ${option.detail ?? ""}`.toLowerCase().includes(query.toLowerCase()),
   );
   const groups = Array.from(new Set(filtered.map((option) => option.group ?? "")));
-  const selected = options.find((option) => option.value === value);
+  const selected = value ? options.find((option) => option.value === value) : undefined;
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
         <Button
+          id={id}
           type="button"
           variant="outline"
           className="h-9 w-full justify-between px-3 font-normal"
@@ -1208,6 +1842,7 @@ function SearchableSingle({
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             placeholder="Search..."
+            aria-label={`Search: ${placeholder}`}
             className="h-8 pl-8"
           />
         </div>
@@ -1224,7 +1859,7 @@ function SearchableSingle({
                 .map((option) => (
                   <button
                     type="button"
-                    key={option.value}
+                    key={option.value || "none"}
                     onClick={() => {
                       onChange(option.value);
                       setOpen(false);
@@ -1256,7 +1891,9 @@ function SearchableSingle({
             </div>
           ))}
           {filtered.length === 0 && (
-            <p className="px-2 py-4 text-center text-xs text-muted-foreground">No results found.</p>
+            <p className="px-2 py-4 text-center text-xs text-muted-foreground">
+              {options.length ? "No results found." : emptyText}
+            </p>
           )}
         </div>
       </PopoverContent>
@@ -1265,10 +1902,12 @@ function SearchableSingle({
 }
 
 function DatePicker({
+  id,
   value,
   onChange,
   placeholder,
 }: {
+  id?: string;
   value?: Date;
   onChange: (value?: Date) => void;
   placeholder: string;
@@ -1278,6 +1917,7 @@ function DatePicker({
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
         <Button
+          id={id}
           type="button"
           variant="outline"
           className="h-9 w-full justify-start px-3 font-normal"
@@ -1305,15 +1945,26 @@ function DatePicker({
 }
 
 function TeamMemberPicker({
+  id,
   selected,
   onChange,
-  department,
+  directory,
+  scope,
   manager,
+  departmentChoices,
+  teamChoices,
 }: {
+  id?: string;
+  /** User ids. */
   selected: string[];
   onChange: (value: string[]) => void;
-  department: string;
+  directory: PersonOption[];
+  /** The Department / Team picker value; matching people are listed first. */
+  scope: string;
+  /** Manager user id — already on the team, so not offered again. */
   manager: string;
+  departmentChoices: { id: string; name: string }[];
+  teamChoices: { id: string; name: string }[];
 }) {
   const [open, setOpen] = useState(false);
   const [expanded, setExpanded] = useState(false);
@@ -1322,20 +1973,22 @@ function TeamMemberPicker({
   const [teamFilter, setTeamFilter] = useState("all");
   const [draft, setDraft] = useState<string[]>(selected);
   const visibleMembers = expanded ? selected : selected.slice(0, 3);
-  const options = [...peopleOptions]
-    .sort(
-      (a, b) =>
-        Number(b.department === department || b.team === department) -
-        Number(a.department === department || a.team === department),
-    )
+  const { departmentId: scopeDepartment, teamId: scopeTeam } = parseScope(scope);
+  const inScope = (person: PersonOption) =>
+    Boolean(
+      (scopeDepartment && person.departmentId === scopeDepartment) ||
+      (scopeTeam && person.teamId === scopeTeam),
+    );
+  const options = [...directory]
+    .sort((a, b) => Number(inScope(b)) - Number(inScope(a)))
     .filter(
       (person) =>
-        person.name !== manager &&
-        `${person.name} ${person.title} ${person.department}`
+        person.id !== manager &&
+        `${person.name} ${person.title} ${person.department} ${person.team}`
           .toLowerCase()
           .includes(query.toLowerCase()) &&
-        (departmentFilter === "all" || person.department === departmentFilter) &&
-        (teamFilter === "all" || person.team === teamFilter),
+        (departmentFilter === "all" || person.departmentId === departmentFilter) &&
+        (teamFilter === "all" || person.teamId === teamFilter),
     );
   return (
     <div className="space-y-2">
@@ -1347,7 +2000,7 @@ function TeamMemberPicker({
         }}
       >
         <PopoverTrigger asChild>
-          <Button type="button" variant="outline" size="sm" className="w-fit">
+          <Button id={id} type="button" variant="outline" size="sm" className="w-fit">
             <UserPlus className="h-3.5 w-3.5" /> Add Team Members
           </Button>
         </PopoverTrigger>
@@ -1358,34 +2011,33 @@ function TeamMemberPicker({
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               placeholder="Search team members..."
+              aria-label="Search team members"
               className="h-8 pl-8"
             />
           </div>
           <div className="mt-2 grid grid-cols-2 gap-2">
             <Select value={departmentFilter} onValueChange={setDepartmentFilter}>
-              <SelectTrigger className="h-8 text-xs">
+              <SelectTrigger className="h-8 text-xs" aria-label="Filter by department">
                 <SelectValue placeholder="Department" />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">All departments</SelectItem>
-                {Array.from(new Set(peopleOptions.map((person) => person.department))).map(
-                  (item) => (
-                    <SelectItem key={item} value={item}>
-                      {item}
-                    </SelectItem>
-                  ),
-                )}
+                {departmentChoices.map((item) => (
+                  <SelectItem key={item.id} value={item.id}>
+                    {item.name}
+                  </SelectItem>
+                ))}
               </SelectContent>
             </Select>
             <Select value={teamFilter} onValueChange={setTeamFilter}>
-              <SelectTrigger className="h-8 text-xs">
+              <SelectTrigger className="h-8 text-xs" aria-label="Filter by team">
                 <SelectValue placeholder="Team" />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">All teams</SelectItem>
-                {Array.from(new Set(peopleOptions.map((person) => person.team))).map((item) => (
-                  <SelectItem key={item} value={item}>
-                    {item}
+                {teamChoices.map((item) => (
+                  <SelectItem key={item.id} value={item.id}>
+                    {item.name}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -1394,16 +2046,16 @@ function TeamMemberPicker({
           <div className="my-3 max-h-60 space-y-1 overflow-y-auto">
             {options.map((person) => (
               <label
-                key={person.name}
+                key={person.id}
                 className="flex cursor-pointer items-center gap-3 rounded-md px-2 py-2 hover:bg-accent"
               >
                 <Checkbox
-                  checked={draft.includes(person.name)}
+                  checked={draft.includes(person.id)}
                   onCheckedChange={(checked) =>
                     setDraft((current) =>
                       checked
-                        ? [...current, person.name]
-                        : current.filter((name) => name !== person.name),
+                        ? [...current, person.id]
+                        : current.filter((memberId) => memberId !== person.id),
                     )
                   }
                 />
@@ -1415,12 +2067,19 @@ function TeamMemberPicker({
                 </span>
                 <span className="min-w-0">
                   <span className="block truncate text-xs font-medium">{person.name}</span>
-                  <span className="block truncate text-[10px] text-muted-foreground">
-                    {person.title} · {person.department}
-                  </span>
+                  {personDetail(person) && (
+                    <span className="block truncate text-[10px] text-muted-foreground">
+                      {personDetail(person)}
+                    </span>
+                  )}
                 </span>
               </label>
             ))}
+            {options.length === 0 && (
+              <p className="px-2 py-4 text-center text-xs text-muted-foreground">
+                {directory.length ? "No people match." : "No people found yet."}
+              </p>
+            )}
           </div>
           <div className="flex justify-end gap-2 border-t border-border pt-3">
             <Button type="button" variant="ghost" size="sm" onClick={() => setOpen(false)}>
@@ -1441,24 +2100,25 @@ function TeamMemberPicker({
       </Popover>
       {selected.length > 0 && (
         <div className="flex flex-wrap gap-1.5">
-          {visibleMembers.map((name) => {
-            const person = peopleOptions.find((item) => item.name === name);
+          {visibleMembers.map((memberId) => {
+            const person = directory.find((item) => item.id === memberId);
+            const memberName = person?.name ?? "Unknown user";
             return (
               <span
-                key={name}
+                key={memberId}
                 className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-2 py-1 text-xs"
               >
                 <span
-                  className="flex h-4 w-4 items-center justify-center rounded-full text-[8px] font-semibold text-primary-foreground"
-                  style={{ background: person?.color }}
+                  className="flex h-4 w-4 items-center justify-center rounded-full bg-muted text-[8px] font-semibold text-primary-foreground"
+                  style={person ? { background: person.color } : undefined}
                 >
-                  {person?.initials}
+                  {person?.initials ?? "?"}
                 </span>
-                {name}
+                {memberName}
                 <button
                   type="button"
-                  aria-label={`Remove ${name}`}
-                  onClick={() => onChange(selected.filter((item) => item !== name))}
+                  aria-label={`Remove ${memberName}`}
+                  onClick={() => onChange(selected.filter((item) => item !== memberId))}
                 >
                   <X className="h-3 w-3 text-muted-foreground" />
                 </button>
@@ -1487,10 +2147,4 @@ function TeamMemberPicker({
       )}
     </div>
   );
-}
-
-function formatFileSize(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }

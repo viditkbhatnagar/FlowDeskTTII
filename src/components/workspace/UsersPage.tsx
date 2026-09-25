@@ -1,7 +1,7 @@
-import { useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import {
   Plus, MoreHorizontal, Eye, Pencil, Ban, ArrowLeft, Mail, Phone, Search,
-  CheckCircle2, Trash2, Building2, Shield, CalendarDays, X,
+  CheckCircle2, Trash2, Building2, Shield, CalendarDays, X, Info,
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -18,12 +18,12 @@ import {
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Switch } from "@/components/ui/switch";
 import {
-  useOrganizations, roleOptions,
-  type Membership, type OrgStatus, type OrgUser,
+  useOrganizations, validatePhone, plural, PHONE_RULES,
+  type Department, type Membership, type OrgStatus, type OrgUser, type Organization, type Team,
 } from "@/lib/organizations-data";
 import { useWorkspace } from "@/lib/workspace-data";
+import { todayIn } from "@/lib/today";
 
 const inputClass =
   "h-9 w-full rounded-lg border border-input bg-card px-3 text-sm outline-none transition focus:border-ring focus:ring-2 focus:ring-ring/20";
@@ -84,7 +84,7 @@ function Detail({ label, value }: { label: string; value?: string }) {
 
 export function UsersPage() {
   const {
-    users, organizations, departments, teams, countsFor, canManageUsers, setUserStatus,
+    status, users, organizations, departments, teams, roles, rolesFor, canManageUsers, setUserStatus,
   } = useOrganizations();
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -98,22 +98,44 @@ export function UsersPage() {
   const [roleFilter, setRoleFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState("all");
 
+  const multiOrg = organizations.length > 1;
   const orgName = (id: string) => organizations.find((o) => o.id === id)?.name ?? "—";
   const deptName = (id?: string) => departments.find((d) => d.id === id)?.name ?? "—";
   const teamName = (id?: string) => teams.find((t) => t.id === id)?.name ?? "—";
+  const visibleMemberships = (user: OrgUser) =>
+    user.memberships.filter((m) => organizations.some((o) => o.id === m.orgId));
 
   const filterDepartments = useMemo(
     () => (orgFilter === "all" ? departments : departments.filter((d) => d.orgId === orgFilter)),
     [departments, orgFilter],
   );
   const filterTeams = useMemo(
-    () => (deptFilter === "all" ? teams : teams.filter((t) => t.departmentId === deptFilter)),
-    [teams, deptFilter],
+    () =>
+      deptFilter !== "all"
+        ? teams.filter((t) => t.departmentId === deptFilter)
+        : orgFilter === "all"
+          ? teams
+          : teams.filter((t) => t.orgId === orgFilter),
+    [teams, deptFilter, orgFilter],
+  );
+  // Real role names, once each. Was a hardcoded Admin / Manager / Member / Viewer
+  // list that matched none of the database's roles (FD-037).
+  const filterRoles = useMemo(() => {
+    const scoped = orgFilter === "all" ? roles : rolesFor(orgFilter);
+    return [...new Set(scoped.map((r) => r.name))];
+  }, [roles, rolesFor, orgFilter]);
+
+  // Everyone in the chosen organization. The header totals use this, so with an
+  // organization picked they equal that organization's Users on Organizations.
+  const scopedUsers = useMemo(
+    () =>
+      orgFilter === "all" ? users : users.filter((u) => u.memberships.some((m) => m.orgId === orgFilter)),
+    [users, orgFilter],
   );
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return users.filter((u) => {
+    return scopedUsers.filter((u) => {
       if (
         q &&
         !u.name.toLowerCase().includes(q) &&
@@ -126,13 +148,14 @@ export function UsersPage() {
         orgFilter === "all"
           ? u.memberships
           : u.memberships.filter((m) => m.orgId === orgFilter);
-      if (scope.length === 0) return false;
+      // People with no organization assignment used to be dropped from the list
+      // while still counted in Total Users (FD-037).
       if (deptFilter !== "all" && !scope.some((m) => m.departmentId === deptFilter)) return false;
       if (teamFilter !== "all" && !scope.some((m) => m.teamId === teamFilter)) return false;
       if (roleFilter !== "all" && !scope.some((m) => m.role === roleFilter)) return false;
       return true;
     });
-  }, [users, query, statusFilter, orgFilter, deptFilter, teamFilter, roleFilter]);
+  }, [scopedUsers, query, statusFilter, orgFilter, deptFilter, teamFilter, roleFilter]);
 
   const selected = users.find((u) => u.id === selectedId) ?? null;
 
@@ -151,8 +174,8 @@ export function UsersPage() {
     );
   }
 
-  const total = users.length;
-  const active = users.filter((u) => u.status === "active").length;
+  const total = scopedUsers.length;
+  const active = scopedUsers.filter((u) => u.status === "active").length;
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -191,27 +214,35 @@ export function UsersPage() {
         <div className="relative">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <input
+            aria-label="Search users"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search users"
             className={cn(inputClass, "w-56 pl-8")}
           />
         </div>
+        {/* With one organization "All Organizations" and its name were the same
+            filter twice (FD-051). */}
+        {multiOrg && (
+          <select
+            aria-label="Filter by organization"
+            value={orgFilter}
+            onChange={(e) => {
+              setOrgFilter(e.target.value);
+              setDeptFilter("all");
+              setTeamFilter("all");
+              setRoleFilter("all");
+            }}
+            className={cn(inputClass, "w-48")}
+          >
+            <option value="all">All Organizations</option>
+            {organizations.map((o) => (
+              <option key={o.id} value={o.id}>{o.name}</option>
+            ))}
+          </select>
+        )}
         <select
-          value={orgFilter}
-          onChange={(e) => {
-            setOrgFilter(e.target.value);
-            setDeptFilter("all");
-            setTeamFilter("all");
-          }}
-          className={cn(inputClass, "w-48")}
-        >
-          <option value="all">All Organizations</option>
-          {organizations.map((o) => (
-            <option key={o.id} value={o.id}>{o.name}</option>
-          ))}
-        </select>
-        <select
+          aria-label="Filter by department"
           value={deptFilter}
           onChange={(e) => {
             setDeptFilter(e.target.value);
@@ -220,31 +251,36 @@ export function UsersPage() {
           className={cn(inputClass, "w-44")}
         >
           <option value="all">All Departments</option>
-          {filterDepartments.map((d) => (
-            <option key={d.id} value={d.id}>{d.name}</option>
-          ))}
+          <GroupedOptions
+            items={filterDepartments}
+            groupOf={(d) => (multiOrg && orgFilter === "all" ? orgName(d.orgId) : null)}
+          />
         </select>
         <select
+          aria-label="Filter by team"
           value={teamFilter}
           onChange={(e) => setTeamFilter(e.target.value)}
           className={cn(inputClass, "w-40")}
         >
           <option value="all">All Teams</option>
-          {filterTeams.map((t) => (
-            <option key={t.id} value={t.id}>{t.name}</option>
-          ))}
+          <GroupedOptions
+            items={filterTeams}
+            groupOf={(t) => (deptFilter === "all" ? deptName(t.departmentId) : null)}
+          />
         </select>
         <select
+          aria-label="Filter by role"
           value={roleFilter}
           onChange={(e) => setRoleFilter(e.target.value)}
           className={cn(inputClass, "w-36")}
         >
           <option value="all">All Roles</option>
-          {roleOptions.map((r) => (
+          {filterRoles.map((r) => (
             <option key={r} value={r}>{r}</option>
           ))}
         </select>
         <select
+          aria-label="Filter by status"
           value={statusFilter}
           onChange={(e) => setStatusFilter(e.target.value)}
           className={cn(inputClass, "w-32")}
@@ -277,7 +313,9 @@ export function UsersPage() {
                   (orgFilter !== "all" && user.memberships.find((m) => m.orgId === orgFilter)) ||
                   user.memberships.find((m) => m.orgId === user.primaryOrgId) ||
                   user.memberships[0];
-                const extra = user.memberships.length - 1;
+                // Only organizations this viewer can actually see, and never with a
+                // single organization ("upCarrera +1" with one org, FD-051).
+                const extra = multiOrg ? visibleMemberships(user).length - 1 : 0;
                 return (
                   <tr
                     key={user.id}
@@ -297,16 +335,23 @@ export function UsersPage() {
                     </td>
                     <td className="px-4 py-3 text-muted-foreground">{user.employeeId ?? "—"}</td>
                     <td className="px-4 py-3">
-                      {orgName(scoped?.orgId ?? user.primaryOrgId)}
+                      {scoped ? (
+                        orgName(scoped.orgId)
+                      ) : (
+                        <span className="text-muted-foreground">Not assigned</span>
+                      )}
                       {extra > 0 && orgFilter === "all" && (
-                        <span className="ml-1.5 rounded-md bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                        <span
+                          className="ml-1.5 rounded-md bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+                          title={plural(extra, "more organization")}
+                        >
                           +{extra}
                         </span>
                       )}
                     </td>
                     <td className="px-4 py-3">{deptName(scoped?.departmentId)}</td>
                     <td className="px-4 py-3">{teamName(scoped?.teamId)}</td>
-                    <td className="px-4 py-3">{user.designation}</td>
+                    <td className="px-4 py-3">{user.designation || "—"}</td>
                     <td className="px-4 py-3">{scoped?.role ?? "—"}</td>
                     <td className="px-4 py-3"><StatusPill status={user.status} /></td>
                     <td className="px-4 py-3 text-right">
@@ -352,7 +397,11 @@ export function UsersPage() {
               {filtered.length === 0 && (
                 <tr>
                   <td colSpan={9} className="px-4 py-10 text-center text-sm text-muted-foreground">
-                    No users match these filters.
+                    {status === "loading"
+                      ? "Loading users…"
+                      : status === "error"
+                        ? "Users could not be loaded. Refresh to try again."
+                        : "No users match these filters."}
                   </td>
                 </tr>
               )}
@@ -363,8 +412,41 @@ export function UsersPage() {
 
       <UserDrawer target={drawerUser} onClose={() => setDrawerUser(null)} />
       <DeactivateDialog user={deactivateUser} onClose={() => setDeactivateUser(null)} />
-      <div className="sr-only">{countsFor(organizations[0]?.id ?? "").users} users indexed</div>
+      {/* Was "{first organization's count} users indexed", which disagreed with the
+          total above whenever a second organization existed (FD-037). */}
+      <div className="sr-only" role="status">
+        Showing {filtered.length} of {plural(total, "user")}
+      </div>
     </div>
+  );
+}
+
+/** Options, grouped under a heading when groupOf returns one — so two departments
+ *  called "Operations" in different organizations no longer look like a duplicate. */
+function GroupedOptions<T extends { id: string; name: string }>({
+  items, groupOf,
+}: { items: T[]; groupOf: (item: T) => string | null }) {
+  const groups = new Map<string | null, T[]>();
+  for (const item of items) {
+    const key = groupOf(item);
+    groups.set(key, [...(groups.get(key) ?? []), item]);
+  }
+  if (groups.size <= 1 && !groups.has(null) && items.length) {
+    // One heading only: no need to group.
+    return <>{items.map((i) => <option key={i.id} value={i.id}>{i.name}</option>)}</>;
+  }
+  return (
+    <>
+      {[...groups.entries()].map(([group, list]) =>
+        group ? (
+          <optgroup key={group} label={group}>
+            {list.map((i) => <option key={i.id} value={i.id}>{i.name}</option>)}
+          </optgroup>
+        ) : (
+          list.map((i) => <option key={i.id} value={i.id}>{i.name}</option>)
+        ),
+      )}
+    </>
   );
 }
 
@@ -378,26 +460,163 @@ type DraftMembership = {
   reportingManagerId: string;
 };
 
+const blankDraft = (role: string): DraftMembership => ({
+  orgId: "", departmentId: "", teamId: "", role, reportingManagerId: "",
+});
+
+/**
+ * One organization assignment. This was declared inside UserDrawer, so React saw
+ * a brand-new component on every keystroke and remounted every field.
+ */
+function AssignmentFields({
+  value, onChange, allowRole = true, lockOrganization = false, organizations, departments, teams,
+  users, roleNames, defaultRoleFor,
+}: {
+  value: DraftMembership;
+  onChange: (next: DraftMembership) => void;
+  allowRole?: boolean;
+  lockOrganization?: boolean;
+  organizations: Organization[];
+  departments: Department[];
+  teams: Team[];
+  users: OrgUser[];
+  roleNames: (orgId: string, current?: string) => string[];
+  defaultRoleFor: (orgId: string) => string;
+}) {
+  const id = useId();
+  const managerOptions = [...users].sort((a, b) => {
+    const aIn = a.memberships.some((m) => m.orgId === value.orgId) ? 0 : 1;
+    const bIn = b.memberships.some((m) => m.orgId === value.orgId) ? 0 : 1;
+    return aIn - bIn || a.name.localeCompare(b.name);
+  });
+
+  return (
+    <div className="grid gap-3 sm:grid-cols-2">
+      <div className="space-y-1.5">
+        <label htmlFor={`${id}-org`} className={labelClass}>Organization</label>
+        <select
+          id={`${id}-org`}
+          value={value.orgId}
+          onChange={(e) =>
+            onChange({
+              ...value,
+              orgId: e.target.value,
+              departmentId: "",
+              teamId: "",
+              reportingManagerId: "",
+              role: defaultRoleFor(e.target.value),
+            })
+          }
+          className={inputClass}
+          disabled={lockOrganization}
+        >
+          <option value="">Select organization</option>
+          {organizations.map((o) => (
+            <option key={o.id} value={o.id}>{o.name}</option>
+          ))}
+        </select>
+      </div>
+      <div className="space-y-1.5">
+        <label htmlFor={`${id}-dept`} className={labelClass}>Department</label>
+        <select
+          id={`${id}-dept`}
+          value={value.departmentId}
+          onChange={(e) => onChange({ ...value, departmentId: e.target.value, teamId: "" })}
+          className={inputClass}
+          disabled={!value.orgId}
+        >
+          <option value="">Select department</option>
+          {departments
+            .filter((d) => d.orgId === value.orgId && (d.status === "active" || d.id === value.departmentId))
+            .map((d) => (
+              <option key={d.id} value={d.id}>{d.name}</option>
+            ))}
+        </select>
+      </div>
+      <div className="space-y-1.5">
+        <label htmlFor={`${id}-team`} className={labelClass}>Team</label>
+        <select
+          id={`${id}-team`}
+          value={value.teamId}
+          onChange={(e) => onChange({ ...value, teamId: e.target.value })}
+          className={inputClass}
+          disabled={!value.departmentId}
+        >
+          <option value="">No team</option>
+          {teams.filter((t) => t.departmentId === value.departmentId).map((t) => (
+            <option key={t.id} value={t.id}>{t.name}</option>
+          ))}
+        </select>
+      </div>
+      <div className="space-y-1.5">
+        <label htmlFor={`${id}-manager`} className={labelClass}>Reporting Manager</label>
+        <select
+          id={`${id}-manager`}
+          value={value.reportingManagerId}
+          onChange={(e) => onChange({ ...value, reportingManagerId: e.target.value })}
+          className={inputClass}
+          disabled={!value.orgId}
+        >
+          <option value="">No manager</option>
+          {managerOptions.map((u) => (
+            <option key={u.id} value={u.id}>
+              {u.name}
+              {u.memberships.some((m) => m.orgId === value.orgId) ? "" : " (other organization)"}
+            </option>
+          ))}
+        </select>
+      </div>
+      {allowRole && (
+        <div className="space-y-1.5">
+          <label htmlFor={`${id}-role`} className={labelClass}>Role</label>
+          <select
+            id={`${id}-role`}
+            value={value.role}
+            onChange={(e) => onChange({ ...value, role: e.target.value })}
+            className={inputClass}
+            disabled={!value.orgId}
+          >
+            {roleNames(value.orgId, value.role).map((r) => (
+              <option key={r} value={r}>{r}</option>
+            ))}
+          </select>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The role names offered in an organization: active roles, plus the current one if it is not. */
+function useRoleChoices() {
+  const { rolesFor, defaultRoleName } = useOrganizations();
+  const roleNames = (orgId: string, current?: string) => {
+    const names = rolesFor(orgId).filter((r) => r.status === "active").map((r) => r.name);
+    const withCurrent = current && !names.includes(current) ? [current, ...names] : names;
+    return withCurrent.length ? withCurrent : [defaultRoleName(orgId)];
+  };
+  return { roleNames, defaultRoleFor: defaultRoleName };
+}
+
 function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClose: () => void }) {
   const {
-    organizations, departments, teams, users, addUser, updateUser, isEmailTaken,
-    upsertMembership, logUserActivity,
+    organizations, departments, teams, users, updateUser, isEmailTaken, logUserActivity,
+    isAdminIn, activeAdminCountIn,
   } = useOrganizations();
+  const { roleNames, defaultRoleFor } = useRoleChoices();
   const isNew = target === "new";
   const existing = target && target !== "new" ? target : null;
+  const fieldId = useId();
 
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [phone, setPhone] = useState("");
+  const [phoneTouched, setPhoneTouched] = useState(false);
   const [avatarUrl, setAvatarUrl] = useState("");
   const [employeeId, setEmployeeId] = useState("");
   const [designation, setDesignation] = useState("");
   const [joiningDate, setJoiningDate] = useState("");
   const [status, setStatus] = useState<OrgStatus>("active");
-  const [sendLogin, setSendLogin] = useState(true);
-  const [primary, setPrimary] = useState<DraftMembership>({
-    orgId: "", departmentId: "", teamId: "", role: "Member", reportingManagerId: "",
-  });
+  const [primary, setPrimary] = useState<DraftMembership>(blankDraft("Employee"));
   const [additional, setAdditional] = useState<DraftMembership[]>([]);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [seed, setSeed] = useState<string | null>(null);
@@ -407,9 +626,11 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
   if (target && seed !== key) {
     setSeed(key);
     setErrors({});
+    setPhoneTouched(false);
     if (existing) {
       const primaryMembership =
         existing.memberships.find((m) => m.orgId === existing.primaryOrgId) ?? existing.memberships[0];
+      const primaryOrgId = existing.primaryOrgId || primaryMembership?.orgId || "";
       setName(existing.name);
       setEmail(existing.email);
       setPhone(existing.phone ?? "");
@@ -419,15 +640,15 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
       setJoiningDate(existing.joiningDate ?? "");
       setStatus(existing.status);
       setPrimary({
-        orgId: existing.primaryOrgId,
+        orgId: primaryOrgId,
         departmentId: primaryMembership?.departmentId ?? "",
         teamId: primaryMembership?.teamId ?? "",
-        role: primaryMembership?.role ?? "Member",
+        role: primaryMembership?.role ?? defaultRoleFor(primaryOrgId),
         reportingManagerId: primaryMembership?.reportingManagerId ?? "",
       });
       setAdditional(
         existing.memberships
-          .filter((m) => m.orgId !== existing.primaryOrgId)
+          .filter((m) => m.orgId !== primaryOrgId)
           .map((m) => ({
             orgId: m.orgId,
             departmentId: m.departmentId ?? "",
@@ -438,11 +659,16 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
       );
     } else {
       setName(""); setEmail(""); setPhone(""); setAvatarUrl(""); setEmployeeId("");
-      setDesignation(""); setJoiningDate(""); setStatus("active"); setSendLogin(true);
-      setPrimary({ orgId: "", departmentId: "", teamId: "", role: "Member", reportingManagerId: "" });
+      setDesignation(""); setJoiningDate(""); setStatus("active");
+      setPrimary(blankDraft("Employee"));
       setAdditional([]);
     }
   }
+
+  const phoneError = validatePhone(phone);
+  // Invalid characters show at once; length only once the field is left (FD-050).
+  const showPhoneError =
+    !!phoneError && (phoneTouched || /[^0-9+\-() ]/.test(phone) || !!errors.phone);
 
   const submit = () => {
     const next: Record<string, string> = {};
@@ -450,6 +676,7 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
     if (!email.trim()) next.email = "Email is required";
     else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) next.email = "Enter a valid email";
     else if (isEmailTaken(email, existing?.id)) next.email = "This email already has an account";
+    if (phoneError) next.phone = phoneError;
     if (!designation.trim()) next.designation = "Designation is required";
     if (!primary.orgId) next.org = "Primary organization is required";
     if (!primary.departmentId) next.dept = "Department is required";
@@ -459,7 +686,12 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
     if (new Set([primary.orgId, ...additional.map((a) => a.orgId)]).size !== additional.length + 1)
       next.additional = "An organization can only be assigned once";
     setErrors(next);
+    setPhoneTouched(true);
     if (Object.keys(next).length > 0) return;
+    // Accounts are created on the server; the browser key cannot (and must not)
+    // mint logins. This used to add a row that vanished on refresh, with a toast
+    // saying login details had been sent — nothing was sent.
+    if (!existing) return;
 
     const memberships: Membership[] = [
       {
@@ -480,133 +712,35 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
       })),
     ];
 
-    if (existing) {
-      updateUser(existing.id, {
-        name: name.trim(),
-        email: email.trim(),
-        phone: phone.trim() || undefined,
-        avatarUrl: avatarUrl.trim() || undefined,
-        employeeId: employeeId.trim() || undefined,
-        designation: designation.trim(),
-        joiningDate: joiningDate || undefined,
-        status,
-        primaryOrgId: primary.orgId,
-        memberships,
-      });
-      logUserActivity(existing.id, "updated", "User details updated");
-      toast.success(`${name.trim()} updated`);
-    } else {
-      const created = addUser({
-        name: name.trim(),
-        email: email.trim(),
-        phone: phone.trim() || undefined,
-        avatarUrl: avatarUrl.trim() || undefined,
-        employeeId: employeeId.trim() || undefined,
-        designation: designation.trim(),
-        joiningDate: joiningDate || undefined,
-        status,
-        primaryOrgId: primary.orgId,
-        memberships,
-      });
-      memberships.slice(1).forEach((m) => upsertMembership(created.id, m));
-      toast.success(
-        sendLogin ? `${name.trim()} added — login details sent` : `${name.trim()} added`,
-      );
+    // The Roles page refuses to demote the last Admin; this form did not.
+    const demotesLastAdmin = existing.memberships.some((before) => {
+      if (!isAdminIn(existing, before.orgId) || existing.status !== "active") return false;
+      const after = memberships.find((m) => m.orgId === before.orgId);
+      const stillAdmin = after && isAdminIn({ ...existing, memberships: [after] }, before.orgId);
+      return !stillAdmin && activeAdminCountIn(before.orgId) <= 1;
+    });
+    if (demotesLastAdmin) {
+      setErrors({ role: "There must always be at least one active Admin. Make someone else Admin first." });
+      return;
     }
+
+    updateUser(existing.id, {
+      name: name.trim(),
+      email: email.trim(),
+      phone: phone.trim() || undefined,
+      avatarUrl: avatarUrl.trim() || undefined,
+      employeeId: employeeId.trim() || undefined,
+      designation: designation.trim(),
+      joiningDate: joiningDate || undefined,
+      status,
+      memberships,
+    });
+    logUserActivity(existing.id, "updated", "User details updated");
+    toast.success(`${name.trim()} updated`);
     onClose();
   };
 
-  const managerOptions = (orgId: string) =>
-    [...users].sort((a, b) => {
-      const aIn = a.memberships.some((m) => m.orgId === orgId) ? 0 : 1;
-      const bIn = b.memberships.some((m) => m.orgId === orgId) ? 0 : 1;
-      return aIn - bIn || a.name.localeCompare(b.name);
-    });
-
-  const AssignmentFields = ({
-    value, onChange, allowRole = true,
-  }: {
-    value: DraftMembership;
-    onChange: (next: DraftMembership) => void;
-    allowRole?: boolean;
-  }) => (
-    <div className="grid gap-3 sm:grid-cols-2">
-      <div className="space-y-1.5">
-        <label className={labelClass}>Organization</label>
-        <select
-          value={value.orgId}
-          onChange={(e) =>
-            onChange({ ...value, orgId: e.target.value, departmentId: "", teamId: "", reportingManagerId: "" })
-          }
-          className={inputClass}
-        >
-          <option value="">Select organization</option>
-          {organizations.map((o) => (
-            <option key={o.id} value={o.id}>{o.name}</option>
-          ))}
-        </select>
-      </div>
-      <div className="space-y-1.5">
-        <label className={labelClass}>Department</label>
-        <select
-          value={value.departmentId}
-          onChange={(e) => onChange({ ...value, departmentId: e.target.value, teamId: "" })}
-          className={inputClass}
-          disabled={!value.orgId}
-        >
-          <option value="">Select department</option>
-          {departments.filter((d) => d.orgId === value.orgId).map((d) => (
-            <option key={d.id} value={d.id}>{d.name}</option>
-          ))}
-        </select>
-      </div>
-      <div className="space-y-1.5">
-        <label className={labelClass}>Team</label>
-        <select
-          value={value.teamId}
-          onChange={(e) => onChange({ ...value, teamId: e.target.value })}
-          className={inputClass}
-          disabled={!value.departmentId}
-        >
-          <option value="">No team</option>
-          {teams.filter((t) => t.departmentId === value.departmentId).map((t) => (
-            <option key={t.id} value={t.id}>{t.name}</option>
-          ))}
-        </select>
-      </div>
-      <div className="space-y-1.5">
-        <label className={labelClass}>Reporting Manager</label>
-        <select
-          value={value.reportingManagerId}
-          onChange={(e) => onChange({ ...value, reportingManagerId: e.target.value })}
-          className={inputClass}
-          disabled={!value.orgId}
-        >
-          <option value="">No manager</option>
-          {managerOptions(value.orgId).map((u) => (
-            <option key={u.id} value={u.id}>
-              {u.name}
-              {u.memberships.some((m) => m.orgId === value.orgId) ? "" : " (other organization)"}
-            </option>
-          ))}
-        </select>
-      </div>
-      {allowRole && (
-        <div className="space-y-1.5">
-          <label className={labelClass}>Role</label>
-          <select
-            value={value.role}
-            onChange={(e) => onChange({ ...value, role: e.target.value })}
-            className={inputClass}
-          >
-            {roleOptions.map((r) => (
-              <option key={r} value={r}>{r}</option>
-            ))}
-          </select>
-        </div>
-      )}
-    </div>
-  );
+  const assignmentProps = { organizations, departments, teams, users, roleNames, defaultRoleFor };
 
   return (
     <Sheet open={!!target} onOpenChange={(open) => !open && onClose()}>
@@ -619,26 +753,53 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
         </SheetHeader>
 
         <div className="flex-1 space-y-6 overflow-y-auto px-6 py-5">
+          {isNew && (
+            <div className="flex gap-2 rounded-xl border border-border bg-muted/40 px-3 py-2.5 text-xs text-muted-foreground">
+              <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <p>
+                New accounts can't be created from the browser yet: a login has to be set up on the server
+                by the FlowDesk administrator. Once the person has an account they appear in this list, and
+                you can assign their department, team and role here.
+              </p>
+            </div>
+          )}
+
           <section className="space-y-3">
             <div className={sectionClass}>Personal</div>
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="space-y-1.5 sm:col-span-2">
-                <label className={labelClass}>Full Name *</label>
-                <input value={name} onChange={(e) => setName(e.target.value)} className={inputClass} placeholder="e.g. Neha Kapoor" />
+                <label htmlFor={`${fieldId}-name`} className={labelClass}>Full Name *</label>
+                <input id={`${fieldId}-name`} value={name} onChange={(e) => setName(e.target.value)} className={inputClass} placeholder="Full name" />
                 {errors.name && <p className="text-[11px] text-destructive">{errors.name}</p>}
               </div>
               <div className="space-y-1.5">
-                <label className={labelClass}>Email *</label>
-                <input value={email} onChange={(e) => setEmail(e.target.value)} className={inputClass} placeholder="name@company.com" />
+                <label htmlFor={`${fieldId}-email`} className={labelClass}>Email *</label>
+                <input id={`${fieldId}-email`} type="email" value={email} onChange={(e) => setEmail(e.target.value)} className={inputClass} placeholder="name@company.com" />
                 {errors.email && <p className="text-[11px] text-destructive">{errors.email}</p>}
               </div>
               <div className="space-y-1.5">
-                <label className={labelClass}>Phone</label>
-                <input value={phone} onChange={(e) => setPhone(e.target.value)} className={inputClass} />
+                <label htmlFor={`${fieldId}-phone`} className={labelClass}>Phone</label>
+                <input
+                  id={`${fieldId}-phone`}
+                  type="tel"
+                  inputMode="tel"
+                  autoComplete="tel"
+                  maxLength={PHONE_RULES.maxLength}
+                  value={phone}
+                  onChange={(e) => setPhone(e.target.value)}
+                  onBlur={() => setPhoneTouched(true)}
+                  className={cn(inputClass, showPhoneError && "border-destructive")}
+                  placeholder="+971 50 000 0000"
+                  aria-invalid={showPhoneError || undefined}
+                  aria-describedby={showPhoneError ? `${fieldId}-phone-error` : undefined}
+                />
+                {showPhoneError && (
+                  <p id={`${fieldId}-phone-error`} className="text-[11px] text-destructive">{phoneError}</p>
+                )}
               </div>
               <div className="space-y-1.5 sm:col-span-2">
-                <label className={labelClass}>Profile Photo URL</label>
-                <input value={avatarUrl} onChange={(e) => setAvatarUrl(e.target.value)} className={inputClass} placeholder="https://" />
+                <label htmlFor={`${fieldId}-avatar`} className={labelClass}>Profile Photo URL</label>
+                <input id={`${fieldId}-avatar`} value={avatarUrl} onChange={(e) => setAvatarUrl(e.target.value)} className={inputClass} placeholder="https://" />
               </div>
             </div>
           </section>
@@ -647,24 +808,32 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
             <div className={sectionClass}>Work</div>
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="space-y-1.5">
-                <label className={labelClass}>Employee ID</label>
-                <input value={employeeId} onChange={(e) => setEmployeeId(e.target.value)} className={inputClass} />
+                <label htmlFor={`${fieldId}-employee`} className={labelClass}>Employee ID</label>
+                <input id={`${fieldId}-employee`} value={employeeId} onChange={(e) => setEmployeeId(e.target.value)} className={inputClass} />
               </div>
               <div className="space-y-1.5">
-                <label className={labelClass}>Designation *</label>
-                <input value={designation} onChange={(e) => setDesignation(e.target.value)} className={inputClass} />
+                <label htmlFor={`${fieldId}-designation`} className={labelClass}>Designation *</label>
+                <input id={`${fieldId}-designation`} value={designation} onChange={(e) => setDesignation(e.target.value)} className={inputClass} />
                 {errors.designation && <p className="text-[11px] text-destructive">{errors.designation}</p>}
               </div>
               <div className="space-y-1.5">
-                <label className={labelClass}>Joining Date</label>
-                <input type="date" value={joiningDate} onChange={(e) => setJoiningDate(e.target.value)} className={inputClass} />
+                <label htmlFor={`${fieldId}-joining`} className={labelClass}>Joining Date</label>
+                <input id={`${fieldId}-joining`} type="date" value={joiningDate} onChange={(e) => setJoiningDate(e.target.value)} className={inputClass} />
               </div>
             </div>
           </section>
 
           <section className="space-y-3">
             <div className={sectionClass}>Organization Assignment</div>
-            <AssignmentFields value={primary} onChange={setPrimary} allowRole={false} />
+            {/* The primary organization of an existing account is not moved from here:
+                moving it means removing their access to the old one. */}
+            <AssignmentFields
+              value={primary}
+              onChange={setPrimary}
+              allowRole={false}
+              lockOrganization={!!existing}
+              {...assignmentProps}
+            />
             {(errors.org || errors.dept) && (
               <p className="text-[11px] text-destructive">{errors.org ?? errors.dept}</p>
             )}
@@ -674,12 +843,7 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
             <div className="flex items-center justify-between">
               <div className={sectionClass}>Additional Organization Access</div>
               <button
-                onClick={() =>
-                  setAdditional((c) => [
-                    ...c,
-                    { orgId: "", departmentId: "", teamId: "", role: "Member", reportingManagerId: "" },
-                  ])
-                }
+                onClick={() => setAdditional((c) => [...c, blankDraft("")])}
                 className="inline-flex items-center gap-1 rounded-lg border border-border px-2 py-1 text-[11px] hover:bg-accent"
               >
                 <Plus className="h-3 w-3" /> Add Organization
@@ -702,6 +866,7 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
                 <AssignmentFields
                   value={item}
                   onChange={(next) => setAdditional((c) => c.map((v, i) => (i === index ? next : v)))}
+                  {...assignmentProps}
                 />
               </div>
             ))}
@@ -712,20 +877,24 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
             <div className={sectionClass}>System Access</div>
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="space-y-1.5">
-                <label className={labelClass}>Role *</label>
+                <label htmlFor={`${fieldId}-role`} className={labelClass}>Role *</label>
                 <select
+                  id={`${fieldId}-role`}
                   value={primary.role}
                   onChange={(e) => setPrimary({ ...primary, role: e.target.value })}
                   className={inputClass}
+                  disabled={!primary.orgId}
                 >
-                  {roleOptions.map((r) => (
+                  {roleNames(primary.orgId, primary.role).map((r) => (
                     <option key={r} value={r}>{r}</option>
                   ))}
                 </select>
+                {errors.role && <p className="text-[11px] text-destructive">{errors.role}</p>}
               </div>
               <div className="space-y-1.5">
-                <label className={labelClass}>Status</label>
+                <label htmlFor={`${fieldId}-status`} className={labelClass}>Status</label>
                 <select
+                  id={`${fieldId}-status`}
                   value={status}
                   onChange={(e) => setStatus(e.target.value as OrgStatus)}
                   className={inputClass}
@@ -735,17 +904,6 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
                 </select>
               </div>
             </div>
-            {!existing && (
-              <div className="flex items-center justify-between rounded-xl border border-border px-3 py-2.5">
-                <div>
-                  <div className="text-sm">Send Login Details</div>
-                  <div className="text-[11px] text-muted-foreground">
-                    Email the employee an invitation to sign in.
-                  </div>
-                </div>
-                <Switch checked={sendLogin} onCheckedChange={setSendLogin} />
-              </div>
-            )}
           </section>
         </div>
 
@@ -755,7 +913,9 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
           </button>
           <button
             onClick={submit}
-            className="rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+            disabled={isNew}
+            title={isNew ? "Accounts are created on the server — see the note above." : undefined}
+            className="rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {existing ? "Save Changes" : "Add User"}
           </button>
@@ -794,10 +954,12 @@ function UserDetail({
   const primaryMembership =
     user.memberships.find((m) => m.orgId === user.primaryOrgId) ?? user.memberships[0];
 
-  const myTasks = tasks.filter((t) => t.assignee.name === user.name);
+  // By id, not display name: two people can share a name.
+  const myTasks = tasks.filter((t) => t.assigneeId === user.id);
   const openTasks = myTasks.filter((t) => t.status !== "done");
-  const overdue = openTasks.filter((t) => new Date(t.dueDate) < new Date());
-  const projectNames = Array.from(new Set(myTasks.map((t) => t.project)));
+  const today = todayIn(organizations.find((o) => o.id === user.primaryOrgId)?.timezone);
+  const overdue = openTasks.filter((t) => t.dueDate && t.dueDate.slice(0, 10) < today);
+  const projectNames = Array.from(new Set(openTasks.map((t) => t.project)));
   const activity = userActivity.filter((a) => a.userId === user.id);
 
   const tabs: { id: Tab; label: string }[] = [
@@ -860,6 +1022,7 @@ function UserDetail({
           <button
             key={t.id}
             onClick={() => setTab(t.id)}
+            aria-pressed={tab === t.id}
             className={cn(
               "rounded-md px-3 py-1.5 text-xs font-medium transition",
               tab === t.id ? "bg-primary text-primary-foreground shadow-sm" : "text-muted-foreground hover:text-foreground",
@@ -879,7 +1042,7 @@ function UserDetail({
             <Detail label="Employee ID" value={user.employeeId} />
             <Detail label="Designation" value={user.designation} />
             <Detail label="Joining Date" value={user.joiningDate} />
-            <Detail label="Primary Organization" value={orgName(user.primaryOrgId)} />
+            <Detail label="Primary Organization" value={user.primaryOrgId ? orgName(user.primaryOrgId) : undefined} />
             <Detail label="Department" value={deptName(primaryMembership?.departmentId)} />
             <Detail label="Team" value={teamName(primaryMembership?.teamId)} />
             <Detail label="Reporting Manager" value={userName(primaryMembership?.reportingManagerId)} />
@@ -899,6 +1062,11 @@ function UserDetail({
               >
                 <Plus className="h-3.5 w-3.5" /> Add Organization
               </button>
+            </div>
+          )}
+          {user.memberships.length === 0 && (
+            <div className="rounded-xl border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
+              Not assigned to an organization you can see.
             </div>
           )}
           {user.memberships.map((m) => (
@@ -962,7 +1130,7 @@ function UserDetail({
               <ul className="divide-y divide-border/60">
                 {openTasks.map((t) => (
                   <li key={t.id} className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 text-sm">
-                    <span className="font-medium">{t.title}</span>
+                    <span className="min-w-0 truncate font-medium">{t.title}</span>
                     <span className="flex items-center gap-3 text-xs text-muted-foreground">
                       <span>{t.project}</span>
                       <span className="inline-flex items-center gap-1">
@@ -986,7 +1154,7 @@ function UserDetail({
                   <li key={p} className="flex items-center justify-between px-4 py-3 text-sm">
                     <span>{p}</span>
                     <span className="text-xs text-muted-foreground">
-                      {myTasks.filter((t) => t.project === p).length} tasks
+                      {plural(openTasks.filter((t) => t.project === p).length, "open task")}
                     </span>
                   </li>
                 ))}
@@ -1000,7 +1168,7 @@ function UserDetail({
         <div className="overflow-hidden rounded-xl border border-border bg-card shadow-[var(--shadow-soft)]">
           {activity.length === 0 ? (
             <div className="px-4 py-10 text-center text-sm text-muted-foreground">
-              No administrative changes recorded.
+              No administrative changes recorded in this session.
             </div>
           ) : (
             <ul className="divide-y divide-border/60">
@@ -1082,12 +1250,12 @@ function AssignmentDialog({
   onClose: () => void;
   onSave: (membership: Membership, isNew: boolean) => void;
 }) {
-  const { organizations, departments, teams, users } = useOrganizations();
+  const { organizations, departments, teams, users, isAdminIn, activeAdminCountIn } = useOrganizations();
+  const { roleNames, defaultRoleFor } = useRoleChoices();
+  const fieldId = useId();
   const existing = orgId && orgId !== "new" ? user.memberships.find((m) => m.orgId === orgId) : null;
   const [seed, setSeed] = useState<string | null>(null);
-  const [draft, setDraft] = useState<DraftMembership>({
-    orgId: "", departmentId: "", teamId: "", role: "Member", reportingManagerId: "",
-  });
+  const [draft, setDraft] = useState<DraftMembership>(blankDraft(""));
 
   if (orgId && seed !== orgId) {
     setSeed(orgId);
@@ -1095,7 +1263,7 @@ function AssignmentDialog({
       orgId: existing?.orgId ?? "",
       departmentId: existing?.departmentId ?? "",
       teamId: existing?.teamId ?? "",
-      role: existing?.role ?? "Member",
+      role: existing?.role ?? "",
       reportingManagerId: existing?.reportingManagerId ?? "",
     });
   }
@@ -1116,10 +1284,19 @@ function AssignmentDialog({
 
         <div className="grid gap-3 sm:grid-cols-2">
           <div className="space-y-1.5">
-            <label className={labelClass}>Organization</label>
+            <label htmlFor={`${fieldId}-org`} className={labelClass}>Organization</label>
             <select
+              id={`${fieldId}-org`}
               value={draft.orgId}
-              onChange={(e) => setDraft({ ...draft, orgId: e.target.value, departmentId: "", teamId: "" })}
+              onChange={(e) =>
+                setDraft({
+                  ...draft,
+                  orgId: e.target.value,
+                  departmentId: "",
+                  teamId: "",
+                  role: defaultRoleFor(e.target.value),
+                })
+              }
               className={inputClass}
               disabled={!!existing}
             >
@@ -1130,22 +1307,26 @@ function AssignmentDialog({
             </select>
           </div>
           <div className="space-y-1.5">
-            <label className={labelClass}>Department</label>
+            <label htmlFor={`${fieldId}-dept`} className={labelClass}>Department</label>
             <select
+              id={`${fieldId}-dept`}
               value={draft.departmentId}
               onChange={(e) => setDraft({ ...draft, departmentId: e.target.value, teamId: "" })}
               className={inputClass}
               disabled={!draft.orgId}
             >
               <option value="">Select department</option>
-              {departments.filter((d) => d.orgId === draft.orgId).map((d) => (
-                <option key={d.id} value={d.id}>{d.name}</option>
-              ))}
+              {departments
+                .filter((d) => d.orgId === draft.orgId && (d.status === "active" || d.id === draft.departmentId))
+                .map((d) => (
+                  <option key={d.id} value={d.id}>{d.name}</option>
+                ))}
             </select>
           </div>
           <div className="space-y-1.5">
-            <label className={labelClass}>Team</label>
+            <label htmlFor={`${fieldId}-team`} className={labelClass}>Team</label>
             <select
+              id={`${fieldId}-team`}
               value={draft.teamId}
               onChange={(e) => setDraft({ ...draft, teamId: e.target.value })}
               className={inputClass}
@@ -1158,8 +1339,9 @@ function AssignmentDialog({
             </select>
           </div>
           <div className="space-y-1.5">
-            <label className={labelClass}>Reporting Manager</label>
+            <label htmlFor={`${fieldId}-manager`} className={labelClass}>Reporting Manager</label>
             <select
+              id={`${fieldId}-manager`}
               value={draft.reportingManagerId}
               onChange={(e) => setDraft({ ...draft, reportingManagerId: e.target.value })}
               className={inputClass}
@@ -1173,13 +1355,16 @@ function AssignmentDialog({
             </select>
           </div>
           <div className="space-y-1.5">
-            <label className={labelClass}>Role</label>
+            <label htmlFor={`${fieldId}-role`} className={labelClass}>Role</label>
             <select
+              id={`${fieldId}-role`}
               value={draft.role}
               onChange={(e) => setDraft({ ...draft, role: e.target.value })}
               className={inputClass}
+              disabled={!draft.orgId}
             >
-              {roleOptions.map((r) => (
+              {!draft.orgId && <option value="">Select organization first</option>}
+              {draft.orgId && roleNames(draft.orgId, draft.role || undefined).map((r) => (
                 <option key={r} value={r}>{r}</option>
               ))}
             </select>
@@ -1196,17 +1381,26 @@ function AssignmentDialog({
                 toast.error("Organization and department are required");
                 return;
               }
-              onSave(
-                {
-                  orgId: draft.orgId,
-                  departmentId: draft.departmentId,
-                  teamId: draft.teamId || undefined,
-                  role: draft.role,
-                  status: "active",
-                  reportingManagerId: draft.reportingManagerId || undefined,
-                },
-                !existing,
-              );
+              const role = draft.role || defaultRoleFor(draft.orgId);
+              const next: Membership = {
+                orgId: draft.orgId,
+                departmentId: draft.departmentId,
+                teamId: draft.teamId || undefined,
+                role,
+                status: "active",
+                reportingManagerId: draft.reportingManagerId || undefined,
+              };
+              if (
+                existing &&
+                user.status === "active" &&
+                isAdminIn(user, draft.orgId) &&
+                !isAdminIn({ ...user, memberships: [next] }, draft.orgId) &&
+                activeAdminCountIn(draft.orgId) <= 1
+              ) {
+                toast.error("There must always be at least one active Admin.");
+                return;
+              }
+              onSave(next, !existing);
             }}
             className="rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground hover:bg-primary/90"
           >
@@ -1221,17 +1415,17 @@ function AssignmentDialog({
 /* ------------------------------ deactivate flow ----------------------------- */
 
 function DeactivateDialog({ user, onClose }: { user: OrgUser | null; onClose: () => void }) {
-  const { users, setUserStatus, activeAdminCount } = useOrganizations();
+  const { users, setUserStatus, isAdminIn, activeAdminCountIn } = useOrganizations();
   const { tasks, updateTask } = useWorkspace();
   const [reassignTo, setReassignTo] = useState("");
 
-  const openTasks = user ? tasks.filter((t) => t.assignee.name === user.name && t.status !== "done") : [];
+  // By id: matching on the display name missed people and caught namesakes.
+  const openTasks = user ? tasks.filter((t) => t.assigneeId === user.id && t.status !== "done") : [];
   const managedProjects = Array.from(new Set(openTasks.map((t) => t.project)));
   const isLastAdmin =
     !!user &&
     user.status === "active" &&
-    user.memberships.some((m) => m.role.toLowerCase() === "admin") &&
-    activeAdminCount <= 1;
+    user.memberships.some((m) => isAdminIn(user, m.orgId) && activeAdminCountIn(m.orgId) <= 1);
 
   return (
     <AlertDialog open={!!user} onOpenChange={(open) => !open && onClose()}>
@@ -1249,20 +1443,22 @@ function DeactivateDialog({ user, onClose }: { user: OrgUser | null; onClose: ()
           <div className="flex flex-wrap items-center gap-4 text-xs text-muted-foreground">
             <span>Open Tasks <span className="font-semibold text-foreground">{openTasks.length}</span></span>
             <span className="h-3 w-px bg-border" />
-            <span>Managed Projects <span className="font-semibold text-foreground">{managedProjects.length}</span></span>
+            <span>Projects With Open Tasks <span className="font-semibold text-foreground">{managedProjects.length}</span></span>
           </div>
           <div className="space-y-1.5">
-            <label className={labelClass}>Reassign Responsibilities</label>
+            <label htmlFor="deactivate-reassign" className={labelClass}>Reassign Open Tasks</label>
             <select
+              id="deactivate-reassign"
               value={reassignTo}
               onChange={(e) => setReassignTo(e.target.value)}
               className={inputClass}
+              disabled={openTasks.length === 0}
             >
               <option value="">Keep current assignments</option>
               {users
                 .filter((u) => u.id !== user?.id && u.status === "active")
                 .map((u) => (
-                  <option key={u.id} value={u.name}>{u.name}</option>
+                  <option key={u.id} value={u.id}>{u.name}</option>
                 ))}
             </select>
           </div>
@@ -1274,18 +1470,11 @@ function DeactivateDialog({ user, onClose }: { user: OrgUser | null; onClose: ()
             disabled={isLastAdmin}
             onClick={() => {
               if (!user || isLastAdmin) return;
-              if (reassignTo) {
-                const target = users.find((u) => u.name === reassignTo);
-                openTasks.forEach((t) =>
-                  updateTask(t.id, {
-                    assignee: {
-                      name: reassignTo,
-                      initials: initialsOf(reassignTo),
-                      color: t.assignee.color,
-                    },
-                  }),
-                );
-                if (target) toast.success(`${openTasks.length} tasks reassigned to ${reassignTo}`);
+              const target = users.find((u) => u.id === reassignTo);
+              if (target && openTasks.length) {
+                // Was an `assignee` display object, which updateTask never saved.
+                openTasks.forEach((t) => void updateTask(t.id, { assigneeId: target.id }));
+                toast.success(`${plural(openTasks.length, "task")} reassigned to ${target.name}`);
               }
               setUserStatus(user.id, "inactive");
               toast.success(`${user.name} deactivated`);

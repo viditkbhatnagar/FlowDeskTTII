@@ -1,7 +1,7 @@
-import { useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import {
   Building2, Plus, MoreHorizontal, Eye, Pencil, Ban, ArrowLeft, Globe, Mail, Phone,
-  MapPin, Clock, Search, CheckCircle2,
+  MapPin, Clock, Search, CheckCircle2, Info,
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -19,7 +19,7 @@ import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
-  useOrganizations, countryOptions, timezoneOptions,
+  useOrganizations, countryOptions, timezoneOptions, validatePhone, PHONE_RULES,
   type Organization, type OrgStatus,
 } from "@/lib/organizations-data";
 
@@ -64,12 +64,19 @@ function StatusPill({ status }: { status: OrgStatus }) {
 }
 
 export function OrganizationsPage() {
-  const { organizations, countsFor, setOrganizationStatus } = useOrganizations();
+  const { status, organizations, countsFor, setOrganizationStatus, canManageUsers, reloadProjects } =
+    useOrganizations();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [drawerOrg, setDrawerOrg] = useState<Organization | "new" | null>(null);
   const [deactivateOrg, setDeactivateOrg] = useState<Organization | null>(null);
 
   const selected = organizations.find((o) => o.id === selectedId) ?? null;
+
+  // Active Projects comes from work_projects; refresh it so a project created
+  // since sign-in is counted.
+  useEffect(() => {
+    void reloadProjects();
+  }, [reloadProjects]);
 
   if (selected) {
     return (
@@ -96,12 +103,14 @@ export function OrganizationsPage() {
             Manage the organizations using this workspace.
           </p>
         </div>
-        <button
-          onClick={() => setDrawerOrg("new")}
-          className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground shadow-sm transition hover:bg-primary/90"
-        >
-          <Plus className="h-4 w-4" /> Add Organization
-        </button>
+        {canManageUsers && (
+          <button
+            onClick={() => setDrawerOrg("new")}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground shadow-sm transition hover:bg-primary/90"
+          >
+            <Plus className="h-4 w-4" /> Add Organization
+          </button>
+        )}
       </div>
 
       <div className="overflow-hidden rounded-xl border border-border bg-card shadow-[var(--shadow-soft)]">
@@ -154,10 +163,12 @@ export function OrganizationsPage() {
                           <DropdownMenuItem onClick={() => setSelectedId(org.id)}>
                             <Eye className="mr-2 h-3.5 w-3.5" /> View
                           </DropdownMenuItem>
-                          <DropdownMenuItem onClick={() => setDrawerOrg(org)}>
-                            <Pencil className="mr-2 h-3.5 w-3.5" /> Edit
-                          </DropdownMenuItem>
-                          {org.status === "active" ? (
+                          {canManageUsers && (
+                            <DropdownMenuItem onClick={() => setDrawerOrg(org)}>
+                              <Pencil className="mr-2 h-3.5 w-3.5" /> Edit
+                            </DropdownMenuItem>
+                          )}
+                          {!canManageUsers ? null : org.status === "active" ? (
                             <DropdownMenuItem onClick={() => setDeactivateOrg(org)}>
                               <Ban className="mr-2 h-3.5 w-3.5" /> Deactivate
                             </DropdownMenuItem>
@@ -177,6 +188,17 @@ export function OrganizationsPage() {
                   </tr>
                 );
               })}
+              {organizations.length === 0 && (
+                <tr>
+                  <td colSpan={7} className="px-4 py-10 text-center text-sm text-muted-foreground">
+                    {status === "loading"
+                      ? "Loading organizations…"
+                      : status === "error"
+                        ? "Organizations could not be loaded. Refresh to try again."
+                        : "No organizations."}
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
@@ -220,8 +242,11 @@ function OrganizationDrawer({
   target: Organization | "new" | null;
   onClose: () => void;
 }) {
-  const { addOrganization, updateOrganization, isNameTaken, isCodeTaken } = useOrganizations();
+  const { updateOrganization, isNameTaken, isCodeTaken } = useOrganizations();
   const editing = target && target !== "new" ? target : null;
+  const isNew = target === "new";
+  const fieldId = useId();
+  const [phoneTouched, setPhoneTouched] = useState(false);
 
   const [form, setForm] = useState(() => blank());
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -245,6 +270,7 @@ function OrganizationDrawer({
   if (key && key !== loadedFor) {
     setLoadedFor(key);
     setErrors({});
+    setPhoneTouched(false);
     setForm(
       editing
         ? {
@@ -265,6 +291,10 @@ function OrganizationDrawer({
   const set = (field: keyof ReturnType<typeof blank>, value: string) =>
     setForm((f) => ({ ...f, [field]: value }));
 
+  const phoneError = validatePhone(form.phone);
+  // Invalid characters show at once; length once the field is left (FD-050).
+  const showPhoneError = !!phoneError && (phoneTouched || /[^0-9+\-() ]/.test(form.phone) || !!errors['phone']);
+
   const submit = () => {
     const next: Record<string, string> = {};
     if (!form.name.trim()) next['name'] = "Organization name is required";
@@ -274,8 +304,13 @@ function OrganizationDrawer({
     else if (isCodeTaken(form.code, editing?.id)) next['code'] = "This code is already in use";
     if (!form.country) next['country'] = "Country is required";
     if (!form.timezone) next['timezone'] = "Timezone is required";
+    if (phoneError) next['phone'] = phoneError;
     setErrors(next);
+    setPhoneTouched(true);
     if (Object.keys(next).length) return;
+    // Organizations can only be created on the server (row-level security refuses
+    // the insert). This used to add a row that disappeared on refresh.
+    if (!editing) return;
 
     const payload = {
       name: form.name.trim(),
@@ -289,13 +324,8 @@ function OrganizationDrawer({
       status: form.status,
     };
 
-    if (editing) {
-      updateOrganization(editing.id, payload);
-      toast.success("Organization updated");
-    } else {
-      addOrganization(payload);
-      toast.success("Organization added");
-    }
+    updateOrganization(editing.id, payload);
+    toast.success("Organization updated");
     setLoadedFor(null);
     onClose();
   };
@@ -313,24 +343,36 @@ function OrganizationDrawer({
         </SheetHeader>
 
         <div className="flex-1 space-y-4 overflow-y-auto px-5 py-5">
-          <Field label="Organization Name" required error={errors['name']}>
+          {isNew && (
+            <div className="flex gap-2 rounded-xl border border-border bg-muted/40 px-3 py-2.5 text-xs text-muted-foreground">
+              <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <p>
+                New organizations can't be created from the browser: they are set up on the server by the
+                FlowDesk administrator, together with their default roles and settings.
+              </p>
+            </div>
+          )}
+          <Field label="Organization Name" required error={errors['name']} htmlFor={`${fieldId}-name`}>
             <input
+              id={`${fieldId}-name`}
               className={inputClass}
               value={form.name}
               onChange={(e) => set("name", e.target.value)}
               placeholder="Teachers' Training Institute of India"
             />
           </Field>
-          <Field label="Short Name / Code" required error={errors['code']}>
+          <Field label="Short Name / Code" required error={errors['code']} htmlFor={`${fieldId}-code`}>
             <input
+              id={`${fieldId}-code`}
               className={cn(inputClass, "uppercase")}
               value={form.code}
               onChange={(e) => set("code", e.target.value)}
               placeholder="TTII"
             />
           </Field>
-          <Field label="Logo URL">
+          <Field label="Logo URL" htmlFor={`${fieldId}-logo`}>
             <input
+              id={`${fieldId}-logo`}
               className={inputClass}
               value={form.logoUrl}
               onChange={(e) => set("logoUrl", e.target.value)}
@@ -338,25 +380,35 @@ function OrganizationDrawer({
             />
           </Field>
           <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="Official Email">
+            <Field label="Official Email" htmlFor={`${fieldId}-email`}>
               <input
+                id={`${fieldId}-email`}
+                type="email"
                 className={inputClass}
                 value={form.email}
                 onChange={(e) => set("email", e.target.value)}
                 placeholder="contact@ttii.in"
               />
             </Field>
-            <Field label="Phone">
+            <Field label="Phone" error={showPhoneError ? (phoneError ?? undefined) : undefined} htmlFor={`${fieldId}-phone`}>
               <input
-                className={inputClass}
+                id={`${fieldId}-phone`}
+                type="tel"
+                inputMode="tel"
+                autoComplete="tel"
+                maxLength={PHONE_RULES.maxLength}
+                className={cn(inputClass, showPhoneError && "border-destructive")}
                 value={form.phone}
                 onChange={(e) => set("phone", e.target.value)}
-                placeholder="+91 22 4000 1200"
+                onBlur={() => setPhoneTouched(true)}
+                aria-invalid={showPhoneError || undefined}
+                placeholder="+971 4 000 0000"
               />
             </Field>
           </div>
-          <Field label="Website">
+          <Field label="Website" htmlFor={`${fieldId}-website`}>
             <input
+              id={`${fieldId}-website`}
               className={inputClass}
               value={form.website}
               onChange={(e) => set("website", e.target.value)}
@@ -364,21 +416,21 @@ function OrganizationDrawer({
             />
           </Field>
           <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="Country" required error={errors['country']}>
-              <select className={inputClass} value={form.country} onChange={(e) => set("country", e.target.value)}>
+            <Field label="Country" required error={errors['country']} htmlFor={`${fieldId}-country`}>
+              <select id={`${fieldId}-country`} className={inputClass} value={form.country} onChange={(e) => set("country", e.target.value)}>
                 <option value="">Select country</option>
                 {countryOptions.map((c) => <option key={c} value={c}>{c}</option>)}
               </select>
             </Field>
-            <Field label="Timezone" required error={errors['timezone']}>
-              <select className={inputClass} value={form.timezone} onChange={(e) => set("timezone", e.target.value)}>
+            <Field label="Timezone" required error={errors['timezone']} htmlFor={`${fieldId}-timezone`}>
+              <select id={`${fieldId}-timezone`} className={inputClass} value={form.timezone} onChange={(e) => set("timezone", e.target.value)}>
                 <option value="">Select timezone</option>
                 {timezoneOptions.map((t) => <option key={t} value={t}>{t}</option>)}
               </select>
             </Field>
           </div>
-          <Field label="Status">
-            <select className={inputClass} value={form.status} onChange={(e) => set("status", e.target.value)}>
+          <Field label="Status" htmlFor={`${fieldId}-status`}>
+            <select id={`${fieldId}-status`} className={inputClass} value={form.status} onChange={(e) => set("status", e.target.value)}>
               <option value="active">Active</option>
               <option value="inactive">Inactive</option>
             </select>
@@ -394,7 +446,9 @@ function OrganizationDrawer({
           </button>
           <button
             onClick={submit}
-            className="rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground shadow-sm transition hover:bg-primary/90"
+            disabled={isNew}
+            title={isNew ? "Organizations are created on the server — see the note above." : undefined}
+            className="rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground shadow-sm transition hover:bg-primary/90 disabled:opacity-50"
           >
             {editing ? "Save Changes" : "Add Organization"}
           </button>
@@ -405,11 +459,11 @@ function OrganizationDrawer({
 }
 
 function Field({
-  label, required, error, children,
-}: { label: string; required?: boolean; error?: string; children: React.ReactNode }) {
+  label, required, error, htmlFor, children,
+}: { label: string; required?: boolean; error?: string; htmlFor?: string; children: React.ReactNode }) {
   return (
     <div className="space-y-1.5">
-      <label className={labelClass}>
+      <label htmlFor={htmlFor} className={labelClass}>
         {label} {required && <span className="text-destructive">*</span>}
       </label>
       {children}
@@ -421,7 +475,9 @@ function Field({
 function OrganizationDetail({
   org, onBack, onEdit, drawer,
 }: { org: Organization; onBack: () => void; onEdit: () => void; drawer: React.ReactNode }) {
-  const { countsFor, departments, teams, users, addDepartment, addUserToOrganization } = useOrganizations();
+  const {
+    countsFor, departments, teams, users, addDepartment, addUserToOrganization, canManageUsers,
+  } = useOrganizations();
   const [tab, setTab] = useState<"overview" | "departments" | "users">("overview");
   const [deptOpen, setDeptOpen] = useState(false);
   const [userOpen, setUserOpen] = useState(false);
@@ -450,12 +506,14 @@ function OrganizationDetail({
             <p className="text-xs text-muted-foreground">{org.code}</p>
           </div>
         </div>
-        <button
-          onClick={onEdit}
-          className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-xs font-medium transition hover:bg-accent"
-        >
-          <Pencil className="h-3.5 w-3.5" /> Edit Organization
-        </button>
+        {canManageUsers && (
+          <button
+            onClick={onEdit}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-xs font-medium transition hover:bg-accent"
+          >
+            <Pencil className="h-3.5 w-3.5" /> Edit Organization
+          </button>
+        )}
       </div>
 
       <div className="inline-flex items-center rounded-lg border border-border bg-card p-1 shadow-[var(--shadow-soft)]">
@@ -464,6 +522,7 @@ function OrganizationDetail({
             <button
               key={id}
               onClick={() => setTab(id)}
+              aria-pressed={tab === id}
               className={cn(
                 "rounded-md px-3 py-1.5 text-xs font-medium transition",
                 tab === id
@@ -518,12 +577,14 @@ function OrganizationDetail({
       {tab === "departments" && (
         <TablePanel
           action={
-            <button
-              onClick={() => setDeptOpen(true)}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground shadow-sm transition hover:bg-primary/90"
-            >
-              <Plus className="h-3.5 w-3.5" /> Add Department
-            </button>
+            canManageUsers && (
+              <button
+                onClick={() => setDeptOpen(true)}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground shadow-sm transition hover:bg-primary/90"
+              >
+                <Plus className="h-3.5 w-3.5" /> Add Department
+              </button>
+            )
           }
           title="Departments"
           head={["Department", "Department Head", "Teams", "Members", "Status"]}
@@ -543,18 +604,21 @@ function OrganizationDetail({
               </tr>
             );
           })}
+          {orgDepartments.length === 0 && <EmptyRow colSpan={5} text="No departments in this organization yet." />}
         </TablePanel>
       )}
 
       {tab === "users" && (
         <TablePanel
           action={
-            <button
-              onClick={() => setUserOpen(true)}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-xs font-medium transition hover:bg-accent"
-            >
-              <Plus className="h-3.5 w-3.5" /> Add Existing User
-            </button>
+            canManageUsers && (
+              <button
+                onClick={() => setUserOpen(true)}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-xs font-medium transition hover:bg-accent"
+              >
+                <Plus className="h-3.5 w-3.5" /> Add Existing User
+              </button>
+            )
           }
           title="Users"
           head={["User", "Designation", "Department", "Team", "Role", "Status"]}
@@ -572,7 +636,7 @@ function OrganizationDetail({
                     {u.primaryOrgId === org.id && " · Primary organization"}
                   </div>
                 </td>
-                <td className="px-4 py-3 text-muted-foreground">{u.designation}</td>
+                <td className="px-4 py-3 text-muted-foreground">{u.designation || "—"}</td>
                 <td className="px-4 py-3">{dept?.name ?? "—"}</td>
                 <td className="px-4 py-3">{team?.name ?? "—"}</td>
                 <td className="px-4 py-3">{m.role}</td>
@@ -580,11 +644,13 @@ function OrganizationDetail({
               </tr>
             );
           })}
+          {orgUsers.length === 0 && <EmptyRow colSpan={6} text="Nobody is assigned to this organization yet." />}
         </TablePanel>
       )}
 
       <AddDepartmentDialog
         open={deptOpen}
+        orgId={org.id}
         onClose={() => setDeptOpen(false)}
         onSave={(name, head) => {
           addDepartment(org.id, name, head);
@@ -621,6 +687,14 @@ function Detail({
   );
 }
 
+function EmptyRow({ colSpan, text }: { colSpan: number; text: string }) {
+  return (
+    <tr>
+      <td colSpan={colSpan} className="px-4 py-10 text-center text-sm text-muted-foreground">{text}</td>
+    </tr>
+  );
+}
+
 function TablePanel({
   title, head, action, children,
 }: { title: string; head: string[]; action: React.ReactNode; children: React.ReactNode }) {
@@ -649,10 +723,16 @@ function TablePanel({
 }
 
 function AddDepartmentDialog({
-  open, onClose, onSave,
-}: { open: boolean; onClose: () => void; onSave: (name: string, head: string) => void }) {
+  open, orgId, onClose, onSave,
+}: { open: boolean; orgId: string; onClose: () => void; onSave: (name: string, head: string) => void }) {
+  const { users, isDepartmentNameTaken } = useOrganizations();
+  const fieldId = useId();
   const [name, setName] = useState("");
   const [head, setHead] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  // A free-text head (with a demo person as placeholder) that only saved when it happened
+  // to match someone's exact name; it now picks from this organization's people.
+  const orgUsers = users.filter((u) => u.memberships.some((m) => m.orgId === orgId));
 
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
@@ -664,11 +744,20 @@ function AddDepartmentDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
-          <Field label="Department Name" required>
-            <input className={inputClass} value={name} onChange={(e) => setName(e.target.value)} placeholder="Learning & Growth" />
+          <Field label="Department Name" required error={error ?? undefined} htmlFor={`${fieldId}-name`}>
+            <input
+              id={`${fieldId}-name`}
+              className={inputClass}
+              value={name}
+              onChange={(e) => { setName(e.target.value); setError(null); }}
+              placeholder="Learning & Growth"
+            />
           </Field>
-          <Field label="Department Head">
-            <input className={inputClass} value={head} onChange={(e) => setHead(e.target.value)} placeholder="Priya Shah" />
+          <Field label="Department Head" htmlFor={`${fieldId}-head`}>
+            <select id={`${fieldId}-head`} className={inputClass} value={head} onChange={(e) => setHead(e.target.value)}>
+              <option value="">Not assigned</option>
+              {orgUsers.map((u) => <option key={u.id} value={u.name}>{u.name}</option>)}
+            </select>
           </Field>
         </div>
         <DialogFooter>
@@ -680,10 +769,13 @@ function AddDepartmentDialog({
           </button>
           <button
             onClick={() => {
-              if (!name.trim()) return;
+              if (!name.trim()) return setError("Department name is required.");
+              if (isDepartmentNameTaken(orgId, name))
+                return setError("A department with this name already exists in this organization.");
               onSave(name.trim(), head.trim());
               setName("");
               setHead("");
+              setError(null);
               onClose();
             }}
             className="rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground shadow-sm transition hover:bg-primary/90"
@@ -704,12 +796,17 @@ function AddExistingUserDialog({
   orgId: string;
   onSave: (userId: string, departmentId: string, teamId: string, role: string) => void;
 }) {
-  const { users, departments, teams } = useOrganizations();
+  const { users, departments, teams, rolesFor, defaultRoleName } = useOrganizations();
+  const fieldId = useId();
   const [query, setQuery] = useState("");
   const [userId, setUserId] = useState("");
   const [departmentId, setDepartmentId] = useState("");
   const [teamId, setTeamId] = useState("");
-  const [role, setRole] = useState("Member");
+  // Was a hardcoded Admin / Manager / Member / Viewer list defaulting to "Member",
+  // a name no role has; these are this organization's real roles (FD-037).
+  const [role, setRole] = useState("");
+  const roleNames = rolesFor(orgId).filter((r) => r.status === "active").map((r) => r.name);
+  const chosenRole = role || defaultRoleName(orgId);
 
   const available = useMemo(
     () =>
@@ -722,7 +819,7 @@ function AddExistingUserDialog({
     [users, orgId, query],
   );
 
-  const orgDepartments = departments.filter((d) => d.orgId === orgId);
+  const orgDepartments = departments.filter((d) => d.orgId === orgId && d.status === "active");
   const deptTeams = teams.filter((t) => t.departmentId === departmentId);
 
   return (
@@ -737,10 +834,11 @@ function AddExistingUserDialog({
         </DialogHeader>
 
         <div className="space-y-4">
-          <Field label="Find Employee">
+          <Field label="Find Employee" htmlFor={`${fieldId}-search`}>
             <div className="relative">
               <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
               <input
+                id={`${fieldId}-search`}
                 className={cn(inputClass, "pl-8")}
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
@@ -759,6 +857,7 @@ function AddExistingUserDialog({
               <button
                 key={u.id}
                 onClick={() => setUserId(u.id)}
+                aria-pressed={userId === u.id}
                 className={cn(
                   "flex w-full items-center justify-between rounded-md px-2.5 py-2 text-left text-xs transition",
                   userId === u.id ? "bg-primary/10 text-primary" : "hover:bg-accent",
@@ -774,8 +873,9 @@ function AddExistingUserDialog({
           </div>
 
           <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="Department">
+            <Field label="Department" htmlFor={`${fieldId}-dept`}>
               <select
+                id={`${fieldId}-dept`}
                 className={inputClass}
                 value={departmentId}
                 onChange={(e) => { setDepartmentId(e.target.value); setTeamId(""); }}
@@ -784,20 +884,19 @@ function AddExistingUserDialog({
                 {orgDepartments.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
               </select>
             </Field>
-            <Field label="Team">
-              <select className={inputClass} value={teamId} onChange={(e) => setTeamId(e.target.value)}>
+            <Field label="Team" htmlFor={`${fieldId}-team`}>
+              <select id={`${fieldId}-team`} className={inputClass} value={teamId} onChange={(e) => setTeamId(e.target.value)}>
                 <option value="">Select</option>
                 {deptTeams.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
               </select>
             </Field>
           </div>
 
-          <Field label="Role">
-            <select className={inputClass} value={role} onChange={(e) => setRole(e.target.value)}>
-              <option value="Admin">Admin</option>
-              <option value="Manager">Manager</option>
-              <option value="Member">Member</option>
-              <option value="Viewer">Viewer</option>
+          <Field label="Role" htmlFor={`${fieldId}-role`}>
+            <select id={`${fieldId}-role`} className={inputClass} value={chosenRole} onChange={(e) => setRole(e.target.value)}>
+              {(roleNames.length ? roleNames : [chosenRole]).map((r) => (
+                <option key={r} value={r}>{r}</option>
+              ))}
             </select>
           </Field>
         </div>
@@ -812,10 +911,11 @@ function AddExistingUserDialog({
           <button
             disabled={!userId}
             onClick={() => {
-              onSave(userId, departmentId, teamId, role);
+              onSave(userId, departmentId, teamId, chosenRole);
               setUserId("");
               setDepartmentId("");
               setTeamId("");
+              setRole("");
               onClose();
             }}
             className="rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground shadow-sm transition hover:bg-primary/90 disabled:opacity-50"

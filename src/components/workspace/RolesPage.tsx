@@ -13,7 +13,7 @@ import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
-  useOrganizations, permissionModules, settingsModules, scopeOptions, emptyRole,
+  useOrganizations, permissionModules, settingsModules, scopeOptions, emptyRole, plural,
   type Role, type OrgStatus, type DataScope, type SettingsAccess, type NewRoleInput, type OrgUser,
 } from "@/lib/organizations-data";
 
@@ -24,6 +24,10 @@ const primaryBtn =
   "inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground shadow-sm transition hover:bg-primary/90 disabled:opacity-50";
 const ghostBtn =
   "inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-xs font-medium transition hover:bg-accent disabled:opacity-50";
+
+/** Shown wherever the permission checkboxes are, so nobody mistakes them for enforcement. */
+const PERMISSIONS_NOTE =
+  "These record what the role is for. What people can actually do is enforced by the role's access level: built-in roles have a fixed level, custom roles take it from Data Access.";
 
 function StatusPill({ status }: { status: OrgStatus }) {
   return (
@@ -45,18 +49,30 @@ function initials(name: string) {
 }
 
 export function RolesPage() {
-  const { roles, roleUserCount, setRoleStatus, duplicateRole, canManageUsers } = useOrganizations();
+  const {
+    status, rolesFor, roleUserCount, setRoleStatus, duplicateRole, canManageUsers,
+    accessibleOrganizations, activeOrgId, countsFor,
+  } = useOrganizations();
   const [drawer, setDrawer] = useState<Role | "new" | null>(null);
   const [openRoleId, setOpenRoleId] = useState<string | null>(null);
   const [deactivateRole, setDeactivateRole] = useState<Role | null>(null);
+  const [selectedOrg, setSelectedOrg] = useState<string | null>(null);
 
+  // Roles belong to one organization (each has its own Admin, Employee ...), so
+  // the page shows one organization at a time. Listing every organization's rows
+  // together showed "Admin" twice and counted people against both (FD-037).
+  const orgId =
+    selectedOrg ?? (activeOrgId !== "all" ? activeOrgId : (accessibleOrganizations[0]?.id ?? ""));
+  const orgName = accessibleOrganizations.find((o) => o.id === orgId)?.name ?? "this organization";
+  const roles = rolesFor(orgId);
   const openRole = openRoleId ? (roles.find((r) => r.id === openRoleId) ?? null) : null;
+  const peopleInOrg = orgId ? countsFor(orgId).users : 0;
 
   if (openRole) {
     return (
       <>
         <RoleDetail role={openRole} onBack={() => setOpenRoleId(null)} onEdit={() => setDrawer(openRole)} />
-        <RoleDrawer target={drawer} onClose={() => setDrawer(null)} />
+        <RoleDrawer target={drawer} orgId={orgId} onClose={() => setDrawer(null)} />
       </>
     );
   }
@@ -74,6 +90,22 @@ export function RolesPage() {
           </button>
         )}
       </div>
+
+      {accessibleOrganizations.length > 1 && (
+        <div className="space-y-1">
+          <label htmlFor="roles-org" className={labelClass}>Organization</label>
+          <select
+            id="roles-org"
+            value={orgId}
+            onChange={(e) => setSelectedOrg(e.target.value)}
+            className={cn(inputClass, "min-w-[240px] sm:w-auto")}
+          >
+            {accessibleOrganizations.map((o) => (
+              <option key={o.id} value={o.id}>{o.name}</option>
+            ))}
+          </select>
+        </div>
+      )}
 
       <div className="overflow-hidden rounded-xl border border-border bg-card shadow-[var(--shadow-soft)]">
         <div className="overflow-x-auto">
@@ -97,6 +129,9 @@ export function RolesPage() {
                     >
                       <ShieldCheck className="h-4 w-4 text-muted-foreground" />
                       {role.name}
+                      {role.system && (
+                        <Lock className="h-3 w-3 text-muted-foreground" aria-label="Built-in role" />
+                      )}
                     </button>
                     <div className="pl-6 text-[11px] text-muted-foreground">
                       Data access: {scopeLabel(role.scope)}
@@ -107,7 +142,10 @@ export function RolesPage() {
                   <td className="px-4 py-3"><StatusPill status={role.status} /></td>
                   <td className="px-4 py-3 text-right">
                     <DropdownMenu>
-                      <DropdownMenuTrigger className="rounded-md p-1.5 text-muted-foreground transition hover:bg-accent hover:text-foreground">
+                      <DropdownMenuTrigger
+                        aria-label={`Actions for ${role.name}`}
+                        className="rounded-md p-1.5 text-muted-foreground transition hover:bg-accent hover:text-foreground"
+                      >
                         <MoreHorizontal className="h-4 w-4" />
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
@@ -127,12 +165,22 @@ export function RolesPage() {
                             >
                               <Copy className="mr-2 h-3.5 w-3.5" /> Duplicate
                             </DropdownMenuItem>
-                            {role.status === "active" ? (
+                            {/* Built-in roles are never offered Deactivate: the database
+                                refuses it, and deactivating Admin would lock everyone out (FD-062). */}
+                            {role.system ? (
+                              <DropdownMenuItem disabled>
+                                <Lock className="mr-2 h-3.5 w-3.5" /> Built-in: can't be deactivated
+                              </DropdownMenuItem>
+                            ) : role.status === "active" ? (
                               <DropdownMenuItem onClick={() => setDeactivateRole(role)}>
                                 <Ban className="mr-2 h-3.5 w-3.5" /> Deactivate
                               </DropdownMenuItem>
                             ) : (
-                              <DropdownMenuItem onClick={() => setRoleStatus(role.id, "active")}>
+                              <DropdownMenuItem
+                                onClick={() => {
+                                  if (setRoleStatus(role.id, "active")) toast.success(`${role.name} activated`);
+                                }}
+                              >
                                 <CheckCircle2 className="mr-2 h-3.5 w-3.5" /> Activate
                               </DropdownMenuItem>
                             )}
@@ -143,16 +191,36 @@ export function RolesPage() {
                   </td>
                 </tr>
               ))}
+              {roles.length === 0 && (
+                <tr>
+                  <td colSpan={5} className="px-4 py-10 text-center text-sm text-muted-foreground">
+                    {status === "loading"
+                      ? "Loading roles…"
+                      : status === "error"
+                        ? "Roles could not be loaded. Refresh to try again."
+                        : "No roles for this organization yet."}
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
       </div>
 
-      <p className="text-xs text-muted-foreground">
-        The Admin role cannot be deactivated and there must always be at least one active Admin.
-      </p>
+      <div className="space-y-1 text-xs text-muted-foreground">
+        {roles.length > 0 && (
+          <p>
+            {plural(peopleInOrg, "person", "people")} in {orgName}. Each holds exactly one role here, so the
+            Users column adds up to that total.
+          </p>
+        )}
+        <p>
+          Built-in roles (marked with a lock) can't be renamed, deactivated or deleted; the database refuses it.
+          There must always be at least one active Admin.
+        </p>
+      </div>
 
-      <RoleDrawer target={drawer} onClose={() => setDrawer(null)} />
+      <RoleDrawer target={drawer} orgId={orgId} onClose={() => setDrawer(null)} />
 
       <AlertDialog open={!!deactivateRole} onOpenChange={(o) => !o && setDeactivateRole(null)}>
         <AlertDialogContent>
@@ -168,8 +236,9 @@ export function RolesPage() {
             <AlertDialogAction
               onClick={() => {
                 if (!deactivateRole) return;
-                setRoleStatus(deactivateRole.id, "inactive");
-                toast.success(`${deactivateRole.name} deactivated`);
+                if (setRoleStatus(deactivateRole.id, "inactive")) {
+                  toast.success(`${deactivateRole.name} deactivated`);
+                }
                 setDeactivateRole(null);
               }}
             >
@@ -232,14 +301,20 @@ function PermissionEditor({
         <div className="space-y-2">
           {settingsModules.map((s) => (
             <div key={s.key} className="flex items-center justify-between gap-3">
-              <span className="text-sm">{s.label}</span>
-              <div className="inline-flex items-center rounded-lg border border-border p-0.5">
+              <span className="text-sm" id={`settings-access-${s.key}`}>{s.label}</span>
+              <div
+                role="group"
+                aria-labelledby={`settings-access-${s.key}`}
+                className="inline-flex items-center rounded-lg border border-border p-0.5"
+              >
                 {(["none", "view", "manage"] as SettingsAccess[]).map((level) => {
                   const active = (value.settings[s.key] ?? "none") === level;
                   return (
                     <button
                       key={level}
+                      type="button"
                       disabled={readOnly}
+                      aria-pressed={active}
                       onClick={() => onChange({ settings: { ...value.settings, [s.key]: level } })}
                       className={cn(
                         "rounded-md px-2.5 py-1 text-[11px] font-medium capitalize transition",
@@ -261,7 +336,9 @@ function PermissionEditor({
   );
 }
 
-function RoleDrawer({ target, onClose }: { target: Role | "new" | null; onClose: () => void }) {
+function RoleDrawer({
+  target, orgId, onClose,
+}: { target: Role | "new" | null; orgId: string; onClose: () => void }) {
   const { createRole, updateRole, isRoleNameTaken } = useOrganizations();
   const editing = target && target !== "new" ? target : null;
   const open = !!target;
@@ -281,13 +358,14 @@ function RoleDrawer({ target, onClose }: { target: Role | "new" | null; onClose:
 
   const submit = () => {
     if (!draft.name.trim()) return setError("Role name is required.");
-    if (isRoleNameTaken(draft.name, editing?.id)) return setError("A role with this name already exists.");
+    const roleOrg = editing?.orgId ?? orgId;
+    if (isRoleNameTaken(draft.name, editing?.id, roleOrg)) return setError("A role with this name already exists.");
 
     if (editing) {
       updateRole(editing.id, { ...draft, name: draft.name.trim() });
       toast.success("Role updated");
     } else {
-      createRole({ ...draft, name: draft.name.trim() });
+      createRole({ ...draft, name: draft.name.trim(), orgId: roleOrg || undefined });
       toast.success("Role created");
     }
     onClose();
@@ -303,12 +381,13 @@ function RoleDrawer({ target, onClose }: { target: Role | "new" | null; onClose:
 
         <div className="flex-1 space-y-5 overflow-y-auto p-6">
           <div className="space-y-1.5">
-            <label className={labelClass}>Role Name *</label>
+            <label htmlFor="role-name" className={labelClass}>Role Name *</label>
             <input
+              id="role-name"
               value={draft.name}
               onChange={(e) => patch({ name: e.target.value })}
               className={inputClass}
-              placeholder="Team Lead"
+              placeholder="Coordinator"
               disabled={editing?.system}
             />
             {editing?.system && (
@@ -319,8 +398,9 @@ function RoleDrawer({ target, onClose }: { target: Role | "new" | null; onClose:
           </div>
 
           <div className="space-y-1.5">
-            <label className={labelClass}>Description</label>
+            <label htmlFor="role-description" className={labelClass}>Description</label>
             <textarea
+              id="role-description"
               value={draft.description}
               onChange={(e) => patch({ description: e.target.value })}
               rows={2}
@@ -329,8 +409,9 @@ function RoleDrawer({ target, onClose }: { target: Role | "new" | null; onClose:
           </div>
 
           <div className="space-y-1.5">
-            <label className={labelClass}>Data Access</label>
+            <label htmlFor="role-scope" className={labelClass}>Data Access</label>
             <select
+              id="role-scope"
               value={draft.scope}
               onChange={(e) => patch({ scope: e.target.value as DataScope })}
               className={inputClass}
@@ -346,20 +427,29 @@ function RoleDrawer({ target, onClose }: { target: Role | "new" | null; onClose:
 
           <div className="space-y-1.5">
             <div className={labelClass}>Permissions</div>
+            <p className="text-[11px] text-muted-foreground">{PERMISSIONS_NOTE}</p>
             <PermissionEditor value={draft} onChange={patch} />
           </div>
 
           <div className="space-y-1.5">
-            <label className={labelClass}>Status</label>
+            <label htmlFor="role-status" className={labelClass}>Status</label>
             <select
+              id="role-status"
               value={draft.status}
               onChange={(e) => patch({ status: e.target.value as OrgStatus })}
               className={inputClass}
-              disabled={editing?.name === "Admin"}
+              // Was disabled for a role literally named "Admin" only; every
+              // built-in role is refused by the database (FD-062).
+              disabled={editing?.system}
             >
               <option value="active">Active</option>
               <option value="inactive">Inactive</option>
             </select>
+            {editing?.system && (
+              <p className="flex items-center gap-1 text-[11px] text-muted-foreground">
+                <Lock className="h-3 w-3" /> Built-in roles are always active.
+              </p>
+            )}
           </div>
 
           {error && <p className="text-xs text-destructive">{error}</p>}
@@ -377,27 +467,37 @@ function RoleDrawer({ target, onClose }: { target: Role | "new" | null; onClose:
 }
 
 function RoleDetail({ role, onBack, onEdit }: { role: Role; onBack: () => void; onEdit: () => void }) {
-  const { users, roles, assignRole, activeAdminCount, canManageUsers } = useOrganizations();
+  const {
+    users, rolesFor, roleMembers, assignRole, activeAdminCount, activeAdminCountIn, isAdminIn,
+    canManageUsers, accessibleOrganizations,
+  } = useOrganizations();
   const [assignOpen, setAssignOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [confirm, setConfirm] = useState<{ user: OrgUser; role: Role } | null>(null);
 
-  const norm = (v: string) => v.trim().toLowerCase();
-  const labels = new Set([role.name, ...role.aliases].map(norm));
-  const members = users.filter((u) => u.memberships.some((m) => labels.has(norm(m.role))));
+  const orgId = role.orgId ?? "";
+  const orgName = accessibleOrganizations.find((o) => o.id === orgId)?.name;
+  // Same rule as the Users page and the Users column (FD-063, FD-067).
+  const members = roleMembers(role);
+  const otherRoles = rolesFor(orgId).filter((r) => r.status === "active" && r.id !== role.id);
 
   const candidates = useMemo(
     () =>
       users
+        // Only people in this role's organization can hold it.
+        .filter((u) => !orgId || u.memberships.some((m) => m.orgId === orgId))
         .filter((u) => !members.some((m) => m.id === u.id))
         .filter((u) => u.name.toLowerCase().includes(search.trim().toLowerCase())),
-    [users, members, search],
+    [users, members, search, orgId],
   );
 
-  const isAdminUser = (u: OrgUser) => u.memberships.some((m) => norm(m.role) === "admin");
-
   const requestAssign = (user: OrgUser, next: Role) => {
-    if (isAdminUser(user) && norm(next.name) !== "admin" && activeAdminCount <= 1) {
+    const nextIsAdmin = next.baseRole ? next.baseRole === "admin" : next.name.trim().toLowerCase() === "admin";
+    const userIsAdmin = orgId
+      ? isAdminIn(user, orgId)
+      : user.memberships.some((m) => isAdminIn(user, m.orgId));
+    const adminsHere = orgId ? activeAdminCountIn(orgId) : activeAdminCount;
+    if (userIsAdmin && !nextIsAdmin && user.status === "active" && adminsHere <= 1) {
       toast.error("There must always be at least one active Admin.");
       return;
     }
@@ -419,6 +519,12 @@ function RoleDetail({ role, onBack, onEdit }: { role: Role; onBack: () => void; 
           </div>
           <p className="max-w-2xl text-sm text-muted-foreground">{role.description}</p>
           <div className="flex flex-wrap gap-5 pt-2 text-sm">
+            {accessibleOrganizations.length > 1 && orgName && (
+              <div>
+                <div className={labelClass}>Organization</div>
+                <div>{orgName}</div>
+              </div>
+            )}
             <div>
               <div className={labelClass}>Data Access</div>
               <div>{scopeLabel(role.scope)}</div>
@@ -443,7 +549,8 @@ function RoleDetail({ role, onBack, onEdit }: { role: Role; onBack: () => void; 
 
       <div className="grid gap-5 lg:grid-cols-[1.2fr_1fr]">
         <div className="rounded-xl border border-border bg-card p-5 shadow-[var(--shadow-soft)]">
-          <h3 className="mb-3 text-sm font-semibold">Permissions</h3>
+          <h3 className="mb-1 text-sm font-semibold">Permissions</h3>
+          <p className="mb-3 text-[11px] text-muted-foreground">{PERMISSIONS_NOTE}</p>
           <PermissionEditor value={role} onChange={() => {}} readOnly />
         </div>
 
@@ -457,21 +564,22 @@ function RoleDetail({ role, onBack, onEdit }: { role: Role; onBack: () => void; 
                 </div>
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-sm font-medium">{u.name}</div>
-                  <div className="truncate text-[11px] text-muted-foreground">{u.designation}</div>
+                  <div className="truncate text-[11px] text-muted-foreground">{u.designation || u.email}</div>
                 </div>
-                {canManageUsers && (
+                {canManageUsers && otherRoles.length > 0 && (
                   <DropdownMenu>
-                    <DropdownMenuTrigger className="rounded-md p-1.5 text-muted-foreground transition hover:bg-accent hover:text-foreground">
+                    <DropdownMenuTrigger
+                      aria-label={`Change role for ${u.name}`}
+                      className="rounded-md p-1.5 text-muted-foreground transition hover:bg-accent hover:text-foreground"
+                    >
                       <MoreHorizontal className="h-4 w-4" />
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
-                      {roles
-                        .filter((r) => r.status === "active" && r.id !== role.id)
-                        .map((r) => (
-                          <DropdownMenuItem key={r.id} onClick={() => requestAssign(u, r)}>
-                            Change to {r.name}
-                          </DropdownMenuItem>
-                        ))}
+                      {otherRoles.map((r) => (
+                        <DropdownMenuItem key={r.id} onClick={() => requestAssign(u, r)}>
+                          Change to {r.name}
+                        </DropdownMenuItem>
+                      ))}
                     </DropdownMenuContent>
                   </DropdownMenu>
                 )}
@@ -490,12 +598,15 @@ function RoleDetail({ role, onBack, onEdit }: { role: Role; onBack: () => void; 
         <SheetContent className="w-full overflow-y-auto sm:max-w-md">
           <SheetHeader>
             <SheetTitle>Assign {role.name}</SheetTitle>
-            <SheetDescription>Pick the employees who should get this role.</SheetDescription>
+            <SheetDescription>
+              Pick the employees who should get this role{orgName ? ` in ${orgName}` : ""}.
+            </SheetDescription>
           </SheetHeader>
           <div className="mt-6 space-y-3">
             <div className="relative">
               <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
               <input
+                aria-label="Search employees"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
                 placeholder="Search employees"
@@ -517,7 +628,7 @@ function RoleDetail({ role, onBack, onEdit }: { role: Role; onBack: () => void; 
                   </div>
                   <span className="min-w-0 flex-1 truncate">
                     {u.name}
-                    <span className="block text-[11px] text-muted-foreground">{u.designation}</span>
+                    <span className="block text-[11px] text-muted-foreground">{u.designation || u.email}</span>
                   </span>
                 </button>
               ))}
@@ -534,8 +645,8 @@ function RoleDetail({ role, onBack, onEdit }: { role: Role; onBack: () => void; 
           <AlertDialogHeader>
             <AlertDialogTitle>Change role for {confirm?.user.name}?</AlertDialogTitle>
             <AlertDialogDescription>
-              {confirm?.user.name} will get the {confirm?.role.name} role across their organizations.
-              Access updates the next time they refresh the app.
+              {confirm?.user.name} will get the {confirm?.role.name} role
+              {orgName ? ` in ${orgName}` : ""}. Access updates the next time they refresh the app.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -543,7 +654,7 @@ function RoleDetail({ role, onBack, onEdit }: { role: Role; onBack: () => void; 
             <AlertDialogAction
               onClick={() => {
                 if (!confirm) return;
-                assignRole(confirm.user.id, confirm.role.name);
+                assignRole(confirm.user.id, confirm.role.id);
                 toast.success(`${confirm.user.name} is now ${confirm.role.name}`);
                 setConfirm(null);
               }}

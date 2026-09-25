@@ -1,11 +1,11 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
 import {
   assignRoleRow,
   createDepartmentRow,
   createRoleRow,
   createTeamRow,
-  deleteRoleRow,
   loadAdminSnapshot,
   removeMembershipRow,
   resolveUserId,
@@ -49,6 +49,7 @@ export interface Team {
   orgId: string;
   departmentId: string;
   name: string;
+  /** User id of the team lead. */
   lead?: string;
   memberIds: string[];
   status: OrgStatus;
@@ -61,6 +62,7 @@ export interface Membership {
   orgId: string;
   departmentId?: string;
   teamId?: string;
+  /** The role's name in this organization, e.g. "Employee". */
   role: string;
   status: OrgStatus;
   reportingManagerId?: string;
@@ -99,251 +101,14 @@ export interface UserActivity {
   at: string;
 }
 
-export type NewUserInput = Omit<OrgUser, "id">;
-
 export interface OrgProject {
   id: string;
   name: string;
   orgId: string;
+  /** Not completed, cancelled or archived. */
   active: boolean;
+  categoryId?: string;
 }
-
-export type NewOrganization = Omit<Organization, "id">;
-
-const seedOrganizations: Organization[] = [
-  {
-    id: "ORG-1",
-    name: "upCarrera",
-    code: "UPC",
-    email: "hello@upcarrera.com",
-    phone: "+971 4 555 0100",
-    website: "https://upcarrera.com",
-    country: "United Arab Emirates",
-    timezone: "Asia/Dubai",
-    status: "active",
-  },
-  {
-    id: "ORG-2",
-    name: "Teachers' Training Institute of India",
-    code: "TTII",
-    email: "contact@ttii.in",
-    phone: "+91 22 4000 1200",
-    website: "https://ttii.in",
-    country: "India",
-    timezone: "Asia/Kolkata",
-    status: "active",
-  },
-];
-
-const seedDepartments: Department[] = [
-  { id: "D-1", orgId: "ORG-1", name: "Management", head: "Alex Morgan", status: "active" },
-  { id: "D-2", orgId: "ORG-1", name: "Product", head: "Sam Chen", status: "active" },
-  { id: "D-3", orgId: "ORG-1", name: "Engineering", head: "Jordan Lee", status: "active" },
-  { id: "D-4", orgId: "ORG-1", name: "Growth", head: "Riley Park", status: "active" },
-  { id: "D-5", orgId: "ORG-1", name: "Operations", head: "Priya Shah", status: "active" },
-  { id: "D-6", orgId: "ORG-1", name: "People", head: "Priya Shah", status: "active" },
-  { id: "D-7", orgId: "ORG-2", name: "Learning & Growth", head: "Priya Shah", status: "active" },
-  { id: "D-8", orgId: "ORG-2", name: "Academics", head: "Meera Iyer", status: "active" },
-  { id: "D-9", orgId: "ORG-2", name: "Admissions", head: "Rahul Verma", status: "active" },
-  { id: "D-10", orgId: "ORG-2", name: "Operations", head: "Sam Chen", status: "active" },
-];
-
-const seedTeams: Team[] = [
-  { id: "TM-1", orgId: "ORG-1", departmentId: "D-1", name: "Leadership", lead: "U-1", memberIds: ["U-1", "U-2"], status: "active" },
-  { id: "TM-2", orgId: "ORG-1", departmentId: "D-2", name: "Design", lead: "U-4", memberIds: ["U-4"], status: "active" },
-  { id: "TM-3", orgId: "ORG-1", departmentId: "D-2", name: "Research", memberIds: [], status: "active" },
-  { id: "TM-4", orgId: "ORG-1", departmentId: "D-3", name: "Platform", lead: "U-3", memberIds: ["U-3"], status: "active" },
-  { id: "TM-5", orgId: "ORG-1", departmentId: "D-3", name: "Payments", memberIds: [], status: "active" },
-  { id: "TM-6", orgId: "ORG-1", departmentId: "D-4", name: "Marketing", lead: "U-5", memberIds: ["U-5"], status: "active" },
-  { id: "TM-7", orgId: "ORG-1", departmentId: "D-5", name: "Service Desk", memberIds: [], status: "active" },
-  { id: "TM-8", orgId: "ORG-2", departmentId: "D-7", name: "Trainer Enablement", lead: "U-1", memberIds: ["U-1", "U-2", "U-8"], status: "active" },
-  { id: "TM-9", orgId: "ORG-2", departmentId: "D-8", name: "Curriculum", lead: "U-6", memberIds: ["U-6"], status: "active" },
-  { id: "TM-10", orgId: "ORG-2", departmentId: "D-9", name: "Counselling", lead: "U-7", memberIds: ["U-7"], status: "active" },
-  { id: "TM-11", orgId: "ORG-2", departmentId: "D-10", name: "Campus Ops", lead: "U-4", memberIds: ["U-4"], status: "active" },
-];
-
-const seedUsers: OrgUser[] = [
-  {
-    id: "U-1",
-    name: "Alex Morgan",
-    email: "alex.morgan@upcarrera.com",
-    phone: "+971 50 221 8890",
-    employeeId: "UPC-0001",
-    designation: "Operations Director",
-    joiningDate: "2021-03-15",
-    status: "active",
-    primaryOrgId: "ORG-1",
-    memberships: [
-      { orgId: "ORG-1", departmentId: "D-1", teamId: "TM-1", role: "Admin", status: "active" },
-      {
-        orgId: "ORG-2",
-        departmentId: "D-7",
-        teamId: "TM-8",
-        role: "Manager",
-        status: "active",
-        reportingManagerId: "U-6",
-      },
-    ],
-  },
-  {
-    id: "U-2",
-    name: "Priya Shah",
-    email: "priya.shah@upcarrera.com",
-    phone: "+971 50 771 4410",
-    employeeId: "UPC-0002",
-    designation: "People Lead",
-    joiningDate: "2021-09-01",
-    status: "active",
-    primaryOrgId: "ORG-1",
-    memberships: [
-      {
-        orgId: "ORG-1",
-        departmentId: "D-6",
-        teamId: "TM-1",
-        role: "Manager",
-        status: "active",
-        reportingManagerId: "U-1",
-      },
-      { orgId: "ORG-2", departmentId: "D-7", teamId: "TM-8", role: "Member", status: "active" },
-    ],
-  },
-  {
-    id: "U-3",
-    name: "Jordan Lee",
-    email: "jordan.lee@upcarrera.com",
-    phone: "+971 50 330 7712",
-    employeeId: "UPC-0003",
-    designation: "Engineering Manager",
-    joiningDate: "2022-01-10",
-    status: "active",
-    primaryOrgId: "ORG-1",
-    memberships: [
-      {
-        orgId: "ORG-1",
-        departmentId: "D-3",
-        teamId: "TM-4",
-        role: "Manager",
-        status: "active",
-        reportingManagerId: "U-1",
-      },
-    ],
-  },
-  {
-    id: "U-4",
-    name: "Sam Chen",
-    email: "sam.chen@upcarrera.com",
-    phone: "+971 50 118 2245",
-    employeeId: "UPC-0004",
-    designation: "Product Manager",
-    joiningDate: "2022-06-20",
-    status: "active",
-    primaryOrgId: "ORG-1",
-    memberships: [
-      {
-        orgId: "ORG-1",
-        departmentId: "D-2",
-        teamId: "TM-2",
-        role: "Member",
-        status: "active",
-        reportingManagerId: "U-1",
-      },
-      { orgId: "ORG-2", departmentId: "D-10", teamId: "TM-11", role: "Manager", status: "active" },
-    ],
-  },
-  {
-    id: "U-5",
-    name: "Riley Park",
-    email: "riley.park@upcarrera.com",
-    employeeId: "UPC-0005",
-    designation: "Growth Lead",
-    joiningDate: "2023-02-06",
-    status: "active",
-    primaryOrgId: "ORG-1",
-    memberships: [
-      {
-        orgId: "ORG-1",
-        departmentId: "D-4",
-        teamId: "TM-6",
-        role: "Member",
-        status: "active",
-        reportingManagerId: "U-1",
-      },
-    ],
-  },
-  {
-    id: "U-6",
-    name: "Meera Iyer",
-    email: "meera.iyer@ttii.in",
-    phone: "+91 98200 45512",
-    employeeId: "TTII-0001",
-    designation: "Academic Head",
-    joiningDate: "2020-07-01",
-    status: "active",
-    primaryOrgId: "ORG-2",
-    memberships: [
-      { orgId: "ORG-2", departmentId: "D-8", teamId: "TM-9", role: "Admin", status: "active" },
-    ],
-  },
-  {
-    id: "U-7",
-    name: "Rahul Verma",
-    email: "rahul.verma@ttii.in",
-    phone: "+91 98330 11245",
-    employeeId: "TTII-0002",
-    designation: "Admissions Manager",
-    joiningDate: "2022-11-14",
-    status: "active",
-    primaryOrgId: "ORG-2",
-    memberships: [
-      {
-        orgId: "ORG-2",
-        departmentId: "D-9",
-        teamId: "TM-10",
-        role: "Manager",
-        status: "active",
-        reportingManagerId: "U-6",
-      },
-    ],
-  },
-  {
-    id: "U-8",
-    name: "Neha Kapoor",
-    email: "neha.kapoor@ttii.in",
-    employeeId: "TTII-0003",
-    designation: "Training Coordinator",
-    joiningDate: "2024-04-02",
-    status: "inactive",
-    primaryOrgId: "ORG-2",
-    memberships: [
-      {
-        orgId: "ORG-2",
-        departmentId: "D-7",
-        teamId: "TM-8",
-        role: "Member",
-        status: "active",
-        reportingManagerId: "U-6",
-      },
-    ],
-  },
-];
-
-const seedUserActivity: UserActivity[] = [
-  { id: "UA-1", userId: "U-1", type: "created", message: "User account created", at: "2021-03-15T09:00:00Z" },
-  { id: "UA-2", userId: "U-1", type: "organization-added", message: "Added to Teachers' Training Institute of India as Manager", at: "2023-05-04T11:20:00Z" },
-  { id: "UA-3", userId: "U-8", type: "created", message: "User account created", at: "2024-04-02T08:30:00Z" },
-  { id: "UA-4", userId: "U-8", type: "deactivated", message: "Account deactivated", at: "2026-02-11T10:05:00Z" },
-];
-
-const seedProjects: OrgProject[] = [
-  { id: "P-1", name: "Orbit Web", orgId: "ORG-1", active: true },
-  { id: "P-2", name: "Payments", orgId: "ORG-1", active: true },
-  { id: "P-3", name: "Platform", orgId: "ORG-1", active: true },
-  { id: "P-4", name: "Growth", orgId: "ORG-1", active: true },
-  { id: "P-5", name: "Operations", orgId: "ORG-2", active: true },
-];
-
-/** Signed-in employee used for permission checks in this prototype. */
-export const roleOptions = ["Admin", "Manager", "Member", "Viewer"];
 
 export interface OrgCounts {
   departments: number;
@@ -351,6 +116,34 @@ export interface OrgCounts {
   users: number;
   activeProjects: number;
 }
+
+/* ------------------------------------------------------------------ */
+/* Phone numbers                                                       */
+/* ------------------------------------------------------------------ */
+
+/** Digits only, not counting the separators. E.164 allows at most 15. */
+export const PHONE_RULES = { minDigits: 7, maxDigits: 15, maxLength: 20 } as const;
+
+/**
+ * Validate a phone number typed by hand. Empty is valid (the field is optional).
+ * Accepts digits, spaces, + - ( ) only (FD-050: "abcxyz" used to be accepted).
+ */
+export function validatePhone(value: string): string | null {
+  const phone = value.trim();
+  if (!phone) return null;
+  if (/[^0-9+\-() ]/.test(phone)) return "Use digits, spaces and + - ( ) only.";
+  if (phone.lastIndexOf("+") > 0) return "A + can only appear once, at the start.";
+  if (phone.length > PHONE_RULES.maxLength) return `Keep it to ${PHONE_RULES.maxLength} characters.`;
+  const digits = phone.replace(/\D/g, "").length;
+  if (digits < PHONE_RULES.minDigits || digits > PHONE_RULES.maxDigits) {
+    return `Enter ${PHONE_RULES.minDigits} to ${PHONE_RULES.maxDigits} digits.`;
+  }
+  return null;
+}
+
+/** "1 team", "2 teams". */
+export const plural = (count: number, singular: string, pluralForm = `${singular}s`) =>
+  `${count} ${count === 1 ? singular : pluralForm}`;
 
 /* ------------------------------------------------------------------ */
 /* Roles & permissions                                                 */
@@ -367,6 +160,9 @@ export const scopeOptions: { value: DataScope; label: string; hint: string }[] =
   { value: "all", label: "All Organizations", hint: "Everything across every organization" },
 ];
 
+// Only features the app actually has. Calendar, Reports and an organization-wide
+// dashboard were listed here although no such screen exists (FD-068). Task and
+// project delete do exist (tasks soft-delete, projects archive).
 export const permissionModules: { key: string; label: string; items: { key: string; label: string }[] }[] = [
   {
     key: "dashboard",
@@ -374,7 +170,6 @@ export const permissionModules: { key: string; label: string; items: { key: stri
     items: [
       { key: "dashboard.personal", label: "View Personal Dashboard" },
       { key: "dashboard.team", label: "View Team Dashboard" },
-      { key: "dashboard.org", label: "View Organization Dashboard" },
     ],
   },
   {
@@ -408,36 +203,20 @@ export const permissionModules: { key: string; label: string; items: { key: stri
       { key: "projects.delete", label: "Delete" },
     ],
   },
-  {
-    key: "calendar",
-    label: "Calendar",
-    items: [
-      { key: "calendar.own", label: "View Own" },
-      { key: "calendar.team", label: "View Team" },
-      { key: "calendar.org", label: "View Organization" },
-      { key: "calendar.events", label: "Create/Edit Events" },
-    ],
-  },
-  {
-    key: "reports",
-    label: "Reports",
-    items: [
-      { key: "reports.own", label: "View Own" },
-      { key: "reports.team", label: "View Team" },
-      { key: "reports.org", label: "View Organization" },
-      { key: "reports.export", label: "Export" },
-    ],
-  },
 ];
 
+// One entry per settings screen in the sidebar. "Holidays & Working Days" was
+// listed but has no screen (FD-068).
 export const settingsModules: { key: string; label: string }[] = [
   { key: "settings.organizations", label: "Organizations" },
   { key: "settings.users", label: "Users" },
   { key: "settings.structure", label: "Teams & Departments" },
   { key: "settings.roles", label: "Roles & Permissions" },
   { key: "settings.taskProject", label: "Task & Project Settings" },
-  { key: "settings.holidays", label: "Holidays & Working Days" },
 ];
+
+const knownPermissionKeys = new Set(permissionModules.flatMap((m) => m.items.map((i) => i.key)));
+const knownSettingsKeys = new Set(settingsModules.map((s) => s.key));
 
 export interface Role {
   id: string;
@@ -450,100 +229,18 @@ export interface Role {
   settings: Record<string, SettingsAccess>;
   /** Membership role labels already stored on users that map to this role. */
   aliases: string[];
-  /** Built-in roles cannot be renamed away from their purpose. */
+  /** Built-in roles cannot be renamed, deactivated or deleted (the database refuses). */
   system?: boolean;
+  /** Roles belong to one organization; each organization has its own "Admin". */
+  orgId?: string;
+  /** The privilege row-level security enforces for people holding this role. */
+  baseRole?: BaseRole;
 }
 
 export type NewRoleInput = Omit<Role, "id">;
 
-const allPermissionKeys = permissionModules.flatMap((m) => m.items.map((i) => i.key));
 const settingsAll = (access: SettingsAccess) =>
   Object.fromEntries(settingsModules.map((s) => [s.key, access])) as Record<string, SettingsAccess>;
-
-const seedRoles: Role[] = [
-  {
-    id: "R-1",
-    name: "Admin",
-    description: "Full application and settings access.",
-    status: "active",
-    scope: "all",
-    permissions: allPermissionKeys,
-    settings: settingsAll("manage"),
-    aliases: ["Admin"],
-    system: true,
-  },
-  {
-    id: "R-2",
-    name: "Manager / HOD",
-    description:
-      "Manage department projects and tasks, assign work and view department-level information.",
-    status: "active",
-    scope: "department",
-    permissions: [
-      "dashboard.personal", "dashboard.team", "dashboard.org",
-      "mytasks.view", "mytasks.create", "mytasks.edit", "mytasks.delete",
-      "teamtasks.view", "teamtasks.create", "teamtasks.assign", "teamtasks.edit",
-      "projects.view", "projects.create", "projects.manage",
-      "calendar.own", "calendar.team", "calendar.org", "calendar.events",
-      "reports.own", "reports.team", "reports.org", "reports.export",
-    ],
-    settings: { ...settingsAll("none"), "settings.users": "view", "settings.structure": "view" },
-    aliases: ["Manager"],
-    system: true,
-  },
-  {
-    id: "R-3",
-    name: "Team Lead",
-    description: "Manage tasks for assigned teams.",
-    status: "active",
-    scope: "team",
-    permissions: [
-      "dashboard.personal", "dashboard.team",
-      "mytasks.view", "mytasks.create", "mytasks.edit",
-      "teamtasks.view", "teamtasks.create", "teamtasks.assign", "teamtasks.edit",
-      "projects.view",
-      "calendar.own", "calendar.team", "calendar.events",
-      "reports.own", "reports.team",
-    ],
-    settings: settingsAll("none"),
-    aliases: ["Team Lead"],
-    system: true,
-  },
-  {
-    id: "R-4",
-    name: "Employee",
-    description: "Manage own tasks and participate in assigned projects.",
-    status: "active",
-    scope: "own",
-    permissions: [
-      "dashboard.personal",
-      "mytasks.view", "mytasks.create", "mytasks.edit",
-      "teamtasks.view",
-      "projects.view",
-      "calendar.own", "calendar.events",
-      "reports.own",
-    ],
-    settings: settingsAll("none"),
-    aliases: ["Employee", "Member"],
-    system: true,
-  },
-  {
-    id: "R-5",
-    name: "Management / Viewer",
-    description: "View organization-level information and reports without operational editing.",
-    status: "active",
-    scope: "organization",
-    permissions: [
-      "dashboard.personal", "dashboard.team", "dashboard.org",
-      "mytasks.view", "teamtasks.view", "projects.view",
-      "calendar.own", "calendar.team", "calendar.org",
-      "reports.own", "reports.team", "reports.org", "reports.export",
-    ],
-    settings: settingsAll("none"),
-    aliases: ["Viewer"],
-    system: true,
-  },
-];
 
 export const emptyRole: NewRoleInput = {
   name: "",
@@ -556,6 +253,8 @@ export const emptyRole: NewRoleInput = {
 };
 
 type OrganizationsContextValue = {
+  /** Whether the admin data has loaded. Screens show a loading row, not "nothing here". */
+  status: "loading" | "ready" | "error";
   organizations: Organization[];
   departments: Department[];
   teams: Team[];
@@ -566,7 +265,12 @@ type OrganizationsContextValue = {
   activeOrgId: string | "all";
   setActiveOrgId: (id: string | "all") => void;
   countsFor: (orgId: string) => OrgCounts;
-  addOrganization: (input: NewOrganization) => Organization;
+  /**
+   * THE department list (FD-036): the departments on Teams & Departments, active
+   * only, for one organization or all of them. Every department picker uses this.
+   */
+  activeDepartmentsFor: (orgId: string | "all") => Department[];
+  reloadProjects: () => Promise<void>;
   updateOrganization: (id: string, updates: Partial<Organization>) => void;
   setOrganizationStatus: (id: string, status: OrgStatus) => void;
   addDepartment: (orgId: string, name: string, head: string) => void;
@@ -581,7 +285,6 @@ type OrganizationsContextValue = {
   userActivity: UserActivity[];
   currentUser: OrgUser | null;
   canManageUsers: boolean;
-  addUser: (input: NewUserInput) => OrgUser;
   updateUser: (id: string, updates: Partial<OrgUser>) => void;
   setUserStatus: (id: string, status: OrgStatus) => void;
   upsertMembership: (userId: string, membership: Membership) => void;
@@ -602,28 +305,71 @@ type OrganizationsContextValue = {
   isTeamNameTaken: (departmentId: string, name: string, exceptId?: string) => boolean;
   // Roles & permissions
   roles: Role[];
+  /** The roles of one organization. */
+  rolesFor: (orgId: string) => Role[];
+  /** The people holding this role in its organization — the same rule the Users page uses. */
+  roleMembers: (role: Role) => OrgUser[];
   roleUserCount: (role: Role) => number;
+  /** The role new people get in an organization ("Employee"). */
+  defaultRoleName: (orgId: string) => string;
+  /** Active users holding an admin-level role anywhere. */
   activeAdminCount: number;
+  activeAdminCountIn: (orgId: string) => number;
+  isAdminIn: (user: OrgUser, orgId: string) => boolean;
   createRole: (input: NewRoleInput) => Role;
   updateRole: (id: string, updates: Partial<Role>) => void;
-  setRoleStatus: (id: string, status: OrgStatus) => void;
+  /** Returns false when refused (built-in roles cannot be deactivated). */
+  setRoleStatus: (id: string, status: OrgStatus) => boolean;
   duplicateRole: (id: string) => void;
-  isRoleNameTaken: (name: string, exceptId?: string) => boolean;
-  assignRole: (userId: string, roleName: string) => void;
+  isRoleNameTaken: (name: string, exceptId?: string, orgId?: string) => boolean;
+  /** Give the user this role in the role's organization — label and privilege. */
+  assignRole: (userId: string, roleId: string) => void;
 };
 
 const OrganizationsContext = createContext<OrganizationsContextValue | null>(null);
 
+const normalize = (v: string) => v.trim().toLowerCase();
+
+const saveFailed = (what: string) =>
+  toast.error(`${what} could not be saved. You may not have permission, or the connection dropped.`);
+
+/** Toast when a write reports failure. The cause is already in the console from admin-api. */
+const reportIfFailed = (what: string) => (ok: boolean) => {
+  if (!ok) saveFailed(what);
+  return ok;
+};
+
+async function loadOrgProjects(): Promise<OrgProject[] | null> {
+  const { data, error } = await supabase
+    .from("work_projects")
+    .select("id, name, organization_id, status, category_id")
+    .is("archived_at", null);
+  if (error) {
+    console.error("[flowdesk] loadOrgProjects failed", error);
+    return null;
+  }
+  return (data ?? []).map((row) => ({
+    id: row.id,
+    name: row.name,
+    orgId: row.organization_id,
+    active: !["completed", "cancelled", "archived"].includes(row.status),
+    categoryId: row.category_id ?? undefined,
+  }));
+}
+
 export function OrganizationsProvider({ children }: { children: ReactNode }) {
   // Everything starts empty and is loaded from Supabase. These lists used to be
-  // seeded from hardcoded arrays of invented people (Alex Morgan, UPC-0001 ...),
+  // seeded from hardcoded arrays of invented people and employee ids,
   // which meant the admin screens showed convincing data that did not exist and
   // silently discarded every edit.
   const [organizations, setOrganizations] = useState<Organization[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
   const [teams, setTeams] = useState<Team[]>([]);
   const [users, setUsers] = useState<OrgUser[]>([]);
-  const [projects, setProjects] = useState<OrgProject[]>(seedProjects);
+  // Was five invented projects with ids no real project has, so
+  // every organization showed 0 active projects and the Projects org filter never
+  // matched anything.
+  const [projects, setProjects] = useState<OrgProject[]>([]);
   const [activeOrgId, setActiveOrgId] = useState<string | "all">("all");
   const [roles, setRoles] = useState<Role[]>([]);
   const [userActivity, setUserActivity] = useState<UserActivity[]>([]);
@@ -631,6 +377,11 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
   const [authenticatedUserId, setAuthenticatedUserId] = useState<string | null>(null);
   const [accessibleOrgIds, setAccessibleOrgIds] = useState<string[]>([]);
   const [authenticatedRoles, setAuthenticatedRoles] = useState<string[]>([]);
+
+  const reloadProjects = useCallback(async () => {
+    const loaded = await loadOrgProjects();
+    if (loaded) setProjects(loaded);
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -651,14 +402,49 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
       setAuthenticatedRoles((assignedRoles ?? []).map((assignedRole) => assignedRole.role));
       // Load the admin surfaces from the database. RLS already narrows every
       // table to this user's organizations, so no client-side scoping is needed.
-      const snapshot = await loadAdminSnapshot();
+      const [snapshot, roleMeta, loadedProjects] = await Promise.all([
+        loadAdminSnapshot(),
+        // Which organization each role belongs to, and its real privilege. Roles
+        // are per organization, so with two organizations there are two "Admin"
+        // rows; without this the Roles page listed both and counted everyone's
+        // memberships against each (FD-037, FD-067).
+        supabase.from("roles").select("id, organization_id, base_role"),
+        loadOrgProjects(),
+      ]);
       if (!active) return;
+      if (loadedProjects) setProjects(loadedProjects);
       if (snapshot) {
+        const metaById = new Map((roleMeta.data ?? []).map((row) => [row.id, row]));
         setOrganizations(snapshot.organizations);
         setDepartments(snapshot.departments);
-        setTeams(snapshot.teams);
+        // admin-api maps a team lead to a display name, but every screen (and
+        // the Team type) works with the user id, so leads never showed or saved.
+        setTeams(
+          snapshot.teams.map((team) => ({
+            ...team,
+            lead:
+              team.lead && !snapshot.users.some((u) => u.id === team.lead)
+                ? snapshot.users.find((u) => u.name === team.lead)?.id
+                : team.lead,
+          })),
+        );
         setUsers(snapshot.users);
-        setRoles(snapshot.roles);
+        setRoles(
+          snapshot.roles.map((role) => {
+            const meta = metaById.get(role.id);
+            return {
+              ...role,
+              orgId: meta?.organization_id,
+              baseRole: meta?.base_role,
+              // Keys for features that do not exist are dropped, so saving a role
+              // no longer writes them back (FD-068).
+              permissions: role.permissions.filter((key) => knownPermissionKeys.has(key)),
+              settings: Object.fromEntries(
+                Object.entries(role.settings ?? {}).filter(([key]) => knownSettingsKeys.has(key)),
+              ) as Record<string, SettingsAccess>,
+            };
+          }),
+        );
         setAdminStatus("ready");
       } else {
         setAdminStatus("error");
@@ -679,15 +465,17 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
    * flight. This swaps in the id the database actually assigned.
    *
    * If the insert failed (RLS refused it, or the network dropped) realId is null:
-   * the row is removed again rather than left behind looking saved, and the cause
-   * is already in the console from admin-api.
+   * the row is removed again rather than left behind looking saved, and the
+   * person is told — the screen had already said "created".
    */
   const reconcileId = useCallback(
     <T extends { id: string }>(
       setter: React.Dispatch<React.SetStateAction<T[]>>,
       tempId: string,
       realId: string | null,
+      what: string,
     ) => {
+      if (!realId) saveFailed(what);
       setter((current) =>
         realId
           ? current.map((row) => (row.id === tempId ? { ...row, id: realId } : row))
@@ -708,6 +496,8 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
     (orgId: string): OrgCounts => ({
       departments: departments.filter((d) => d.orgId === orgId).length,
       teams: teams.filter((t) => t.orgId === orgId).length,
+      // The same rule as the Users page (filtered to this organization) and the
+      // sum of the Roles page for this organization, so the three agree (FD-037).
       users: users.filter((u) => u.memberships.some((m) => m.orgId === orgId)).length,
       activeProjects: projects.filter((p) => p.orgId === orgId && p.active).length,
     }),
@@ -715,8 +505,6 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
   );
 
   const value = useMemo<OrganizationsContextValue>(() => {
-    const normalize = (v: string) => v.trim().toLowerCase();
-
     // The privilege a role actually carries. Everything else on a role is
     // presentation; this is the single value row-level security consults, so a
     // new role must declare one or it would grant nothing.
@@ -727,7 +515,108 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
       : scope === "team" ? "team_lead"
       : "employee";
 
+    const inOrg = (role: Role, orgId: string) => !role.orgId || role.orgId === orgId;
+    const rolesFor = (orgId: string) => roles.filter((r) => inOrg(r, orgId));
+    const roleIn = (orgId: string, name: string) =>
+      roles.find((r) => inOrg(r, orgId) && normalize(r.name) === normalize(name));
+    // A system role's privilege is fixed in the database; a custom one follows its scope.
+    const privilegeOf = (role: Role): BaseRole => role.baseRole ?? baseRoleFor(role.scope);
+    const isAdminRole = (orgId: string, name: string) => {
+      const role = roleIn(orgId, name);
+      return role ? privilegeOf(role) === "admin" : normalize(name) === "admin";
+    };
+    const isAdminIn = (user: OrgUser, orgId: string) =>
+      user.memberships.some((m) => m.orgId === orgId && isAdminRole(m.orgId, m.role));
+    const roleMembers = (role: Role) =>
+      users.filter((u) =>
+        u.memberships.some((m) => inOrg(role, m.orgId) && normalize(m.role) === normalize(role.name)),
+      );
+    const defaultRoleName = (orgId: string) =>
+      rolesFor(orgId).find((r) => r.system && r.baseRole === "employee")?.name ?? "Employee";
+    const fallbackOrgId = () =>
+      activeOrgId !== "all" ? activeOrgId : (accessibleOrgIds[0] ?? organizations[0]?.id);
+
+    const leadIdOf = (lead?: string) =>
+      lead ? (users.some((u) => u.id === lead) ? lead : resolveUserId(users, lead)) : null;
+
+    /**
+     * Write one membership: department, team, manager, role label — and, when the
+     * role changed, the privilege too. Without the privilege write a role change
+     * on the Users page only relabelled the person (FD-067).
+     *
+     * is_primary and designation are passed explicitly: the upsert otherwise
+     * writes false / null, which cleared them on every assignment edit.
+     */
+    const persistMembership = async (
+      userId: string,
+      membership: Membership,
+      options: { isPrimary: boolean; designation?: string; roleChanged: boolean },
+    ): Promise<boolean> => {
+      const role = roleIn(membership.orgId, membership.role);
+      const saved = await upsertMembershipRow(userId, {
+        orgId: membership.orgId,
+        departmentId: membership.departmentId,
+        teamId: membership.teamId,
+        roleId: role?.id ?? null,
+        reportingManagerId: membership.reportingManagerId ?? null,
+        status: membership.status,
+        designation: options.designation,
+        isPrimary: options.isPrimary,
+      });
+      if (!saved) {
+        saveFailed("The organization assignment");
+        return false;
+      }
+      if (options.roleChanged && role) {
+        return reportIfFailed("The role change")(
+          await assignRoleRow(userId, membership.orgId, { id: role.id, baseRole: privilegeOf(role) }),
+        );
+      }
+      return true;
+    };
+
+    const sameMembership = (a: Membership, b: Membership) =>
+      a.departmentId === b.departmentId &&
+      a.teamId === b.teamId &&
+      normalize(a.role) === normalize(b.role) &&
+      a.reportingManagerId === b.reportingManagerId &&
+      a.status === b.status;
+
+    const replaceMembership = (userId: string, membership: Membership) =>
+      setUsers((current) =>
+        current.map((u) => {
+          if (u.id !== userId) return u;
+          const exists = u.memberships.some((m) => m.orgId === membership.orgId);
+          return {
+            ...u,
+            primaryOrgId: u.primaryOrgId || membership.orgId,
+            memberships: exists
+              ? u.memberships.map((m) => (m.orgId === membership.orgId ? { ...m, ...membership } : m))
+              : [...u.memberships, membership],
+          };
+        }),
+      );
+
+    const upsertMembership = (userId: string, membership: Membership) => {
+      const user = users.find((u) => u.id === userId);
+      const before = user?.memberships.find((m) => m.orgId === membership.orgId);
+      replaceMembership(userId, membership);
+      void persistMembership(userId, membership, {
+        isPrimary: user?.primaryOrgId ? user.primaryOrgId === membership.orgId : true,
+        designation: user?.designation,
+        roleChanged: !before || normalize(before.role) !== normalize(membership.role),
+      });
+    };
+
+    const adminCountIn = (orgId?: string) =>
+      users.filter(
+        (u) =>
+          u.status === "active" &&
+          u.memberships.some((m) => (!orgId || m.orgId === orgId) && isAdminRole(m.orgId, m.role)),
+      ).length;
+
     return {
+      status: adminStatus,
       organizations,
       departments,
       teams,
@@ -737,51 +626,40 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
       activeOrgId,
       setActiveOrgId,
       countsFor,
+      activeDepartmentsFor: (orgId) =>
+        departments
+          .filter((d) => d.status === "active" && (orgId === "all" || d.orgId === orgId))
+          .sort((a, b) => a.name.localeCompare(b.name)),
+      reloadProjects,
       isNameTaken: (name, exceptId) =>
         organizations.some((o) => o.id !== exceptId && normalize(o.name) === normalize(name)),
       isCodeTaken: (code, exceptId) =>
         organizations.some((o) => o.id !== exceptId && normalize(o.code) === normalize(code)),
-      addOrganization: (input) => {
-        const org: Organization = { ...input, id: `ORG-${organizations.length + 1}-${Date.now()}` };
-        setOrganizations((current) => [...current, org]);
-        return org;
-      },
       updateOrganization: (id, updates) => {
         setOrganizations((current) => current.map((o) => (o.id === id ? { ...o, ...updates } : o)));
-        void updateOrganizationRow(id, updates);
+        void updateOrganizationRow(id, updates).then(reportIfFailed("The organization"));
       },
       setOrganizationStatus: (id, status) => {
         setOrganizations((current) => current.map((o) => (o.id === id ? { ...o, status } : o)));
-        void updateOrganizationRow(id, { status });
+        void updateOrganizationRow(id, { status }).then(reportIfFailed("The organization status"));
       },
       addDepartment: (orgId, name, head) => {
         const tempId = `D-pending-${Date.now()}`;
         setDepartments((current) => [...current, { id: tempId, orgId, name, head, status: "active" }]);
         void createDepartmentRow({ orgId, name, headUserId: resolveUserId(users, head) }).then((realId) =>
-          reconcileId(setDepartments, tempId, realId),
+          reconcileId(setDepartments, tempId, realId, "The department"),
         );
       },
       addUserToOrganization: (userId, orgId, membership) =>
-        setUsers((current) =>
-          current.map((u) =>
-            u.id === userId && !u.memberships.some((m) => m.orgId === orgId)
-              ? { ...u, memberships: [...u.memberships, { ...membership, orgId, status: "active" }] }
-              : u,
-          ),
-        ),
+        upsertMembership(userId, { ...membership, orgId, status: "active" }),
       userActivity,
       currentUser: users.find((u) => u.id === authenticatedUserId) ?? null,
       canManageUsers: authenticatedRoles.includes("admin"),
       logUserActivity: pushActivity,
       isEmailTaken: (email, exceptId) =>
         users.some((u) => u.id !== exceptId && normalize(u.email) === normalize(email)),
-      addUser: (input) => {
-        const user: OrgUser = { ...input, id: `U-${users.length + 1}-${Date.now()}` };
-        setUsers((current) => [...current, user]);
-        pushActivity(user.id, "created", "User account created");
-        return user;
-      },
       updateUser: (id, updates) => {
+        const before = users.find((u) => u.id === id);
         setUsers((current) => current.map((u) => (u.id === id ? { ...u, ...updates } : u)));
         void updateProfileRow(id, {
           name: updates.name,
@@ -789,39 +667,44 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
           employeeId: updates.employeeId,
           joiningDate: updates.joiningDate,
           status: updates.status,
-        });
+        }).then(reportIfFailed("The user's details"));
+        if (!before) return;
+
+        // Department, team, manager, role and designation live on the membership
+        // rows. This used to update the screen only, so those edits vanished on
+        // reload and the Users and Roles pages disagreed (FD-067).
+        const primaryOrgId = before.primaryOrgId;
+        const designation = updates.designation ?? before.designation;
+        const designationChanged = designation !== before.designation;
+        for (const next of updates.memberships ?? []) {
+          const previous = before.memberships.find((m) => m.orgId === next.orgId);
+          const isPrimary = next.orgId === primaryOrgId;
+          if (previous && sameMembership(previous, next) && !(isPrimary && designationChanged)) continue;
+          void persistMembership(id, next, {
+            isPrimary,
+            designation,
+            roleChanged: !previous || normalize(previous.role) !== normalize(next.role),
+          });
+        }
+        if (updates.memberships) {
+          // Additional access removed in the drawer. The primary is never removed here.
+          for (const previous of before.memberships) {
+            if (previous.orgId === primaryOrgId) continue;
+            if (updates.memberships.some((m) => m.orgId === previous.orgId)) continue;
+            void removeMembershipRow(id, previous.orgId).then(reportIfFailed("Removing organization access"));
+          }
+        }
       },
       setUserStatus: (id, status) => {
         setUsers((current) => current.map((u) => (u.id === id ? { ...u, status } : u)));
-        void updateProfileRow(id, { status });
+        void updateProfileRow(id, { status }).then(reportIfFailed("The account status"));
         pushActivity(
           id,
           status === "active" ? "activated" : "deactivated",
           status === "active" ? "Account activated" : "Account deactivated",
         );
       },
-      upsertMembership: (userId, membership) => {
-        void upsertMembershipRow(userId, {
-          orgId: membership.orgId,
-          departmentId: membership.departmentId,
-          teamId: membership.teamId,
-          roleId: roles.find((r) => normalize(r.name) === normalize(membership.role))?.id ?? null,
-          reportingManagerId: membership.reportingManagerId ?? null,
-          status: membership.status,
-        });
-        setUsers((current) =>
-          current.map((u) => {
-            if (u.id !== userId) return u;
-            const exists = u.memberships.some((m) => m.orgId === membership.orgId);
-            return {
-              ...u,
-              memberships: exists
-                ? u.memberships.map((m) => (m.orgId === membership.orgId ? { ...m, ...membership } : m))
-                : [...u.memberships, membership],
-            };
-          }),
-        );
-      },
+      upsertMembership,
       removeMembership: (userId, orgId) => {
         // The primary organization is never removed; that would leave the account
         // with no route into any workspace.
@@ -834,7 +717,7 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
               : u,
           ),
         );
-        void removeMembershipRow(userId, orgId);
+        void removeMembershipRow(userId, orgId).then(reportIfFailed("Removing organization access"));
       },
       createDepartment: (input) => {
         const tempId = `D-pending-${Date.now()}`;
@@ -846,7 +729,7 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
           code: input.code,
           description: input.description,
           headUserId: resolveUserId(users, input.head),
-        }).then((realId) => reconcileId(setDepartments, tempId, realId));
+        }).then((realId) => reconcileId(setDepartments, tempId, realId, "The department"));
         return dept;
       },
       updateDepartment: (id, updates) => {
@@ -857,11 +740,11 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
           description: updates.description,
           status: updates.status,
           ...(updates.head !== undefined ? { headUserId: resolveUserId(users, updates.head) } : {}),
-        });
+        }).then(reportIfFailed("The department"));
       },
       setDepartmentStatus: (id, status) => {
         setDepartments((current) => current.map((d) => (d.id === id ? { ...d, status } : d)));
-        void updateDepartmentRow(id, { status });
+        void updateDepartmentRow(id, { status }).then(reportIfFailed("The department status"));
       },
       createTeam: (input) => {
         const tempId = `TM-pending-${Date.now()}`;
@@ -871,29 +754,47 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
           orgId: input.orgId,
           departmentId: input.departmentId,
           name: input.name,
-          leadUserId: resolveUserId(users, input.lead),
+          leadUserId: leadIdOf(input.lead),
         }).then((realId) => {
-          reconcileId(setTeams, tempId, realId);
+          reconcileId(setTeams, tempId, realId, "The team");
           // Members are a column on the membership row, so they can only be
           // written once the team has a real id.
           if (realId) {
-            for (const userId of input.memberIds ?? []) void setUserTeam(userId, input.orgId, realId);
+            for (const userId of input.memberIds ?? []) {
+              void setUserTeam(userId, input.orgId, realId).then(reportIfFailed("A team member"));
+            }
           }
         });
         return team;
       },
       updateTeam: (id, updates) => {
+        const before = teams.find((t) => t.id === id);
         setTeams((current) => current.map((t) => (t.id === id ? { ...t, ...updates } : t)));
         void updateTeamRow(id, {
           name: updates.name,
           departmentId: updates.departmentId,
           status: updates.status,
-          ...(updates.lead !== undefined ? { leadUserId: resolveUserId(users, updates.lead) } : {}),
-        });
+          // "lead" present but empty means "no lead"; it used to be skipped, so a
+          // lead could never be cleared.
+          ...("lead" in updates ? { leadUserId: leadIdOf(updates.lead) } : {}),
+        }).then(reportIfFailed("The team"));
+        // Members added or removed in the edit drawer were never written.
+        if (before && updates.memberIds) {
+          for (const userId of updates.memberIds) {
+            if (!before.memberIds.includes(userId)) {
+              void setUserTeam(userId, before.orgId, id).then(reportIfFailed("A team member"));
+            }
+          }
+          for (const userId of before.memberIds) {
+            if (!updates.memberIds.includes(userId)) {
+              void setUserTeam(userId, before.orgId, null).then(reportIfFailed("A team member"));
+            }
+          }
+        }
       },
       setTeamStatus: (id, status) => {
         setTeams((current) => current.map((t) => (t.id === id ? { ...t, status } : t)));
-        void updateTeamRow(id, { status });
+        void updateTeamRow(id, { status }).then(reportIfFailed("The team status"));
       },
       addTeamMember: (teamId, userId) => {
         setTeams((current) =>
@@ -904,7 +805,7 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
           ),
         );
         const orgId = teams.find((t) => t.id === teamId)?.orgId;
-        if (orgId) void setUserTeam(userId, orgId, teamId);
+        if (orgId) void setUserTeam(userId, orgId, teamId).then(reportIfFailed("The team member"));
       },
       removeTeamMember: (teamId, userId) => {
         setTeams((current) =>
@@ -919,7 +820,7 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
           ),
         );
         const orgId = teams.find((t) => t.id === teamId)?.orgId;
-        if (orgId) void setUserTeam(userId, orgId, null);
+        if (orgId) void setUserTeam(userId, orgId, null).then(reportIfFailed("The team member"));
       },
       moveTeamMember: (fromTeamId, toTeamId, userId) => {
         setTeams((current) =>
@@ -938,7 +839,7 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
           }),
         );
         const orgId = teams.find((t) => t.id === toTeamId)?.orgId ?? teams.find((t) => t.id === fromTeamId)?.orgId;
-        if (orgId) void setUserTeam(userId, orgId, toTeamId);
+        if (orgId) void setUserTeam(userId, orgId, toTeamId).then(reportIfFailed("The team move"));
       },
       isDepartmentNameTaken: (orgId, name, exceptId) =>
         departments.some(
@@ -949,20 +850,28 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
           (t) => t.departmentId === departmentId && t.id !== exceptId && normalize(t.name) === normalize(name),
         ),
       roles,
-      roleUserCount: (role) => {
-        const labels = new Set([role.name, ...role.aliases].map(normalize));
-        return users.filter((u) => u.memberships.some((m) => labels.has(normalize(m.role)))).length;
-      },
-      activeAdminCount: users.filter(
-        (u) => u.status === "active" && u.memberships.some((m) => normalize(m.role) === "admin"),
-      ).length,
-      isRoleNameTaken: (name, exceptId) =>
-        roles.some((r) => r.id !== exceptId && normalize(r.name) === normalize(name)),
+      rolesFor,
+      roleMembers,
+      // Was a match on the role's name OR its base privilege across every
+      // organization, so each "Admin" row counted both organizations' admins and a
+      // custom employee-level role counted every Employee too (FD-037, FD-067).
+      roleUserCount: (role) => roleMembers(role).length,
+      defaultRoleName,
+      activeAdminCount: adminCountIn(),
+      activeAdminCountIn: (orgId) => adminCountIn(orgId),
+      isAdminIn,
+      isRoleNameTaken: (name, exceptId, orgId) =>
+        roles.some(
+          (r) =>
+            r.id !== exceptId &&
+            (!orgId || inOrg(r, orgId)) &&
+            normalize(r.name) === normalize(name),
+        ),
       createRole: (input) => {
         const tempId = `R-pending-${Date.now()}`;
-        const role: Role = { ...input, id: tempId };
+        const orgId = input.orgId ?? fallbackOrgId();
+        const role: Role = { ...input, id: tempId, orgId, baseRole: baseRoleFor(input.scope), system: false };
         setRoles((current) => [...current, role]);
-        const orgId = activeOrgId !== "all" ? activeOrgId : (accessibleOrgIds[0] ?? organizations[0]?.id);
         if (orgId) {
           void createRoleRow({
             orgId,
@@ -972,75 +881,109 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
             scope: input.scope,
             permissions: input.permissions,
             settings: input.settings,
-          }).then((realId) => reconcileId(setRoles, tempId, realId));
+          }).then((realId) => reconcileId(setRoles, tempId, realId, "The role"));
         }
         return role;
       },
       updateRole: (id, updates) => {
-        setRoles((current) => current.map((r) => (r.id === id ? { ...r, ...updates } : r)));
+        const before = roles.find((r) => r.id === id);
+        if (!before) return;
+        // A built-in role stays active whatever the form says (FD-062).
+        const safe: Partial<Role> = before.system ? { ...updates, status: "active" } : updates;
+        const nextBase = !before.system && safe.scope !== undefined ? baseRoleFor(safe.scope) : undefined;
+        setRoles((current) =>
+          current.map((r) => (r.id === id ? { ...r, ...safe, ...(nextBase ? { baseRole: nextBase } : {}) } : r)),
+        );
         void updateRoleRow(id, {
-          name: updates.name,
-          description: updates.description,
-          scope: updates.scope,
-          permissions: updates.permissions,
-          settings: updates.settings,
-          status: updates.status,
+          name: safe.name,
+          description: safe.description,
+          scope: safe.scope,
+          permissions: safe.permissions,
+          settings: safe.settings,
+          status: safe.status,
           // A system role refuses this at the database; a custom role follows its scope.
-          ...(updates.scope !== undefined && !roles.find((r) => r.id === id)?.system
-            ? { baseRole: baseRoleFor(updates.scope) }
-            : {}),
+          ...(nextBase ? { baseRole: nextBase } : {}),
+        }).then((ok) => {
+          if (ok) return;
+          setRoles((current) => current.map((r) => (r.id === id ? before : r)));
+          saveFailed(`${before.name}`);
         });
       },
       setRoleStatus: (id, status) => {
+        const role = roles.find((r) => r.id === id);
+        if (!role) return false;
+        // The database trigger refuses this for the five built-in roles; refuse it
+        // here too rather than show "deactivated" and have it silently bounce (FD-062).
+        if (role.system && status !== "active") {
+          toast.error(`${role.name} is a built-in role and can't be deactivated.`);
+          return false;
+        }
         setRoles((current) => current.map((r) => (r.id === id ? { ...r, status } : r)));
-        void updateRoleRow(id, { status });
+        void updateRoleRow(id, { status }).then((ok) => {
+          if (ok) return;
+          setRoles((current) => current.map((r) => (r.id === id ? { ...r, status: role.status } : r)));
+          saveFailed(`${role.name}'s status`);
+        });
+        return true;
       },
-      duplicateRole: (id) =>
-        setRoles((current) => {
-          const source = current.find((r) => r.id === id);
-          if (!source) return current;
-          let name = `${source.name} (Copy)`;
-          let n = 2;
-          while (current.some((r) => normalize(r.name) === normalize(name))) {
-            name = `${source.name} (Copy ${n++})`;
-          }
-          const tempId = `R-pending-${Date.now()}`;
-          const orgId = activeOrgId !== "all" ? activeOrgId : (accessibleOrgIds[0] ?? organizations[0]?.id);
-          if (orgId) {
-            void createRoleRow({
-              orgId,
-              name,
-              description: source.description,
-              baseRole: baseRoleFor(source.scope),
-              scope: source.scope,
-              permissions: source.permissions,
-              settings: source.settings,
-            }).then((realId) => reconcileId(setRoles, tempId, realId));
-          }
-          return [...current, { ...source, id: tempId, name, aliases: [], system: false }];
-        }),
-      assignRole: (userId, roleName) => {
+      duplicateRole: (id) => {
+        const source = roles.find((r) => r.id === id);
+        if (!source) return;
+        const orgId = source.orgId ?? fallbackOrgId();
+        const taken = (candidate: string) =>
+          roles.some((r) => (!orgId || inOrg(r, orgId)) && normalize(r.name) === normalize(candidate));
+        let name = `${source.name} (Copy)`;
+        let n = 2;
+        while (taken(name)) name = `${source.name} (Copy ${n++})`;
+        const tempId = `R-pending-${Date.now()}`;
+        // The insert used to run inside the setRoles updater, which React may call
+        // twice; it now runs once, outside it.
+        setRoles((current) => [
+          ...current,
+          { ...source, id: tempId, name, aliases: [], system: false, orgId, baseRole: baseRoleFor(source.scope) },
+        ]);
+        if (orgId) {
+          void createRoleRow({
+            orgId,
+            name,
+            description: source.description,
+            baseRole: baseRoleFor(source.scope),
+            scope: source.scope,
+            permissions: source.permissions,
+            settings: source.settings,
+          }).then((realId) => reconcileId(setRoles, tempId, realId, "The copied role"));
+        }
+      },
+      assignRole: (userId, roleId) => {
+        const role = roles.find((r) => r.id === roleId);
+        const user = users.find((u) => u.id === userId);
+        if (!role || !user) return;
+        // Only the membership in the role's own organization: the other
+        // organization has its own role rows, and used to be handed this one's id.
+        const targets = user.memberships.filter((m) => inOrg(role, m.orgId));
         setUsers((current) =>
           current.map((u) =>
             u.id === userId
-              ? { ...u, memberships: u.memberships.map((m) => ({ ...m, role: roleName })) }
+              ? {
+                  ...u,
+                  memberships: u.memberships.map((m) =>
+                    targets.some((t) => t.orgId === m.orgId) ? { ...m, role: role.name } : m,
+                  ),
+                }
               : u,
           ),
         );
-        const role = roles.find((r) => normalize(r.name) === normalize(roleName));
-        const user = users.find((u) => u.id === userId);
-        if (role && user) {
-          // Writes the label AND the privilege. Without the second, the screen
-          // would report a permission change that granted nothing.
-          const base = baseRoleFor(role.scope);
-          for (const membership of user.memberships) {
-            void assignRoleRow(userId, membership.orgId, { id: role.id, baseRole: base });
-          }
+        // Writes the label AND the privilege. Without the second, the screen
+        // would report a permission change that granted nothing.
+        for (const membership of targets) {
+          void assignRoleRow(userId, membership.orgId, { id: role.id, baseRole: privilegeOf(role) }).then(
+            reportIfFailed("The role change"),
+          );
         }
-        pushActivity(userId, "role-changed", `Role changed to ${roleName}`);
+        pushActivity(userId, "role-changed", `Role changed to ${role.name}`);
       },
     };
-  }, [organizations, departments, teams, users, projects, activeOrgId, countsFor, userActivity, pushActivity, roles, accessibleOrgIds, authenticatedUserId, authenticatedRoles]);
+  }, [organizations, departments, teams, users, projects, activeOrgId, countsFor, userActivity, pushActivity, roles, accessibleOrgIds, authenticatedUserId, authenticatedRoles, adminStatus, reconcileId, reloadProjects]);
 
   return <OrganizationsContext.Provider value={value}>{children}</OrganizationsContext.Provider>;
 }

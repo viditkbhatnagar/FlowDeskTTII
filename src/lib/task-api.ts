@@ -131,15 +131,25 @@ const statusWords: Record<string, string> = {
   planning: "Planning", active: "Active", on_hold: "On Hold", completed: "Completed", archived: "Archived",
 };
 
-/** One human sentence per activity row, e.g. "moved this task to In Progress". */
-export function describeActivity(entry: ActivityEntry, subject: "task" | "project" = "task"): string {
+/**
+ * One human sentence per activity row, e.g. "moved this task to In Progress".
+ *
+ * Pass useTaskSettings().statusLabel as `label` so task statuses use the names
+ * configured in Settings; the built-in words are only a fallback (FD-018).
+ */
+export function describeActivity(
+  entry: ActivityEntry,
+  subject: "task" | "project" = "task",
+  label?: (value: string) => string,
+): string {
   const d = entry.details ?? {};
   const to = (d as { to?: string }).to;
+  const taskStatus = (value: string) => label?.(value) ?? statusWords[value] ?? value;
   switch (entry.type) {
     case "task_created": return `created this ${subject}`;
-    case "task_completed": return "marked this task Completed";
+    case "task_completed": return `marked this task ${taskStatus("done")}`;
     case "task_review_submitted": return "sent this task for review";
-    case "task_status_changed": return `moved this task to ${statusWords[to ?? ""] ?? to ?? "a new status"}`;
+    case "task_status_changed": return `moved this task to ${to ? taskStatus(to) : "a new status"}`;
     case "task_assignee_changed": return "changed the assignee";
     case "task_due_date_changed": return "changed the due date";
     case "task_updated": {

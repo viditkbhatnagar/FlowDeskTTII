@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import {
   Plus, MoreHorizontal, Eye, Pencil, Ban, CheckCircle2, ArrowLeft, Search, X,
   Users as UsersIcon, ArrowRightLeft, Crown,
@@ -14,7 +14,7 @@ import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
-  useOrganizations, type Department, type Team, type OrgStatus, type OrgUser,
+  useOrganizations, plural, type Department, type Team, type OrgStatus, type OrgUser,
 } from "@/lib/organizations-data";
 
 const inputClass =
@@ -54,13 +54,16 @@ function Avatar({ user }: { user: OrgUser }) {
 
 export function StructurePage() {
   const {
-    organizations, accessibleOrganizations, departments, teams, users,
-    activeOrgId, setDepartmentStatus, setTeamStatus,
+    status, organizations, accessibleOrganizations, departments, teams, users,
+    activeOrgId, setDepartmentStatus, setTeamStatus, canManageUsers,
   } = useOrganizations();
 
-  const [orgFilter, setOrgFilter] = useState<string>(
-    activeOrgId !== "all" ? activeOrgId : (accessibleOrganizations[0]?.id ?? "all"),
-  );
+  // Chosen explicitly, or else the active organization. Computed rather than
+  // captured once, because the organizations may still be loading on first render.
+  const [chosenOrg, setOrgFilter] = useState<string | null>(null);
+  const multiOrg = accessibleOrganizations.length > 1;
+  const orgFilter =
+    chosenOrg ?? (activeOrgId !== "all" ? activeOrgId : (accessibleOrganizations[0]?.id ?? "all"));
   const [tab, setTab] = useState<"departments" | "teams">("departments");
   const [deptDrawer, setDeptDrawer] = useState<Department | "new" | null>(null);
   const [teamDrawer, setTeamDrawer] = useState<Team | "new" | null>(null);
@@ -127,16 +130,19 @@ export function StructurePage() {
               <Plus className="h-4 w-4" /> Add Team
             </button>
           )}
-          <button onClick={() => setDeptDrawer("new")} className={primaryBtn}>
-            <Plus className="h-4 w-4" /> Add Department
-          </button>
+          {canManageUsers && (
+            <button onClick={() => setDeptDrawer("new")} className={primaryBtn}>
+              <Plus className="h-4 w-4" /> Add Department
+            </button>
+          )}
         </div>
       </div>
 
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div className="space-y-1">
-          <div className={labelClass}>Organization</div>
+          <label htmlFor="structure-org" className={labelClass}>Organization</label>
           <select
+            id="structure-org"
             value={orgFilter}
             onChange={(e) => setOrgFilter(e.target.value)}
             className={cn(inputClass, "min-w-[240px]")}
@@ -146,7 +152,8 @@ export function StructurePage() {
                 {o.name}
               </option>
             ))}
-            <option value="all">All Organizations</option>
+            {/* With one organization this was the same list twice (FD-051). */}
+            {multiOrg && <option value="all">All Organizations</option>}
           </select>
         </div>
 
@@ -155,6 +162,7 @@ export function StructurePage() {
             <button
               key={t}
               onClick={() => setTab(t)}
+              aria-pressed={tab === t}
               className={cn(
                 "rounded-md px-3 py-1.5 text-xs font-medium capitalize transition",
                 tab === t ? "bg-primary text-primary-foreground shadow-sm" : "text-muted-foreground hover:text-foreground",
@@ -192,11 +200,14 @@ export function StructurePage() {
                     </td>
                     <td className="px-4 py-3 text-muted-foreground">{orgName(d.orgId)}</td>
                     <td className="px-4 py-3">{d.head || "—"}</td>
-                    <td className="px-4 py-3">{deptTeams(d.id).length} Teams</td>
-                    <td className="px-4 py-3">{deptMemberCount(d.id)} Members</td>
+                    {/* Was "{n} Teams" / "{n} Members" whatever n was ("1 Teams", FD-051). */}
+                    <td className="px-4 py-3">{plural(deptTeams(d.id).length, "team")}</td>
+                    <td className="px-4 py-3">{plural(deptMemberCount(d.id), "member")}</td>
                     <td className="px-4 py-3"><StatusPill status={d.status} /></td>
                     <td className="px-4 py-3 text-right">
                       <RowMenu
+                        label={d.name}
+                        canEdit={canManageUsers}
                         onView={() => setOpenDeptId(d.id)}
                         onEdit={() => setDeptDrawer(d)}
                         status={d.status}
@@ -209,7 +220,7 @@ export function StructurePage() {
                 {visibleDepartments.length === 0 && (
                   <tr>
                     <td colSpan={7} className="px-4 py-10 text-center text-sm text-muted-foreground">
-                      No departments yet for this organization.
+                      {status === "loading" ? "Loading departments…" : "No departments yet for this organization."}
                     </td>
                   </tr>
                 )}
@@ -240,10 +251,12 @@ export function StructurePage() {
                       <td className="px-4 py-3 font-medium">{t.name}</td>
                       <td className="px-4 py-3 text-muted-foreground">{dept?.name ?? "—"}</td>
                       <td className="px-4 py-3">{lead?.name ?? "—"}</td>
-                      <td className="px-4 py-3">{t.memberIds.length}</td>
+                      <td className="px-4 py-3">{plural(t.memberIds.length, "member")}</td>
                       <td className="px-4 py-3"><StatusPill status={t.status} /></td>
                       <td className="px-4 py-3 text-right">
                         <RowMenu
+                          label={t.name}
+                          canEdit
                           onView={() => setTeamDrawer(t)}
                           onEdit={() => setTeamDrawer(t)}
                           status={t.status}
@@ -257,7 +270,7 @@ export function StructurePage() {
                 {visibleTeams.length === 0 && (
                   <tr>
                     <td colSpan={6} className="px-4 py-10 text-center text-sm text-muted-foreground">
-                      No teams yet for this organization.
+                      {status === "loading" ? "Loading teams…" : "No teams yet for this organization."}
                     </td>
                   </tr>
                 )}
@@ -308,8 +321,10 @@ export function StructurePage() {
 }
 
 function RowMenu({
-  onView, onEdit, onDeactivate, onActivate, status,
+  label, canEdit, onView, onEdit, onDeactivate, onActivate, status,
 }: {
+  label: string;
+  canEdit: boolean;
   onView: () => void;
   onEdit: () => void;
   onDeactivate: () => void;
@@ -318,17 +333,22 @@ function RowMenu({
 }) {
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger className="rounded-md p-1.5 text-muted-foreground transition hover:bg-accent hover:text-foreground">
+      <DropdownMenuTrigger
+        aria-label={`Actions for ${label}`}
+        className="rounded-md p-1.5 text-muted-foreground transition hover:bg-accent hover:text-foreground"
+      >
         <MoreHorizontal className="h-4 w-4" />
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end">
         <DropdownMenuItem onClick={onView}>
           <Eye className="mr-2 h-3.5 w-3.5" /> View
         </DropdownMenuItem>
-        <DropdownMenuItem onClick={onEdit}>
-          <Pencil className="mr-2 h-3.5 w-3.5" /> Edit
-        </DropdownMenuItem>
-        {status === "active" ? (
+        {canEdit && (
+          <DropdownMenuItem onClick={onEdit}>
+            <Pencil className="mr-2 h-3.5 w-3.5" /> Edit
+          </DropdownMenuItem>
+        )}
+        {!canEdit ? null : status === "active" ? (
           <DropdownMenuItem onClick={onDeactivate}>
             <Ban className="mr-2 h-3.5 w-3.5" /> Deactivate
           </DropdownMenuItem>
@@ -351,6 +371,7 @@ function DepartmentDrawer({
 }) {
   const { accessibleOrganizations, users, createDepartment, updateDepartment, isDepartmentNameTaken } =
     useOrganizations();
+  const fieldId = useId();
   const editing = target && target !== "new" ? target : null;
   const open = !!target;
 
@@ -403,24 +424,24 @@ function DepartmentDrawer({
 
         <div className="mt-6 space-y-4">
           <div className="space-y-1.5">
-            <label className={labelClass}>Organization *</label>
-            <select value={orgId} onChange={(e) => setOrgId(e.target.value)} className={inputClass}>
+            <label htmlFor={`${fieldId}-org`} className={labelClass}>Organization *</label>
+            <select id={`${fieldId}-org`} value={orgId} onChange={(e) => setOrgId(e.target.value)} className={inputClass}>
               {accessibleOrganizations.map((o) => (
                 <option key={o.id} value={o.id}>{o.name}</option>
               ))}
             </select>
           </div>
           <div className="space-y-1.5">
-            <label className={labelClass}>Department Name *</label>
-            <input value={name} onChange={(e) => setName(e.target.value)} className={inputClass} placeholder="Sales & Marketing" />
+            <label htmlFor={`${fieldId}-name`} className={labelClass}>Department Name *</label>
+            <input id={`${fieldId}-name`} value={name} onChange={(e) => setName(e.target.value)} className={inputClass} placeholder="Sales & Marketing" />
           </div>
           <div className="space-y-1.5">
-            <label className={labelClass}>Department Code</label>
-            <input value={code} onChange={(e) => setCode(e.target.value.toUpperCase())} className={inputClass} placeholder="SLS" maxLength={8} />
+            <label htmlFor={`${fieldId}-code`} className={labelClass}>Department Code</label>
+            <input id={`${fieldId}-code`} value={code} onChange={(e) => setCode(e.target.value.toUpperCase())} className={inputClass} placeholder="SLS" maxLength={8} />
           </div>
           <div className="space-y-1.5">
-            <label className={labelClass}>Department Head</label>
-            <select value={head} onChange={(e) => setHead(e.target.value)} className={inputClass}>
+            <label htmlFor={`${fieldId}-head`} className={labelClass}>Department Head</label>
+            <select id={`${fieldId}-head`} value={head} onChange={(e) => setHead(e.target.value)} className={inputClass}>
               <option value="">Not assigned</option>
               {orgUsers.map((u) => (
                 <option key={u.id} value={u.name}>{u.name}</option>
@@ -428,8 +449,9 @@ function DepartmentDrawer({
             </select>
           </div>
           <div className="space-y-1.5">
-            <label className={labelClass}>Description</label>
+            <label htmlFor={`${fieldId}-description`} className={labelClass}>Description</label>
             <textarea
+              id={`${fieldId}-description`}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               rows={3}
@@ -437,8 +459,8 @@ function DepartmentDrawer({
             />
           </div>
           <div className="space-y-1.5">
-            <label className={labelClass}>Status</label>
-            <select value={status} onChange={(e) => setStatus(e.target.value as OrgStatus)} className={inputClass}>
+            <label htmlFor={`${fieldId}-status`} className={labelClass}>Status</label>
+            <select id={`${fieldId}-status`} value={status} onChange={(e) => setStatus(e.target.value as OrgStatus)} className={inputClass}>
               <option value="active">Active</option>
               <option value="inactive">Inactive</option>
             </select>
@@ -469,6 +491,7 @@ function TeamDrawer({
   const {
     accessibleOrganizations, departments, users, createTeam, updateTeam, isTeamNameTaken,
   } = useOrganizations();
+  const fieldId = useId();
   const editing = target && target !== "new" ? target : null;
   const open = !!target;
 
@@ -541,8 +564,9 @@ function TeamDrawer({
 
         <div className="mt-6 space-y-4">
           <div className="space-y-1.5">
-            <label className={labelClass}>Organization *</label>
+            <label htmlFor={`${fieldId}-org`} className={labelClass}>Organization *</label>
             <select
+              id={`${fieldId}-org`}
               value={orgId}
               onChange={(e) => {
                 setOrgId(e.target.value);
@@ -559,8 +583,8 @@ function TeamDrawer({
           </div>
 
           <div className="space-y-1.5">
-            <label className={labelClass}>Department *</label>
-            <select value={departmentId} onChange={(e) => setDepartmentId(e.target.value)} className={inputClass}>
+            <label htmlFor={`${fieldId}-dept`} className={labelClass}>Department *</label>
+            <select id={`${fieldId}-dept`} value={departmentId} onChange={(e) => setDepartmentId(e.target.value)} className={inputClass}>
               <option value="">Select department</option>
               {orgDepartments.map((d) => (
                 <option key={d.id} value={d.id}>{d.name}</option>
@@ -569,13 +593,13 @@ function TeamDrawer({
           </div>
 
           <div className="space-y-1.5">
-            <label className={labelClass}>Team Name *</label>
-            <input value={name} onChange={(e) => setName(e.target.value)} className={inputClass} placeholder="Curriculum" />
+            <label htmlFor={`${fieldId}-name`} className={labelClass}>Team Name *</label>
+            <input id={`${fieldId}-name`} value={name} onChange={(e) => setName(e.target.value)} className={inputClass} placeholder="Curriculum" />
           </div>
 
           <div className="space-y-1.5">
-            <label className={labelClass}>Team Lead</label>
-            <select value={lead} onChange={(e) => setLead(e.target.value)} className={inputClass}>
+            <label htmlFor={`${fieldId}-lead`} className={labelClass}>Team Lead</label>
+            <select id={`${fieldId}-lead`} value={lead} onChange={(e) => setLead(e.target.value)} className={inputClass}>
               <option value="">Not assigned</option>
               {candidates.map((u) => (
                 <option key={u.id} value={u.id}>{u.name}</option>
@@ -584,10 +608,11 @@ function TeamDrawer({
           </div>
 
           <div className="space-y-1.5">
-            <label className={labelClass}>Members</label>
+            <label htmlFor={`${fieldId}-members`} className={labelClass}>Members</label>
             <div className="relative">
               <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
               <input
+                id={`${fieldId}-members`}
                 value={memberSearch}
                 onChange={(e) => setMemberSearch(e.target.value)}
                 placeholder="Search employees"
@@ -600,6 +625,7 @@ function TeamDrawer({
                 return (
                   <button
                     key={u.id}
+                    aria-pressed={checked}
                     onClick={() =>
                       setMemberIds((c) => (checked ? c.filter((id) => id !== u.id) : [...c, u.id]))
                     }
@@ -626,8 +652,8 @@ function TeamDrawer({
           </div>
 
           <div className="space-y-1.5">
-            <label className={labelClass}>Status</label>
-            <select value={status} onChange={(e) => setStatus(e.target.value as OrgStatus)} className={inputClass}>
+            <label htmlFor={`${fieldId}-status`} className={labelClass}>Status</label>
+            <select id={`${fieldId}-status`} value={status} onChange={(e) => setStatus(e.target.value as OrgStatus)} className={inputClass}>
               <option value="active">Active</option>
               <option value="inactive">Inactive</option>
             </select>
@@ -657,7 +683,7 @@ function DepartmentDetail({
 }) {
   const {
     organizations, teams, users, updateTeam, addTeamMember, removeTeamMember, moveTeamMember,
-    setTeamStatus,
+    setTeamStatus, canManageUsers,
   } = useOrganizations();
   const [tab, setTab] = useState<"teams" | "members">("teams");
   const [addMemberTeam, setAddMemberTeam] = useState<Team | null>(null);
@@ -674,6 +700,9 @@ function DepartmentDetail({
   const members = users.filter((u) => memberIds.has(u.id));
 
   const userById = (id: string) => users.find((u) => u.id === id);
+  const moveTargets = teams.filter(
+    (t) => t.orgId === department.orgId && t.id !== moveMember?.team.id && t.status === "active",
+  );
   const orgCandidates = users
     .filter((u) => u.memberships.some((m) => m.orgId === department.orgId))
     .filter((u) => u.name.toLowerCase().includes(search.trim().toLowerCase()));
@@ -706,9 +735,11 @@ function DepartmentDetail({
             </div>
           </div>
         </div>
-        <button onClick={onEdit} className={ghostBtn}>
-          <Pencil className="h-3.5 w-3.5" /> Edit Department
-        </button>
+        {canManageUsers && (
+          <button onClick={onEdit} className={ghostBtn}>
+            <Pencil className="h-3.5 w-3.5" /> Edit Department
+          </button>
+        )}
       </div>
 
       <div className="flex items-center justify-between gap-3">
@@ -717,6 +748,7 @@ function DepartmentDetail({
             <button
               key={t}
               onClick={() => setTab(t)}
+              aria-pressed={tab === t}
               className={cn(
                 "rounded-md px-3 py-1.5 text-xs font-medium capitalize transition",
                 tab === t ? "bg-primary text-primary-foreground shadow-sm" : "text-muted-foreground hover:text-foreground",
@@ -775,7 +807,10 @@ function DepartmentDetail({
                         </span>
                       )}
                       <DropdownMenu>
-                        <DropdownMenuTrigger className="rounded-md p-1.5 text-muted-foreground transition hover:bg-accent hover:text-foreground">
+                        <DropdownMenuTrigger
+                          aria-label={`Actions for ${u.name} in ${team.name}`}
+                          className="rounded-md p-1.5 text-muted-foreground transition hover:bg-accent hover:text-foreground"
+                        >
                           <MoreHorizontal className="h-4 w-4" />
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="end">
@@ -833,7 +868,7 @@ function DepartmentDetail({
                       </div>
                     </div>
                   </td>
-                  <td className="px-4 py-3 text-muted-foreground">{u.designation}</td>
+                  <td className="px-4 py-3 text-muted-foreground">{u.designation || "—"}</td>
                   <td className="px-4 py-3 text-muted-foreground">
                     {deptTeams.filter((t) => t.memberIds.includes(u.id)).map((t) => t.name).join(", ") || "—"}
                   </td>
@@ -865,6 +900,7 @@ function DepartmentDetail({
             <div className="relative">
               <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
               <input
+                aria-label="Search employees"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
                 placeholder="Search employees"
@@ -913,23 +949,26 @@ function DepartmentDetail({
             </SheetDescription>
           </SheetHeader>
           <div className="mt-6 space-y-1">
-            {teams
-              .filter((t) => t.orgId === department.orgId && t.id !== moveMember?.team.id && t.status === "active")
-              .map((t) => (
-                <button
-                  key={t.id}
-                  onClick={() => {
-                    if (!moveMember) return;
-                    moveTeamMember(moveMember.team.id, t.id, moveMember.userId);
-                    toast.success(`Moved to ${t.name}`);
-                    setMoveMember(null);
-                  }}
-                  className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm transition hover:bg-accent"
-                >
-                  <UsersIcon className="h-3.5 w-3.5 text-muted-foreground" />
-                  <span className="flex-1">{t.name}</span>
-                </button>
-              ))}
+            {moveTargets.length === 0 && (
+              <p className="py-6 text-center text-xs text-muted-foreground">
+                No other active teams in this organization.
+              </p>
+            )}
+            {moveTargets.map((t) => (
+              <button
+                key={t.id}
+                onClick={() => {
+                  if (!moveMember) return;
+                  moveTeamMember(moveMember.team.id, t.id, moveMember.userId);
+                  toast.success(`Moved to ${t.name}`);
+                  setMoveMember(null);
+                }}
+                className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm transition hover:bg-accent"
+              >
+                <UsersIcon className="h-3.5 w-3.5 text-muted-foreground" />
+                <span className="flex-1">{t.name}</span>
+              </button>
+            ))}
           </div>
         </SheetContent>
       </Sheet>

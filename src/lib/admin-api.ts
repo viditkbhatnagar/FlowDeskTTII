@@ -28,6 +28,9 @@ import type {
   Role,
   Team,
 } from "@/lib/organizations-data";
+import { projectHealth, projectProgress, type ProjectHealth } from "@/lib/project-metrics";
+import { personRef, type PersonRef } from "@/lib/task-api";
+import { todayIn } from "@/lib/today";
 
 /** app_role — the enum row-level security reads. Order matters: most to least privileged. */
 export type BaseRole = "admin" | "manager" | "team_lead" | "employee" | "viewer";
@@ -411,105 +414,182 @@ export async function updateOrganizationRow(
 /* ------------------------------------------------------------------ */
 
 /** Stable colour per project, so a project keeps its colour between loads. */
-function projectColor(seed: string): string {
+export function projectColor(seed: string): string {
   let hash = 0;
   for (let i = 0; i < seed.length; i++) hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
   const hues = [265, 30, 155, 300, 80, 200, 340, 120];
   return `oklch(0.7 0.15 ${hues[hash % hues.length]})`;
 }
 
-const initialsOf = (name: string) =>
-  name.split(/\s+/).filter(Boolean).map((part) => part[0]).join("").slice(0, 2).toUpperCase() || "?";
+/** The project lifecycle as the Projects screen spells it. */
+export type ProjectLifecycle = "planning" | "active" | "on-hold" | "completed" | "cancelled" | "archived";
+
+const lifecycleFromRow = (status: string): ProjectLifecycle =>
+  status === "on_hold" ? "on-hold"
+  : status === "active" || status === "completed" || status === "cancelled" || status === "archived" ? status
+  : "planning";
+
+const lifecycleToRow = (status: string): Upd<"work_projects">["status"] =>
+  status === "on-hold" ? "on_hold"
+  : status === "active" || status === "completed" || status === "cancelled" || status === "archived" ? status
+  : "planning";
 
 export interface LoadedProject {
   id: string;
   name: string;
   description?: string;
   color: string;
+  /** projectProgress(...).percent — the one progress figure (FD-014). */
   progress: number;
+  /** Counted tasks (everything but cancelled) and how many are done. */
+  taskCount: number;
+  doneCount: number;
   members: number;
   deadline: string;
   startDate: string;
-  status: "on-track" | "at-risk" | "delayed";
+  /** projectHealth(...) — the one health figure (FD-014, FD-056). */
+  health: ProjectHealth;
   organizationId: string;
-  manager: { name: string; initials: string; color: string };
-  team: { name: string; initials: string; color: string }[];
+  manager: PersonRef;
+  managerId: string | null;
+  team: PersonRef[];
+  teamIds: string[];
   pendingTasks: number;
+  overdueTasks: number;
   risk: "low" | "medium" | "high";
+  /** Empty when the project has no category — never an invented one. */
   category: string;
+  /** Department or team name, when the project has one. */
+  department?: string;
+  departmentId: string | null;
+  teamId: string | null;
   priority: "low" | "medium" | "high" | "critical";
   projectType: "internal" | "client";
   client: string;
-  creationStatus: "planning" | "active" | "on-hold";
+  creationStatus: ProjectLifecycle;
+  createdAt: string;
+  updatedAt: string;
 }
+
+/**
+ * Risk follows health. It used to be read off the project's priority, so a
+ * card could say "On track" and "high" side by side — a second, contradictory
+ * health signal (FD-014).
+ */
+export const riskFor = (health: ProjectHealth): LoadedProject["risk"] =>
+  health === "delayed" ? "high" : health === "at-risk" ? "medium" : "low";
 
 /**
  * Load projects with their real progress.
  *
- * Progress and pendingTasks are derived from work_tasks rather than stored, so
- * they cannot drift from the board the way a cached column would.
+ * Progress, health and pendingTasks are derived from work_tasks rather than
+ * stored, so they cannot drift from the board the way a cached column would.
+ * Both go through project-metrics.ts, the same functions every other screen
+ * uses, with "today" in the project's organization timezone (FD-014, FD-056).
  */
 export async function loadProjects(): Promise<LoadedProject[] | null> {
-  const [projectRows, taskRows, profileRows, categoryRows, memberRows] = await Promise.all([
-    supabase.from("work_projects").select("*").is("archived_at", null).order("created_at"),
-    supabase.from("work_tasks").select("id, project_id, status").is("archived_at", null),
-    supabase.from("profiles").select("user_id, full_name, username"),
-    supabase.from("project_categories").select("id, name"),
-    supabase.from("project_members").select("project_id, user_id"),
-  ]);
+  const [projectRows, taskRows, profileRows, categoryRows, memberRows, orgRows, departmentRows, teamRows] =
+    await Promise.all([
+      supabase.from("work_projects").select("*").is("archived_at", null).order("created_at"),
+      supabase.from("work_tasks").select("id, project_id, status, due_date, due_at").is("archived_at", null),
+      supabase.from("profiles").select("user_id, full_name, username"),
+      supabase.from("project_categories").select("id, name"),
+      supabase.from("project_members").select("project_id, user_id"),
+      supabase.from("organizations").select("id, timezone"),
+      supabase.from("departments").select("id, name"),
+      supabase.from("teams").select("id, name"),
+    ]);
 
-  const firstError = [projectRows, taskRows, profileRows, categoryRows, memberRows].find((r) => r.error);
+  const firstError = [projectRows, taskRows, profileRows, categoryRows, memberRows, orgRows, departmentRows, teamRows]
+    .find((r) => r.error);
   if (firstError?.error) return fail("loadProjects", firstError.error);
 
-  const personFor = (userId: string | null) => {
-    const row = (profileRows.data ?? []).find((p) => p.user_id === userId);
-    const name = row?.full_name || row?.username || "Unassigned";
-    return { name, initials: initialsOf(name), color: projectColor(name) };
-  };
+  const nameByUser = new Map(
+    (profileRows.data ?? []).map((p) => [p.user_id, p.full_name || p.username || null]),
+  );
+  // personRef is what useWorkspace().people is built from, so a manager here
+  // has the same id, initials and colour as in every picker.
+  const personFor = (userId: string | null) => personRef(userId, userId ? nameByUser.get(userId) : null);
   const categoryName = new Map((categoryRows.data ?? []).map((c) => [c.id, c.name]));
-  const today = new Date().toISOString().slice(0, 10);
+  const departmentName = new Map((departmentRows.data ?? []).map((d) => [d.id, d.name]));
+  const teamName = new Map((teamRows.data ?? []).map((t) => [t.id, t.name]));
+  const timezoneByOrg = new Map((orgRows.data ?? []).map((o) => [o.id, o.timezone]));
+  const todayByOrg = new Map<string, string>();
+  const todayFor = (orgId: string) => {
+    if (!todayByOrg.has(orgId)) todayByOrg.set(orgId, todayIn(timezoneByOrg.get(orgId) ?? undefined));
+    return todayByOrg.get(orgId) as string;
+  };
 
   return (projectRows.data ?? []).map((row) => {
+    const today = todayFor(row.organization_id);
     const mine = (taskRows.data ?? []).filter((t) => t.project_id === row.id);
-    const done = mine.filter((t) => t.status === "done").length;
-    const pending = mine.filter((t) => t.status !== "done" && t.status !== "cancelled").length;
-    const progress = mine.length ? Math.round((done / mine.length) * 100) : 0;
+    const progress = projectProgress(mine);
+    const overdueTasks = mine.filter((t) => {
+      if (t.status === "done" || t.status === "cancelled") return false;
+      const due = t.due_date ?? t.due_at?.slice(0, 10);
+      return Boolean(due && due < today);
+    }).length;
     const due = row.due_date ?? "";
+    const health = projectHealth({
+      progress,
+      dueDate: due,
+      today,
+      lifecycle: row.status,
+      overdueTasks,
+    });
 
-    // Overdue and unfinished is delayed; due within a fortnight and under
-    // halfway is at risk. Everything else is on track.
-    const daysLeft = due ? Math.round((Date.parse(due) - Date.parse(today)) / 86400000) : Infinity;
-    const status: LoadedProject["status"] =
-      progress < 100 && daysLeft < 0 ? "delayed"
-      : progress < 50 && daysLeft <= 14 ? "at-risk"
-      : "on-track";
-
-    const team = (memberRows.data ?? [])
+    const teamIds = (memberRows.data ?? [])
       .filter((m) => m.project_id === row.id)
-      .map((m) => personFor(m.user_id));
+      .map((m) => m.user_id);
+    const managerId = row.manager_id ?? row.owner_id;
 
     return {
       id: row.id,
       name: row.name,
       description: row.description ?? undefined,
       color: projectColor(row.name),
-      progress,
-      members: team.length,
+      progress: progress.percent,
+      taskCount: progress.total,
+      doneCount: progress.done,
+      members: teamIds.length,
       deadline: due ? `${due}T23:59:59` : "",
       startDate: row.start_date ? `${row.start_date}T00:00:00` : "",
-      status,
+      health,
       organizationId: row.organization_id,
-      manager: personFor(row.manager_id ?? row.owner_id),
-      team,
-      pendingTasks: pending,
-      risk: row.priority === "critical" || row.priority === "high" ? "high" : row.priority === "medium" ? "medium" : "low",
-      category: (row.category_id ? categoryName.get(row.category_id) : undefined) ?? "Internal",
+      manager: personFor(managerId),
+      managerId,
+      team: teamIds.map(personFor),
+      teamIds,
+      pendingTasks: progress.open,
+      overdueTasks,
+      risk: riskFor(health),
+      // Was `?? "Internal"`: a project with no category was shown as having
+      // one it never had (FD-014).
+      category: (row.category_id ? categoryName.get(row.category_id) : undefined) ?? "",
+      department:
+        (row.team_id ? teamName.get(row.team_id) : undefined) ??
+        (row.department_id ? departmentName.get(row.department_id) : undefined),
+      departmentId: row.department_id,
+      teamId: row.team_id,
       priority: row.priority,
-      projectType: (row.project_type === "client" ? "client" : "internal"),
+      projectType: row.project_type === "client" ? "client" : "internal",
       client: row.client_name ?? "",
-      creationStatus: row.status === "on_hold" ? "on-hold" : row.status === "active" ? "active" : "planning",
+      creationStatus: lifecycleFromRow(row.status),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
     };
   });
+}
+
+/** Resolve a category name to its row in the project's organization. */
+async function categoryIdFor(orgId: string, name: string): Promise<string | null> {
+  const { data } = await supabase
+    .from("project_categories")
+    .select("id")
+    .eq("organization_id", orgId)
+    .eq("name", name)
+    .maybeSingle();
+  return data?.id ?? null;
 }
 
 export async function createProjectRow(input: {
@@ -522,39 +602,34 @@ export async function createProjectRow(input: {
   priority?: "low" | "medium" | "high" | "critical";
   projectType?: "internal" | "client";
   clientName?: string;
-  status?: "planning" | "active" | "on-hold";
+  status?: ProjectLifecycle;
   managerId?: string | null;
+  departmentId?: string | null;
+  teamId?: string | null;
 }): Promise<string | null> {
   const { data: auth } = await supabase.auth.getUser();
   if (!auth.user) return fail("createProject", new Error("not signed in"));
 
-  let categoryId: string | null = null;
-  if (input.categoryName) {
-    const { data } = await supabase
-      .from("project_categories")
-      .select("id")
-      .eq("organization_id", input.orgId)
-      .eq("name", input.categoryName)
-      .maybeSingle();
-    categoryId = data?.id ?? null;
-  }
+  const categoryId = input.categoryName ? await categoryIdFor(input.orgId, input.categoryName) : null;
 
   const { data, error } = await supabase
     .from("work_projects")
     .insert({
       organization_id: input.orgId,
       name: input.name,
-      description: input.description ?? null,
+      description: input.description || null,
       // RLS requires owner_id = auth.uid() on insert, so this is not optional.
       owner_id: auth.user.id,
       manager_id: input.managerId ?? auth.user.id,
       start_date: input.startDate ? input.startDate.slice(0, 10) : null,
       due_date: input.dueDate ? input.dueDate.slice(0, 10) : null,
       category_id: categoryId,
+      department_id: input.departmentId ?? null,
+      team_id: input.teamId ?? null,
       priority: input.priority ?? "medium",
       project_type: input.projectType ?? "internal",
-      client_name: input.clientName ?? null,
-      status: input.status === "on-hold" ? "on_hold" : (input.status ?? "planning"),
+      client_name: input.clientName || null,
+      status: lifecycleToRow(input.status ?? "planning"),
     })
     .select("id")
     .single();
@@ -564,25 +639,88 @@ export async function createProjectRow(input: {
 
 export async function updateProjectRow(
   id: string,
-  updates: { name?: string; description?: string; startDate?: string; dueDate?: string; priority?: "low" | "medium" | "high" | "critical"; status?: string; clientName?: string },
+  updates: {
+    name?: string;
+    description?: string;
+    startDate?: string;
+    dueDate?: string;
+    priority?: "low" | "medium" | "high" | "critical";
+    status?: string;
+    clientName?: string;
+    projectType?: "internal" | "client";
+    /** Resolved within the project's own organization; an unknown name clears it. */
+    categoryName?: string;
+    managerId?: string | null;
+    departmentId?: string | null;
+    teamId?: string | null;
+  },
 ): Promise<boolean> {
   const payload: Upd<"work_projects"> = {};
   if (updates.name !== undefined) payload.name = updates.name;
-  if (updates.description !== undefined) payload.description = updates.description;
+  if (updates.description !== undefined) payload.description = updates.description || null;
   if (updates.startDate !== undefined) payload.start_date = updates.startDate ? updates.startDate.slice(0, 10) : null;
   if (updates.dueDate !== undefined) payload.due_date = updates.dueDate ? updates.dueDate.slice(0, 10) : null;
   if (updates.priority !== undefined) payload.priority = updates.priority;
-  if (updates.clientName !== undefined) payload.client_name = updates.clientName;
-  if (updates.status !== undefined) {
-    const map: Record<string, Upd<"work_projects">["status"]> = {
-      "on-hold": "on_hold", planning: "planning", active: "active",
-      completed: "completed", cancelled: "cancelled", archived: "archived",
-    };
-    payload.status = map[updates.status] ?? "planning";
+  if (updates.clientName !== undefined) payload.client_name = updates.clientName || null;
+  if (updates.projectType !== undefined) payload.project_type = updates.projectType;
+  if (updates.managerId !== undefined) payload.manager_id = updates.managerId;
+  if (updates.departmentId !== undefined) payload.department_id = updates.departmentId;
+  if (updates.teamId !== undefined) payload.team_id = updates.teamId;
+  if (updates.status !== undefined) payload.status = lifecycleToRow(updates.status);
+  if (updates.categoryName !== undefined) {
+    if (!updates.categoryName) {
+      payload.category_id = null;
+    } else {
+      const { data: project, error } = await supabase
+        .from("work_projects")
+        .select("organization_id")
+        .eq("id", id)
+        .maybeSingle();
+      if (error || !project) return Boolean(fail("updateProject (category)", error ?? new Error("project not found")));
+      payload.category_id = await categoryIdFor(project.organization_id, updates.categoryName);
+    }
   }
   if (!Object.keys(payload).length) return true;
   const { error } = await supabase.from("work_projects").update(payload).eq("id", id);
   return error ? Boolean(fail("updateProject", error)) : true;
+}
+
+/**
+ * Make project_members exactly `userIds`: add the new ones, remove the rest.
+ *
+ * The Team Members picker used to collect names that were never written
+ * anywhere, so a project's team vanished on refresh (FD-034).
+ */
+export async function setProjectMembers(projectId: string, userIds: string[]): Promise<boolean> {
+  const wanted = [...new Set(userIds.filter(Boolean))];
+  const { data: current, error: readError } = await supabase
+    .from("project_members")
+    .select("user_id")
+    .eq("project_id", projectId);
+  if (readError) return Boolean(fail("setProjectMembers (read)", readError));
+
+  const existing = new Set((current ?? []).map((m) => m.user_id));
+  const toAdd = wanted.filter((userId) => !existing.has(userId));
+  const toRemove = [...existing].filter((userId) => !wanted.includes(userId));
+
+  if (toAdd.length) {
+    const { error } = await supabase
+      .from("project_members")
+      .upsert(toAdd.map((userId) => ({ project_id: projectId, user_id: userId })), {
+        onConflict: "project_id,user_id",
+        ignoreDuplicates: true,
+      });
+    if (error) return Boolean(fail("setProjectMembers (add)", error));
+  }
+  if (toRemove.length) {
+    const { error } = await supabase
+      .from("project_members")
+      .delete()
+      .eq("project_id", projectId)
+      .in("user_id", toRemove);
+    if (error) return Boolean(fail("setProjectMembers (remove)", error));
+  }
+  return true;
 }
 
 /** Archive rather than delete, so the tasks that reference it keep their history. */
