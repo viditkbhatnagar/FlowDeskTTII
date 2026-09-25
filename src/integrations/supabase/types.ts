@@ -78,6 +78,170 @@ export type Database = {
           },
         ]
       }
+      email_outbox: {
+        Row: {
+          actor_id: string | null
+          attempts: number
+          created_at: string
+          dedupe_key: string
+          expires_at: string
+          id: string
+          kind: string
+          last_error: string | null
+          locked_at: string | null
+          not_before: string
+          organization_id: string | null
+          payload: Json
+          project_id: string | null
+          recipient_email: string | null
+          recipient_user_id: string | null
+          sent_at: string | null
+          status: string
+          task_id: string | null
+        }
+        Insert: {
+          actor_id?: string | null
+          attempts?: number
+          created_at?: string
+          dedupe_key: string
+          expires_at: string
+          id?: string
+          kind: string
+          last_error?: string | null
+          locked_at?: string | null
+          not_before?: string
+          organization_id?: string | null
+          payload?: Json
+          project_id?: string | null
+          recipient_email?: string | null
+          recipient_user_id?: string | null
+          sent_at?: string | null
+          status?: string
+          task_id?: string | null
+        }
+        Update: {
+          actor_id?: string | null
+          attempts?: number
+          created_at?: string
+          dedupe_key?: string
+          expires_at?: string
+          id?: string
+          kind?: string
+          last_error?: string | null
+          locked_at?: string | null
+          not_before?: string
+          organization_id?: string | null
+          payload?: Json
+          project_id?: string | null
+          recipient_email?: string | null
+          recipient_user_id?: string | null
+          sent_at?: string | null
+          status?: string
+          task_id?: string | null
+        }
+        Relationships: []
+      }
+      email_settings: {
+        Row: {
+          daily_digest: boolean
+          daily_management: boolean
+          due_reminder: boolean
+          enabled: boolean
+          organization_id: string
+          overdue_alert: boolean
+          project_invitation: boolean
+          send_hour: number
+          task_assigned: boolean
+          updated_at: string
+          updated_by: string | null
+          weekly_day: number
+          weekly_digest: boolean
+          weekly_management: boolean
+          working_days: number[]
+        }
+        Insert: {
+          daily_digest?: boolean
+          daily_management?: boolean
+          due_reminder?: boolean
+          enabled?: boolean
+          organization_id: string
+          overdue_alert?: boolean
+          project_invitation?: boolean
+          send_hour?: number
+          task_assigned?: boolean
+          updated_at?: string
+          updated_by?: string | null
+          weekly_day?: number
+          weekly_digest?: boolean
+          weekly_management?: boolean
+          working_days?: number[]
+        }
+        Update: {
+          daily_digest?: boolean
+          daily_management?: boolean
+          due_reminder?: boolean
+          enabled?: boolean
+          organization_id?: string
+          overdue_alert?: boolean
+          project_invitation?: boolean
+          send_hour?: number
+          task_assigned?: boolean
+          updated_at?: string
+          updated_by?: string | null
+          weekly_day?: number
+          weekly_digest?: boolean
+          weekly_management?: boolean
+          working_days?: number[]
+        }
+        Relationships: [
+          {
+            foreignKeyName: "email_settings_organization_id_fkey"
+            columns: ["organization_id"]
+            isOneToOne: true
+            referencedRelation: "organizations"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      notification_preferences: {
+        Row: {
+          daily_digest: boolean
+          daily_management: boolean
+          due_reminder: boolean
+          overdue_alert: boolean
+          project_invitation: boolean
+          task_assigned: boolean
+          updated_at: string
+          user_id: string
+          weekly_digest: boolean
+          weekly_management: boolean
+        }
+        Insert: {
+          daily_digest?: boolean
+          daily_management?: boolean
+          due_reminder?: boolean
+          overdue_alert?: boolean
+          project_invitation?: boolean
+          task_assigned?: boolean
+          updated_at?: string
+          user_id?: string
+          weekly_digest?: boolean
+          weekly_management?: boolean
+        }
+        Update: {
+          daily_digest?: boolean
+          daily_management?: boolean
+          due_reminder?: boolean
+          overdue_alert?: boolean
+          project_invitation?: boolean
+          task_assigned?: boolean
+          updated_at?: string
+          user_id?: string
+          weekly_digest?: boolean
+          weekly_management?: boolean
+        }
+        Relationships: []
+      }
       organization_memberships: {
         Row: {
           created_at: string
@@ -1232,6 +1396,19 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
+      email_worker_claim: {
+        Args: { p_limit?: number; p_secret: string }
+        Returns: Json
+      }
+      email_worker_complete: {
+        Args: { p_results: Json; p_secret: string }
+        Returns: number
+      }
+      email_worker_enqueue: {
+        Args: { p_rows: Json; p_secret: string }
+        Returns: number
+      }
+      email_worker_snapshot: { Args: { p_secret: string }; Returns: Json }
       process_scheduled_task_recurrences: { Args: never; Returns: number }
     }
     Enums: {

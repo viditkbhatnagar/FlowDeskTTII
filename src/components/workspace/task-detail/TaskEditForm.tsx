@@ -218,7 +218,7 @@ export function TaskEditForm({ task, onDone }: { task: WorkspaceTask; onDone: ()
             id={ids.startDate}
             type="date"
             value={draft.startDate}
-            max={draft.dueDate || undefined}
+            max={draft.dueDate || TASK_LIMITS.dateMax}
             onChange={(event) => set("startDate", event.target.value)}
             aria-invalid={Boolean(errors.startDate) || undefined}
             aria-describedby={errors.startDate ? `${ids.startDate}-error` : undefined}
@@ -230,6 +230,7 @@ export function TaskEditForm({ task, onDone }: { task: WorkspaceTask; onDone: ()
             type="date"
             value={draft.dueDate}
             min={draft.startDate || undefined}
+            max={TASK_LIMITS.dateMax}
             onChange={(event) => set("dueDate", event.target.value)}
             aria-invalid={Boolean(errors.dueDate) || undefined}
             aria-describedby={errors.dueDate ? `${ids.dueDate}-error` : undefined}

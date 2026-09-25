@@ -2,6 +2,7 @@
 // each page's tab title. The leading "-" keeps the router generator from treating
 // this file as a route.
 import {
+  Bell,
   Building2,
   CheckSquare,
   FolderKanban,
@@ -45,6 +46,12 @@ export const settingsItems = [
     label: "Task & Project Settings",
     icon: SlidersHorizontal,
     to: "/settings/tasks",
+  },
+  {
+    id: "settings-notifications",
+    label: "Notifications",
+    icon: Bell,
+    to: "/settings/notifications",
   },
 ] as const;
 

@@ -5,6 +5,7 @@ build/
 .env.local
 .env.*.local
 *.zip
+*.rar
 lovable-export/
 .DS_Store
 *.log

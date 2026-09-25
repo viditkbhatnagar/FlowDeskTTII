@@ -37,13 +37,33 @@ export type FilterSearch = { filter?: string };
 
 export function validateFilterSearch(search: Record<string, unknown>): FilterSearch {
   const filter = typeof search.filter === "string" ? search.filter.trim() : "";
-  return filter ? { filter } : {};
+  // Always return the key: the router lays this over the raw query string, so a key left
+  // out would keep its unvalidated value (?filter=1 arrives as the number 1).
+  return { filter: filter || undefined };
 }
 
 /** Each page names the browser tab; it used to say "Flowdesk" everywhere (FD-038). */
 export function pageHead(id: WorkspaceNavId) {
   const label = workspaceNavItems.find((item) => item.id === id)?.label ?? "Workspace";
   return { meta: [{ title: `${label} — Flowdesk` }] };
+}
+
+const passedGuards = new Set<string>();
+
+/**
+ * Runs a layout's access check on the way in, and skips it while moving between pages under
+ * that layout (cause "stay"). router-core also reports "stay" on the first load after SSR
+ * hydration, because the dehydrated match counts as the previous one, so a check is skipped
+ * only once it has passed in this browser for this key.
+ */
+export async function checkOnEntry(
+  key: string,
+  cause: string,
+  check: () => Promise<void>,
+): Promise<void> {
+  if (cause === "stay" && passedGuards.has(key)) return;
+  await check();
+  passedGuards.add(key);
 }
 
 /**

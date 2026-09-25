@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { Link } from "@tanstack/react-router";
-import { Settings, Sparkles, ChevronLeft, ChevronRight, ChevronDown } from "lucide-react";
+import { Settings, ChevronLeft, ChevronRight, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   mainItems,
@@ -44,9 +44,15 @@ export function Sidebar({
         collapsed ? "justify-center px-2" : "justify-between px-5 gap-2"
       )}>
         <div className={cn("flex items-center", collapsed ? "justify-center" : "gap-2")}>
-          <div className="brand-mark flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-primary-foreground">
-            <Sparkles className="h-4 w-4" aria-hidden="true" />
-          </div>
+          {/* The symbol alone: the navy wordmark would vanish on the dark sidebar, so
+              the name stays theme-aware text beside it. */}
+          <img
+            src="/brand/flowdesk-symbol.png"
+            alt={collapsed ? "Flowdesk" : ""}
+            width={32}
+            height={32}
+            className="h-8 w-8 shrink-0"
+          />
           {!collapsed && (
             <div>
               <div className="text-sm font-semibold text-sidebar-foreground">Flowdesk</div>

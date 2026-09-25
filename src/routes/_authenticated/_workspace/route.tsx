@@ -14,6 +14,7 @@ import { OrganizationsProvider, useOrganizations } from "@/lib/organizations-dat
 import { TaskSettingsProvider } from "@/lib/task-settings-data";
 import { supabase } from "@/integrations/supabase/client";
 import {
+  checkOnEntry,
   DESTINATION_PATHS,
   WorkspaceShellContext,
   type WorkspaceShell,
@@ -34,18 +35,18 @@ const ORG_SWITCHER_PAGES = new Set(["my-tasks", "team", "projects"]);
  * (FD-038). As a layout it stays mounted between pages, so data is not reloaded.
  */
 export const Route = createFileRoute("/_authenticated/_workspace")({
-  beforeLoad: async ({ context, cause }) => {
-    // Checked on the way in, not on every move between workspace pages.
-    if (cause === "stay") return;
-    const { count, error } = await supabase
-      .from("organization_memberships")
-      .select("id", { count: "exact", head: true })
-      .eq("user_id", context.user.id)
-      .eq("status", "active");
-    // A failed lookup is not "no organization"; show the error page with Try again.
-    if (error) throw new Error(`Could not load your organizations: ${error.message}`);
-    if (!count) throw redirect({ to: "/no-organization" });
-  },
+  // Checked on the way in, not on every move between workspace pages.
+  beforeLoad: ({ context, cause }) =>
+    checkOnEntry(`membership:${context.user.id}`, cause, async () => {
+      const { count, error } = await supabase
+        .from("organization_memberships")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", context.user.id)
+        .eq("status", "active");
+      // A failed lookup is not "no organization"; show the error page with Try again.
+      if (error) throw new Error(`Could not load your organizations: ${error.message}`);
+      if (!count) throw redirect({ to: "/no-organization" });
+    }),
   head: () => ({
     meta: [
       { name: "description", content: DESCRIPTION },

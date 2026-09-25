@@ -254,10 +254,16 @@ export function ProjectsPage({
   onNewTask: _onNewTask,
   dashboardFilter,
   onClearFilter,
+  linkedProjectId,
+  onLinkedProjectClosed,
 }: {
   onNewTask?: () => void;
   dashboardFilter?: string;
   onClearFilter?: () => void;
+  /** ?project=<id> from an email: the project to open once the list has loaded. */
+  linkedProjectId?: string;
+  /** Called when the person leaves that project, to drop the id from the URL. */
+  onLinkedProjectClosed?: () => void;
 }) {
   // Loaded from work_projects. This screen used to render five hardcoded
   // projects from mock-data.ts while the five real rows sat unread.
@@ -316,6 +322,27 @@ export function ProjectsPage({
     const match = projectItems.find((project) => matchesTarget(project, dashboardScope.target));
     if (match) setSelected(match);
   }, [dashboardScope, activeFilterKey, projectsStatus, projectItems]);
+
+  // ?project=<id> (email links), likewise once. An archived project, or one this
+  // person cannot see (RLS), is not in the list.
+  const openedEmailProject = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!linkedProjectId) {
+      openedEmailProject.current = undefined;
+      return;
+    }
+    if (projectsStatus !== "ready" || openedEmailProject.current === linkedProjectId) return;
+    openedEmailProject.current = linkedProjectId;
+    const match = projectItems.find((project) => project.id === linkedProjectId);
+    if (match) {
+      setSelected(match);
+      return;
+    }
+    toast.error("That project isn't available to you.", {
+      description: "It may have been archived, or you may no longer be on its team.",
+    });
+    onLinkedProjectClosed?.();
+  }, [linkedProjectId, projectsStatus, projectItems, onLinkedProjectClosed]);
 
   // Scoped by each project's own organization. This used to look projects up in
   // a hardcoded list of five sample projects ("P-1".."P-5", Operations in a
@@ -524,7 +551,9 @@ export function ProjectsPage({
 
   const backToList = () => {
     setSelected(null);
+    // Clearing the filter clears the whole query string, ?project included.
     if (dashboardScope?.kind === "project") clearDashboardFilter();
+    else if (linkedProjectId) onLinkedProjectClosed?.();
     // Pick up edits, task changes and archives made inside the project.
     void pendingArchive.current.then(() =>
       refreshProjects().then((ok) => {

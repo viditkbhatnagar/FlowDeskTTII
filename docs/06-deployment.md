@@ -300,8 +300,21 @@ Nothing was written outside those paths.
 
 ## Redeploying
 
+**Build against the hosted project, not local Supabase.** Vite bakes `VITE_SUPABASE_*` into
+the browser bundle at build time, and `.env.local` (used for local development) overrides
+`.env`. A plain `bun run build` on a machine with `.env.local` pointing at `127.0.0.1` ships
+a site whose browser code calls your laptop. Values already in the shell environment win
+over both files, so build with the hosted ones set explicitly (they are the public URL and
+publishable key from `.env`), then check the bundle:
+
 ```bash
-bun run build                                     # locally
+set -a; . ./.env; set +a                          # hosted SUPABASE/VITE_SUPABASE values
+bun run build
+grep -rl 'azrpqltfpvbfnjawqxbp' .output/public >/dev/null && echo "hosted: ok"
+grep -rl '127.0.0.1:544' .output >/dev/null && echo "LOCAL URL IN BUILD — do not deploy"
+```
+
+```bash
 rsync -az --delete -e "ssh -i ~/.ssh/upcarrera_deploy" \
   .output/ root@168.144.188.190:/opt/flowdesk/.output/
 ssh -i ~/.ssh/upcarrera_deploy root@168.144.188.190 \
@@ -309,6 +322,10 @@ ssh -i ~/.ssh/upcarrera_deploy root@168.144.188.190 \
 ```
 
 **`pm2 restart flowdesk` — never `pm2 restart all`.** That would bounce the live CRM.
+
+That restart reuses the environment PM2 captured at the last start. It does **not** re-read
+`/opt/flowdesk/.env`. After any change to `.env`, restart through the ecosystem file
+instead: `pm2 restart /opt/flowdesk/ecosystem.config.cjs --only flowdesk && pm2 save`.
 
 ---
 
@@ -398,4 +415,310 @@ build from the previous one.
 - **Adding a sixth task status or a new priority.** Those are Postgres enums on
   columns the board and dashboard key off; their presentation is editable, the
   set is not.
-- **Email**, including password recovery. Not built. See `docs/03`.
+- **Email.** Built since; it needs its own migration and settings — see "Email
+  notifications" below.
+
+---
+
+# Email notifications
+
+FlowDesk sends nine kinds of email: account access, added to a project, task assigned,
+due-date reminder, overdue alert, and the daily/weekly task digests and management
+summaries. The database queues them in `email_outbox`, and a worker inside the SSR process
+sends them through Microsoft Graph. Supabase Auth sends the password-reset code itself,
+using the template in `deploy/email/`. Rehearsed end to end against local Supabase,
+including the built server (`node .output/server/index.mjs`) with the log transport.
+
+**Nothing is sent until `EMAIL_WORKER_ENABLED=true` and every Microsoft Graph credential
+below is set.** Until then the worker logs `[email] worker not started: <reason>` once at
+boot, and the site carries on. That line goes to `out.log` when the worker is simply off,
+and to `error.log` when it is switched on but a setting is missing or wrong. The database
+triggers still queue events in the meantime. When the worker first starts, it sends
+queued rows that have not yet expired: task/project emails from the last 48 hours and
+account-access emails from the last 7 days. To start clean, first run
+`delete from public.email_outbox where status = 'pending';` in the SQL editor.
+
+Rules the system enforces, so nobody is surprised by them:
+
+- **The welcome (account access) email goes out when a person is first given an
+  organization, and only if they have never signed in.** Creating the login alone sends
+  nothing. It is sent once per person, ever: adding a second organization, or removing and
+  re-adding one, sends nothing more. It is withdrawn if every membership is removed again
+  before it goes out. Because only an admin can add a membership, nobody can make FlowDesk
+  send a welcome email to an address of their choosing, even if sign-ups were ever switched
+  on.
+
+  **Onboarding a new colleague** (a brand-new login has no organization yet, so it does not
+  appear in FlowDesk → Settings → Users, which only lists people in your organizations):
+  1. Lovable Cloud → Users → add the user with their email (and a temporary password if
+     asked; they will set their own through the welcome email).
+  2. Lovable Cloud → SQL editor, with their email and the organization code (`UPC` for
+     upCarrera, `TTII` for Teachers' Training Institute of India):
+
+     ```sql
+     insert into public.organization_memberships (user_id, organization_id, is_primary, status)
+     select u.id, o.id, true, 'active' from auth.users u, public.organizations o
+     where u.email = 'new.person@upcarrera.com' and o.code = 'UPC';
+     insert into public.user_roles (user_id, organization_id, role)
+     select u.id, o.id, 'employee' from auth.users u, public.organizations o
+     where u.email = 'new.person@upcarrera.com' and o.code = 'UPC';
+     ```
+
+  3. The welcome email goes out within about five minutes. The person now appears in
+     FlowDesk → Settings → Users, where you set their department, team and role.
+- **Email always goes to the sign-in address** (`auth.users.email`). `profiles.email` is a
+  display copy, and users cannot change it. To change where someone's email goes, change
+  their sign-in email. People also cannot change their own active/inactive status; only an
+  admin can.
+- **One account can queue at most 50 event emails an hour** (task assigned and added to a
+  project, counted together, including requests made in parallel; welcome emails are
+  neither capped nor counted). Past that, the write still succeeds but no email is queued.
+  The work still appears in the digests, and Postgres logs a `WARNING … reached the hourly
+  email cap; not queued`. An admin assigning more than 50 tasks in one sitting will hit
+  this. The limit is the literal `50` in `private.email_actor_over_cap`. Email never costs
+  anyone a save: if the cap check has to wait more than a second, that one email is skipped
+  (`WARNING … lock timeout`) and the write goes through.
+- **At most 10 due-date reminders and 10 overdue alerts per person per day**, the most
+  urgent first (priority, then due date), counted across the whole day's ticks. The daily
+  digest still lists every task. The limit is `TASK_EMAILS_PER_DAY` in
+  `src/lib/email/schedule.ts` and the literal `10` in `public.email_worker_enqueue`; change
+  both together.
+- **A Microsoft outage never uses up an email's last attempt.** Such an email waits and
+  retries; one Microsoft keeps refusing ends as `expired` (with its error) rather than
+  `failed` when its time runs out.
+- **Notification settings take effect within an hour.** Between send windows the worker
+  decides whether to plan from organization settings it refreshes at least hourly, so a
+  change to an organization's send hour or working days can take up to 60 minutes to apply.
+  Per-person email preferences apply to the next email.
+
+## Where the worker logs
+
+PM2 writes FlowDesk's stdout and stderr to two different files, with a timestamp on every
+line. Always check both.
+
+| File | `[email]` lines |
+|---|---|
+| `/var/log/flowdesk/out.log` | `worker started (…)`, `worker not started: EMAIL_WORKER_ENABLED is not "true"`, `tick N: <counts>` (the first tick, then only ticks that planned, claimed or sent something), and on a restart mid-batch `stopping: N email(s) put back for the next start` (they go out about 30 s after the new process starts) |
+| `/var/log/flowdesk/error.log` | `worker not started: <missing or wrong setting>`, `tick N failed: …` (for example `unauthorized`), `planning failed` / `enqueue failed`, `planning skipped <scope> <id>: …` (one person, task or organization whose data could not be planned; everyone else is still planned), `compose failed for …`, and one `<n> x <outcome>: <reason>` line per distinct send failure in a tick |
+
+```bash
+grep '\[email\]' /var/log/flowdesk/out.log   | tail -n 5
+grep '\[email\]' /var/log/flowdesk/error.log | tail -n 5
+```
+
+## How the sender is set up (Microsoft 365)
+
+These are facts about the Microsoft 365 tenant, kept here for whoever maintains this
+next. No secret appears here, and nothing here needs changing for a normal deploy.
+
+- **From:** `flowdesk@upcarrera.com`, a shared mailbox named **Flowdesk**. Microsoft
+  ignores the display name that FlowDesk sends and uses the mailbox's own display name. So
+  `MAIL_FROM_NAME` has no visible effect. To change the name people see, rename the
+  mailbox in the Exchange admin center.
+- **Reply-To:** `hello@upcarrera.com` (`MAIL_REPLY_TO`), so replies reach a monitored
+  inbox.
+- **App registration:** the Entra app **upCarrera Mailer**, application (client) ID
+  `af15433e-11ae-4754-9907-45712db2be94` (this is `MS_CLIENT_ID`). It holds the Microsoft
+  Graph `Mail.Send` *application* permission. `MS_TENANT_ID` is the Directory (tenant) ID
+  on the app's Overview page.
+- **Its own client secret:** FlowDesk uses the client secret named **`flowdesk`**
+  (`MS_CLIENT_SECRET` is that secret's *Value*, not its ID). The CRM uses a separate secret
+  on the same app, **`crm-mailer`**. Rotating or deleting one never breaks the other, so
+  never copy the CRM's secret into FlowDesk. Client secrets expire, so note the expiry of
+  `flowdesk`. To rotate it:
+  1. Add a new secret under the app's Certificates & secrets.
+  2. Put its Value in `MS_CLIENT_SECRET`.
+  3. Restart through the ecosystem file, with no rebuild:
+     `pm2 restart /opt/flowdesk/ecosystem.config.cjs --only flowdesk && pm2 save`.
+     Then check the logs as in Step 4.
+  4. Then delete the old secret.
+- **Who it may send as:** an Exchange Application Access Policy lets the app send only
+  as members of the mail-enabled group **upCarrera Mailer Scope**. Today those are
+  `hello@upcarrera.com` and `flowdesk@upcarrera.com`. Sending as any other address fails
+  with `403 ErrorAccessDenied` in `error.log`. To use a new sender mailbox:
+  1. Add it to that group first.
+  2. Allow up to about an hour for Microsoft to honour the change.
+  3. Confirm with `Test-ApplicationAccessPolicy -Identity <mailbox> -AppId af15433e-11ae-4754-9907-45712db2be94`
+     in Exchange Online PowerShell. It should report `Granted`.
+  4. Only then change `MAIL_FROM_ADDRESS`.
+
+## Step 1 — apply the migration (SQL editor)
+
+This needs `20260922000000_admin_persistence.sql` and `20260925000000_task_collaboration.sql`
+applied first (`deploy/supabase/build-hosted-upgrade.sh`). The bundle stops with a clear
+error if they are missing.
+
+```bash
+bash deploy/supabase/build-email-upgrade.sh > email-upgrade.sql   # locally
+```
+
+Paste `email-upgrade.sql` into the SQL editor and run it. It is idempotent and runs as a
+single transaction.
+
+## Step 2 — the worker secret
+
+The server keeps the secret, and the database keeps only its SHA-256. Generate the secret
+**on the droplet, as root** (`ssh -i ~/.ssh/upcarrera_deploy root@168.144.188.190`). The
+block below writes it straight into FlowDesk's own `.env` and prints only the hash. It
+touches nothing else on the box.
+
+```bash
+F=/opt/flowdesk/.env
+cp -p "$F" "$F.bak.$(date +%Y%m%d%H%M%S)"          # chmod 600 copy; removed after Step 4
+sed -i '/^EMAIL_WORKER_SECRET=/d' "$F"             # drop any old or empty line
+[ -z "$(tail -c1 "$F")" ] || echo >> "$F"          # make sure the file ends in a newline
+echo "EMAIL_WORKER_SECRET=$(openssl rand -hex 32)" >> "$F"
+grep -c '^EMAIL_WORKER_SECRET=' "$F"               # expect 1
+sed -n 's/^EMAIL_WORKER_SECRET=//p' "$F" | tr -d '\n' | sha256sum
+```
+
+The last line prints a 64-character hash followed by `  -`. Copy only the hash.
+
+> **If the hash starts with `e3b0c442`, stop.** That is the SHA-256 of an *empty* string
+> (`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`). It means the
+> secret line is missing or blank. Storing that hash makes every tick fail with
+> `unauthorized`. Run the block again.
+
+Then run this in the SQL editor with that hash:
+
+```sql
+INSERT INTO private.email_worker_config (id, secret_sha256)
+VALUES (1, decode('<64 hex chars>', 'hex'))
+ON CONFLICT (id) DO UPDATE SET secret_sha256 = EXCLUDED.secret_sha256, updated_at = now();
+
+select encode(secret_sha256, 'hex') from private.email_worker_config;
+-- must equal the hash above, and must not start with e3b0c442
+```
+
+Until this row exists, or while it does not match, every tick fails and `error.log` shows
+`[email] tick N failed: … unauthorized`. To rotate the secret later, repeat this step, then
+restart with no rebuild:
+`pm2 restart /opt/flowdesk/ecosystem.config.cjs --only flowdesk && pm2 save`. In between,
+ticks fail with `unauthorized` and emails simply wait in the queue.
+
+## Step 3 — the rest of `/opt/flowdesk/.env`
+
+Add these with an editor (`nano /opt/flowdesk/.env`). Secret values live only on the
+server. `EMAIL_WORKER_SECRET` is already there from Step 2. Do not add a second, empty
+copy, because the last line for a key wins.
+
+```
+EMAIL_WORKER_ENABLED=true
+EMAIL_TRANSPORT=graph
+MS_TENANT_ID=
+MS_CLIENT_ID=
+MS_CLIENT_SECRET=
+MAIL_FROM_ADDRESS=flowdesk@upcarrera.com
+MAIL_FROM_NAME=Flowdesk
+MAIL_REPLY_TO=hello@upcarrera.com
+APP_URL=https://flowdesk.upcarrera.com
+```
+
+"How the sender is set up" above says where each `MS_*` value comes from.
+`SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` are already in the file, and the worker uses
+them. `EMAIL_WORKER_INTERVAL_MS` is optional (default 300000).
+
+**Set `EMAIL_WORKER_ENABLED=true` only once every `MS_*` value is in.** Until then, leave
+it out or set it to `false`. The worker stays off and the triggers keep queuing.
+
+**Never use `EMAIL_TRANSPORT=log` on the server.** The log transport writes each email to
+an `.html` file and then marks it *sent* in whatever database `SUPABASE_URL` points at.
+On the droplet, that is production. That day's digests, and every queued account-access,
+invitation and assignment email, would be marked sent and never delivered. Names,
+addresses and task titles would also be left on disk. Use it only against local Supabase
+(`supabase start`). The worker refuses it under `NODE_ENV=production`, which
+`ecosystem.config.cjs` always sets. It logs `worker not started` to `error.log` instead.
+The override for that, `EMAIL_LOG_ALLOW_PRODUCTION`, must never be set on the droplet.
+
+`ecosystem.config.cjs` reads this file only when PM2 evaluates the ecosystem file. That
+happens at `pm2 start` and at `pm2 restart /opt/flowdesk/ecosystem.config.cjs`. **It does
+not happen at `pm2 restart flowdesk`**, with or without `--update-env`. That command reuses
+the environment captured at the last start.
+
+## Step 4 — rebuild, redeploy, restart, verify
+
+The build must include `public/brand/`, because every email loads its logo from
+`$APP_URL/brand/`. Because `.env` changed, restart **through the ecosystem file**. Never
+use `pm2 restart all`, and never touch `upcarrera-api`. Build against the hosted project
+exactly as in [Redeploying](#redeploying), never with a plain `bun run build` while
+`.env.local` points at local Supabase. Then:
+
+```bash
+rsync -az --delete -e "ssh -i ~/.ssh/upcarrera_deploy" \
+  .output/ root@168.144.188.190:/opt/flowdesk/.output/
+ssh -i ~/.ssh/upcarrera_deploy root@168.144.188.190 \
+  'chown -R root:root /opt/flowdesk/.output && pm2 restart /opt/flowdesk/ecosystem.config.cjs --only flowdesk && pm2 save && pm2 list'
+```
+
+`pm2 list` must still show `upcarrera-api` online with its previous uptime. Then:
+
+```bash
+curl -fsS -o /dev/null -w '%{http_code} %{content_type}\n' \
+  https://flowdesk.upcarrera.com/brand/flowdesk-email-header.png   # 200 image/png
+curl -fsS -o /dev/null -w '%{http_code}\n' https://admin.upcarrera.com/        # CRM: 200
+curl -fsS -o /dev/null -w '%{http_code}\n' https://admissions.upcarrera.com/   # CRM: 200
+```
+
+About a minute after the restart, on the droplet:
+
+```bash
+grep '\[email\]' /var/log/flowdesk/out.log   | tail -n 5
+# expect exactly one "[email] worker started (transport=graph as flowdesk@upcarrera.com
+# (reply-to hello@upcarrera.com), app=https://flowdesk.upcarrera.com, …)" for this
+# restart, then "[email] tick 1: …" about 30 s later
+grep '\[email\]' /var/log/flowdesk/error.log | tail -n 5
+# expect nothing new since the restart (check the timestamps)
+```
+
+What the lines mean:
+
+- **`worker not started: EMAIL_WORKER_ENABLED is not "true"`** in `out.log` right after
+  this restart means `.env` was not re-read. Restart through the ecosystem file, as above.
+- **`worker not started: <setting> …`** in `error.log` names the missing or wrong
+  setting. Fix it in `.env`, then restart through the ecosystem file.
+- **`tick N failed: … unauthorized`** means the Step 2 hash does not match the secret in
+  `.env`.
+- **`403` / `ErrorAccessDenied`** means `MAIL_FROM_ADDRESS` is not in upCarrera Mailer
+  Scope yet, or Microsoft has not yet picked up the change.
+- **An `AADSTS7000215` / `AADSTS7000222` token error** means the client secret is wrong
+  (often the secret's ID instead of its Value) or has expired.
+- **`<n> x defer: paused 900s, check the Graph credentials and sender: …`** is how the two
+  problems above show up in a tick: sending stops and the queue waits 15 minutes. No
+  retries are used up. Rows still expire as usual (48 hours for task and project emails,
+  the end of the send window for digests), so fix it the same day.
+- **`<n> x defer: paused <s>s, Graph is throttling or unavailable: …`** means Microsoft
+  answered 429 or 5xx. The worker waits as long as Graph asks (at most an hour), then
+  carries on. No retries are used up.
+- **`<n> x failed: Graph sendMail 400 …`** means Graph refused that one message, usually its
+  recipient address. It is not retried.
+
+The worker sends at most 20 emails per tick, 2.5 s apart, so a busy morning drains over
+several ticks. That keeps it well under Exchange Online's 30 messages a minute for the
+mailbox. Any other failed send is retried with backoff, up to 5 attempts. To see what is
+queued, in the SQL editor:
+
+```sql
+select status, count(*) from public.email_outbox group by status;
+select kind, attempts, last_error from public.email_outbox
+ where last_error is not null order by created_at desc limit 10;
+```
+
+Once everything checks out, remove the Step 2 backup: `rm /opt/flowdesk/.env.bak.*`.
+
+Scheduled email goes out from each organization's send hour (default 08:00 local) for three
+hours, on its working days. Admins change this under Settings → Notifications.
+
+## Turning email off
+
+Set `EMAIL_WORKER_ENABLED=false` in `/opt/flowdesk/.env`, then run
+`pm2 restart /opt/flowdesk/ecosystem.config.cjs --only flowdesk && pm2 save`. **Change the
+value. Do not just delete the line.** PM2 merges the new environment into the old one on
+restart, so a deleted key keeps its previous value. The triggers keep queuing. Unsent
+event rows expire on their own after 48 hours (7 days for account access), and scheduled
+ones at the end of their send window.
+
+## Step 5 — the password-reset template (Lovable Cloud)
+
+Paste `deploy/email/supabase-reset-password.html` into **Lovable Cloud → Emails → Reset
+password**, with the subject `Your Flowdesk password reset code`. `deploy/email/README.md`
+has the details. Do this after Step 4, so the logo URL already resolves.

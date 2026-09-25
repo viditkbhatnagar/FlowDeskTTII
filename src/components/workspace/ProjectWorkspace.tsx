@@ -3381,6 +3381,7 @@ function MilestoneDialog({
                 id={`${fieldId}-date`}
                 type="date"
                 value={date}
+                max="9999-12-31"
                 onChange={(event) => setDate(event.target.value)}
               />
             </div>

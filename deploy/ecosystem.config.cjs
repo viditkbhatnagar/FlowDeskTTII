@@ -92,6 +92,11 @@ module.exports = {
       // Restart if the process leaks past 500 MB, so FlowDesk can never starve the CRM.
       max_memory_restart: '500M',
 
+      // On a restart the email worker finishes the send in flight, puts the rest of its
+      // batch back and exits on its own (about a second when idle). PM2's default 1.6 s
+      // could cut that send off half-recorded, and it would go out again 15 min later.
+      kill_timeout: 15000,
+
       // Runtime secrets come from /opt/flowdesk/.env (chmod 600), never from this
       // git-tracked file. The SSR server reads SUPABASE_URL and
       // SUPABASE_PUBLISHABLE_KEY from process.env at request time

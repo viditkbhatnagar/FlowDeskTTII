@@ -38,6 +38,12 @@ enable_signup = true
 enable_signup = true
 enable_confirmations = false
 
+# The same password-reset template that is pasted into Lovable Cloud
+# (deploy/email/README.md), so the recovery email can be checked in Mailpit.
+[auth.email.template.recovery]
+subject = "Your Flowdesk password reset code"
+content_path = "./deploy/email/supabase-reset-password.html"
+
 [storage]
 enabled = true
 

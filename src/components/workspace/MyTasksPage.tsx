@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Search,
   Filter,
@@ -16,6 +16,7 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
+import { toast } from "sonner";
 import {
   useWorkspace,
   type Priority,
@@ -60,6 +61,10 @@ interface MyTasksPageProps {
   dashboardFilter?: string;
   /** Clears the filter the dashboard applied (FD-030). */
   onClearFilter?: () => void;
+  /** ?task=<id> from an email: the task to open once the list has loaded. */
+  linkedTaskId?: string;
+  /** Called when that task's drawer closes, to drop the id from the URL. */
+  onLinkedTaskClosed?: () => void;
 }
 
 /**
@@ -197,7 +202,13 @@ function weekProductivity(items: WorkspaceTask[], today: string, timezone?: stri
   };
 }
 
-export function MyTasksPage({ onNewTask, dashboardFilter, onClearFilter }: MyTasksPageProps) {
+export function MyTasksPage({
+  onNewTask,
+  dashboardFilter,
+  onClearFilter,
+  linkedTaskId: emailTaskId,
+  onLinkedTaskClosed,
+}: MyTasksPageProps) {
   const { tasks: allTasks, updateTask, status: loadStatus } = useWorkspace();
   const { statusLabel } = useTaskSettings();
   // Due-date comparisons must use the organization's calendar date, not UTC's.
@@ -322,6 +333,33 @@ export function MyTasksPage({ onNewTask, dashboardFilter, onClearFilter }: MyTas
     setDetailOpen(true);
     setScrollToId(linkedTaskId);
   }, [linkedTaskId]);
+
+  // ?task=<id> (email links): open it once, after the tasks load. A task this
+  // person cannot see (RLS), or one archived since, is not in the list.
+  const openedEmailTask = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!emailTaskId) {
+      openedEmailTask.current = undefined;
+      return;
+    }
+    if (pageStatus !== "ready" || openedEmailTask.current === emailTaskId) return;
+    openedEmailTask.current = emailTaskId;
+    if (allTasks.some((task) => task.id === emailTaskId)) {
+      setSelectedId(emailTaskId);
+      setDetailOpen(true);
+      setScrollToId(emailTaskId);
+      return;
+    }
+    toast.error("That task isn't available to you.", {
+      description: "It may have been archived, or you may no longer have access to it.",
+    });
+    onLinkedTaskClosed?.();
+  }, [emailTaskId, pageStatus, allTasks, onLinkedTaskClosed]);
+
+  const changeDetailOpen = (open: boolean) => {
+    setDetailOpen(open);
+    if (!open && emailTaskId) onLinkedTaskClosed?.();
+  };
 
   useEffect(() => {
     if (!scrollToId) return;
@@ -907,7 +945,7 @@ export function MyTasksPage({ onNewTask, dashboardFilter, onClearFilter }: MyTas
       <TaskDetailDrawer
         task={selected}
         open={detailOpen && Boolean(selected)}
-        onOpenChange={setDetailOpen}
+        onOpenChange={changeDetailOpen}
         variant={view === "kanban" ? "modal" : "sheet"}
       />
     </div>

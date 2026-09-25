@@ -17,7 +17,20 @@ export const TASK_LIMITS = {
   tagsMax: 20,
   tagMax: 40,
   subtaskMax: 200,
+  /** The `max` for every task and project date input. Without it Chrome takes a 6-digit year. */
+  dateMax: "9999-12-31",
 } as const;
+
+// A date input accepts years up to 275760. A 5-digit year ("20266") gets saved,
+// and then every date formatter that reads it throws, the email digests included.
+// With max set, Chrome wraps a fifth typed digit to "0266" instead, so years
+// below 1000 are refused too.
+const FOUR_DIGIT_YEAR_DATE = /^[1-9]\d{3}-\d{2}-\d{2}$/;
+
+function dateError(label: string, value: string | undefined): string | undefined {
+  if (!value || FOUR_DIGIT_YEAR_DATE.test(value)) return undefined;
+  return `Enter a ${label} with a 4-digit year.`;
+}
 
 export interface TaskFieldInput {
   title: string;
@@ -63,8 +76,12 @@ export function validateTaskFields(input: TaskFieldInput): TaskFieldErrors {
     errors.description = `Description must be ${TASK_LIMITS.descriptionMax} characters or fewer.`;
   }
 
+  const startDateError = dateError("start date", input.startDate);
+  const dueDateError = dateError("due date", input.dueDate);
+  if (startDateError) errors.startDate = startDateError;
   if (input.requireDueDate && !input.dueDate) errors.dueDate = "Due date is required.";
-  if (input.startDate && input.dueDate && input.dueDate < input.startDate) {
+  else if (dueDateError) errors.dueDate = dueDateError;
+  else if (!startDateError && input.startDate && input.dueDate && input.dueDate < input.startDate) {
     errors.dueDate = "Due date cannot be before the start date.";
   }
 

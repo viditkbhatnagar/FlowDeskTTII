@@ -381,11 +381,11 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
             options={priorityOptions.map((option) => ({ value: option.id, label: option.name }))}
           />
           <Field label="Start Date" htmlFor={fieldId("start")}>
-            <Input id={fieldId("start")} type="date" value={startDate} max={dueDate || undefined} onChange={(event) => setStartDate(event.target.value)} />
+            <Input id={fieldId("start")} type="date" value={startDate} max={dueDate || TASK_LIMITS.dateMax} onChange={(event) => setStartDate(event.target.value)} />
           </Field>
           <Field label="Due Date*" htmlFor={fieldId("due")} error={dueDateError}>
             <Input
-              id={fieldId("due")} type="date" value={dueDate} min={startDate || undefined}
+              id={fieldId("due")} type="date" value={dueDate} min={startDate || undefined} max={TASK_LIMITS.dateMax}
               onChange={(event) => { setDueDate(event.target.value); touch("dueDate"); }}
               onBlur={() => touch("dueDate")} {...describedBy(fieldId("due"), dueDateError)}
             />

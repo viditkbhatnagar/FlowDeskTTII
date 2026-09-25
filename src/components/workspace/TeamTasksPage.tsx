@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import type { Priority, Status } from "@/lib/mock-data";
 import { useWorkspace, type WorkspaceTask } from "@/lib/workspace-data";
@@ -144,12 +144,18 @@ export function TeamTasksPage({
   dashboardFilter,
   onClearFilter,
   onManageMembers,
+  linkedTaskId: emailTaskId,
+  onLinkedTaskClosed,
 }: {
   onNewTask: () => void;
   dashboardFilter?: string;
   onClearFilter?: () => void;
   /** Opens Settings › Users. The Workload "Manage" link is hidden without it, rather than inert (FD-031). */
   onManageMembers?: () => void;
+  /** ?task=<id> from an email: the task to open once the tasks have loaded. */
+  linkedTaskId?: string;
+  /** Called when that task's drawer closes, to drop the id from the URL. */
+  onLinkedTaskClosed?: () => void;
 }) {
   const [view, setView] = useState<"kanban" | "table" | "timeline">("kanban");
   const { tasks: workspaceTasks, updateTask, status: loadStatus, people } = useWorkspace();
@@ -221,6 +227,26 @@ export function TeamTasksPage({
     if (dashboardFilter?.startsWith("task:")) setSelectedId(dashboardFilter.slice(5));
   }, [dashboardFilter]);
 
+  // ?task=<id> (management summaries): open it once, after the tasks load. A task
+  // this person cannot see (RLS), or one archived since, is not in the list.
+  const openedEmailTask = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!emailTaskId) {
+      openedEmailTask.current = undefined;
+      return;
+    }
+    if (loadStatus !== "ready" || openedEmailTask.current === emailTaskId) return;
+    openedEmailTask.current = emailTaskId;
+    if (workspaceTasks.some((task) => task.id === emailTaskId)) {
+      setSelectedId(emailTaskId);
+      return;
+    }
+    toast.error("That task isn't available to you.", {
+      description: "It may have been archived, or you may no longer have access to it.",
+    });
+    onLinkedTaskClosed?.();
+  }, [emailTaskId, loadStatus, workspaceTasks, onLinkedTaskClosed]);
+
   // The chip names the filter a dashboard card applied. It used to be applied
   // invisibly, so Team Tasks silently showed 4 tasks with no way back (FD-030).
   const filterLabel = useMemo(() => {
@@ -278,7 +304,9 @@ export function TeamTasksPage({
   const closeDetail = (open: boolean) => {
     if (open) return;
     setSelectedId(undefined);
+    // Clearing the filter clears the whole query string, ?task included.
     if (dashboardFilter?.startsWith("task:")) onClearFilter?.();
+    else if (emailTaskId) onLinkedTaskClosed?.();
   };
 
   const selectClass =

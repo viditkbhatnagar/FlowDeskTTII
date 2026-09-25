@@ -24,6 +24,7 @@ import { Route as AuthenticatedWorkspaceSettingsTasksRouteImport } from './route
 import { Route as AuthenticatedWorkspaceSettingsStructureRouteImport } from './routes/_authenticated/_workspace/settings/structure'
 import { Route as AuthenticatedWorkspaceSettingsRolesRouteImport } from './routes/_authenticated/_workspace/settings/roles'
 import { Route as AuthenticatedWorkspaceSettingsOrganizationsRouteImport } from './routes/_authenticated/_workspace/settings/organizations'
+import { Route as AuthenticatedWorkspaceSettingsNotificationsRouteImport } from './routes/_authenticated/_workspace/settings/notifications'
 
 const AuthRoute = AuthRouteImport.update({
   id: '/auth',
@@ -111,6 +112,12 @@ const AuthenticatedWorkspaceSettingsOrganizationsRoute =
     path: '/organizations',
     getParentRoute: () => AuthenticatedWorkspaceSettingsRouteRoute,
   } as any)
+const AuthenticatedWorkspaceSettingsNotificationsRoute =
+  AuthenticatedWorkspaceSettingsNotificationsRouteImport.update({
+    id: '/notifications',
+    path: '/notifications',
+    getParentRoute: () => AuthenticatedWorkspaceSettingsRouteRoute,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof AuthenticatedWorkspaceIndexRoute
@@ -120,6 +127,7 @@ export interface FileRoutesByFullPath {
   '/my-tasks': typeof AuthenticatedWorkspaceMyTasksRoute
   '/projects': typeof AuthenticatedWorkspaceProjectsRoute
   '/team': typeof AuthenticatedWorkspaceTeamRoute
+  '/settings/notifications': typeof AuthenticatedWorkspaceSettingsNotificationsRoute
   '/settings/organizations': typeof AuthenticatedWorkspaceSettingsOrganizationsRoute
   '/settings/roles': typeof AuthenticatedWorkspaceSettingsRolesRoute
   '/settings/structure': typeof AuthenticatedWorkspaceSettingsStructureRoute
@@ -134,6 +142,7 @@ export interface FileRoutesByTo {
   '/my-tasks': typeof AuthenticatedWorkspaceMyTasksRoute
   '/projects': typeof AuthenticatedWorkspaceProjectsRoute
   '/team': typeof AuthenticatedWorkspaceTeamRoute
+  '/settings/notifications': typeof AuthenticatedWorkspaceSettingsNotificationsRoute
   '/settings/organizations': typeof AuthenticatedWorkspaceSettingsOrganizationsRoute
   '/settings/roles': typeof AuthenticatedWorkspaceSettingsRolesRoute
   '/settings/structure': typeof AuthenticatedWorkspaceSettingsStructureRoute
@@ -152,6 +161,7 @@ export interface FileRoutesById {
   '/_authenticated/_workspace/projects': typeof AuthenticatedWorkspaceProjectsRoute
   '/_authenticated/_workspace/team': typeof AuthenticatedWorkspaceTeamRoute
   '/_authenticated/_workspace/': typeof AuthenticatedWorkspaceIndexRoute
+  '/_authenticated/_workspace/settings/notifications': typeof AuthenticatedWorkspaceSettingsNotificationsRoute
   '/_authenticated/_workspace/settings/organizations': typeof AuthenticatedWorkspaceSettingsOrganizationsRoute
   '/_authenticated/_workspace/settings/roles': typeof AuthenticatedWorkspaceSettingsRolesRoute
   '/_authenticated/_workspace/settings/structure': typeof AuthenticatedWorkspaceSettingsStructureRoute
@@ -169,6 +179,7 @@ export interface FileRouteTypes {
     | '/my-tasks'
     | '/projects'
     | '/team'
+    | '/settings/notifications'
     | '/settings/organizations'
     | '/settings/roles'
     | '/settings/structure'
@@ -183,6 +194,7 @@ export interface FileRouteTypes {
     | '/my-tasks'
     | '/projects'
     | '/team'
+    | '/settings/notifications'
     | '/settings/organizations'
     | '/settings/roles'
     | '/settings/structure'
@@ -200,6 +212,7 @@ export interface FileRouteTypes {
     | '/_authenticated/_workspace/projects'
     | '/_authenticated/_workspace/team'
     | '/_authenticated/_workspace/'
+    | '/_authenticated/_workspace/settings/notifications'
     | '/_authenticated/_workspace/settings/organizations'
     | '/_authenticated/_workspace/settings/roles'
     | '/_authenticated/_workspace/settings/structure'
@@ -320,10 +333,18 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedWorkspaceSettingsOrganizationsRouteImport
       parentRoute: typeof AuthenticatedWorkspaceSettingsRouteRoute
     }
+    '/_authenticated/_workspace/settings/notifications': {
+      id: '/_authenticated/_workspace/settings/notifications'
+      path: '/notifications'
+      fullPath: '/settings/notifications'
+      preLoaderRoute: typeof AuthenticatedWorkspaceSettingsNotificationsRouteImport
+      parentRoute: typeof AuthenticatedWorkspaceSettingsRouteRoute
+    }
   }
 }
 
 interface AuthenticatedWorkspaceSettingsRouteRouteChildren {
+  AuthenticatedWorkspaceSettingsNotificationsRoute: typeof AuthenticatedWorkspaceSettingsNotificationsRoute
   AuthenticatedWorkspaceSettingsOrganizationsRoute: typeof AuthenticatedWorkspaceSettingsOrganizationsRoute
   AuthenticatedWorkspaceSettingsRolesRoute: typeof AuthenticatedWorkspaceSettingsRolesRoute
   AuthenticatedWorkspaceSettingsStructureRoute: typeof AuthenticatedWorkspaceSettingsStructureRoute
@@ -334,6 +355,8 @@ interface AuthenticatedWorkspaceSettingsRouteRouteChildren {
 
 const AuthenticatedWorkspaceSettingsRouteRouteChildren: AuthenticatedWorkspaceSettingsRouteRouteChildren =
   {
+    AuthenticatedWorkspaceSettingsNotificationsRoute:
+      AuthenticatedWorkspaceSettingsNotificationsRoute,
     AuthenticatedWorkspaceSettingsOrganizationsRoute:
       AuthenticatedWorkspaceSettingsOrganizationsRoute,
     AuthenticatedWorkspaceSettingsRolesRoute:

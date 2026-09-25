@@ -9,7 +9,6 @@ import {
   FolderKanban,
   Loader2,
   RefreshCw,
-  Sparkles,
   Users,
 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
@@ -19,7 +18,17 @@ import { Label } from "@/components/ui/label";
 import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
 import { hasLiveSession } from "@/components/workspace/account/session";
 
-type AuthSearch = { redirect?: string };
+type AuthSearch = { redirect?: string; mode?: "reset"; email?: string };
+
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const EMAIL_MAX_LENGTH = 254;
+
+/** An email address to prefill (from a "Set your password" link); anything else is dropped. */
+function safeEmail(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const email = value.trim();
+  return email.length <= EMAIL_MAX_LENGTH && EMAIL_PATTERN.test(email) ? email : undefined;
+}
 
 /**
  * The page to return to after sign-in: a path on this site only. Anything else
@@ -42,8 +51,15 @@ export const Route = createFileRoute("/auth")({
   // including a reload or a typed URL; on the server there is no session to see.
   ssr: false,
   validateSearch: (search: Record<string, unknown>): AuthSearch => {
-    const target = safeRedirect(search.redirect);
-    return target ? { redirect: target } : {};
+    // Every key is set, even when undefined: the router merges this over the raw
+    // query string, so a key left out would keep its unvalidated value. That is
+    // how ?redirect=https://… used to reach navigate() and leave the site.
+    return {
+      redirect: safeRedirect(search.redirect),
+      // ?mode=reset&email=… (the account-access email) opens the reset flow, prefilled.
+      mode: search.mode === "reset" ? "reset" : undefined,
+      email: safeEmail(search.email),
+    };
   },
   // Browser Back from the workspace used to land on this form with the session
   // still active (FD-039). Someone already signed in goes straight back in.
@@ -76,9 +92,10 @@ const RESEND_SECONDS = 60;
 
 function AuthPage() {
   const navigate = useNavigate();
-  const { redirect: returnTo } = Route.useSearch();
-  const [step, setStep] = useState<AuthStep>("sign-in");
-  const [email, setEmail] = useState("");
+  const { redirect: returnTo, mode, email: linkedEmail } = Route.useSearch();
+  // Nothing is sent automatically: the person still presses "Send verification code".
+  const [step, setStep] = useState<AuthStep>(mode === "reset" ? "request" : "sign-in");
+  const [email, setEmail] = useState(linkedEmail ?? "");
   const [password, setPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -405,8 +422,15 @@ function BrandPanel() {
       <div className="auth-shape auth-shape-two" aria-hidden="true" />
       <div className="relative z-10 mx-auto w-full max-w-2xl">
         <div className="flex items-center gap-3">
-          <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary-foreground/15 ring-1 ring-primary-foreground/20">
-            <Sparkles className="h-4 w-4" />
+          {/* A white tile: the blue symbol alone would vanish on this blue panel. */}
+          <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-white shadow-sm ring-1 ring-primary-foreground/20">
+            <img
+              src="/brand/flowdesk-symbol.png"
+              alt=""
+              width={24}
+              height={24}
+              className="h-6 w-6"
+            />
           </div>
           <div>
             <p className="text-sm font-semibold leading-none">Flowdesk</p>

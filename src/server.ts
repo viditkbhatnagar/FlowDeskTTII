@@ -1,7 +1,12 @@
 import "./lib/error-capture";
 
+import { startEmailWorker } from "./lib/email/worker";
 import { consumeLastCapturedError } from "./lib/error-capture";
 import { renderErrorPage } from "./lib/error-page";
+
+// Also started at boot by the nitro plugin in the built server; this call covers `vite dev`.
+// It starts at most once per process and never throws.
+startEmailWorker();
 
 type ServerEntry = {
   fetch: (request: Request, env: unknown, ctx: unknown) => Promise<Response> | Response;

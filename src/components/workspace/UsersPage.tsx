@@ -757,9 +757,9 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
             <div className="flex gap-2 rounded-xl border border-border bg-muted/40 px-3 py-2.5 text-xs text-muted-foreground">
               <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               <p>
-                New accounts can't be created from the browser yet: a login has to be set up on the server
-                by the FlowDesk administrator. Once the person has an account they appear in this list, and
-                you can assign their department, team and role here.
+                New accounts can't be created from the browser yet: the FlowDesk administrator sets up the
+                login and gives it a first organization on the server, which also sends the person a welcome
+                email. They then appear in this list, and you can assign their department, team and role here.
               </p>
             </div>
           )}
