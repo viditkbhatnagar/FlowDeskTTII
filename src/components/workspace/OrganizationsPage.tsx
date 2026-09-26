@@ -1,7 +1,7 @@
 import { useEffect, useId, useMemo, useState } from "react";
 import {
   Building2, Plus, MoreHorizontal, Eye, Pencil, Ban, ArrowLeft, Globe, Mail, Phone,
-  MapPin, Clock, Search, CheckCircle2, Info,
+  MapPin, Clock, Search, CheckCircle2, Loader2, ShieldCheck,
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -20,7 +20,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import {
   useOrganizations, countryOptions, timezoneOptions, validatePhone, PHONE_RULES,
-  type Organization, type OrgStatus,
+  type AdminRpcError, type Organization, type OrgStatus,
 } from "@/lib/organizations-data";
 
 const inputClass =
@@ -235,6 +235,27 @@ export function OrganizationsPage() {
   );
 }
 
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const HTTP_URL = /^https?:\/\/\S+$/i;
+
+/**
+ * Which field a refusal from admin_create_organization belongs to, so it shows
+ * next to that field. The function's messages name the field.
+ */
+function organizationErrorField(error: AdminRpcError): string | null {
+  if (error.code !== "22023" && error.code !== "23505") return null;
+  const message = error.message.toLowerCase();
+  if (message.includes("code")) return "code";
+  if (message.includes("time zone") || message.includes("timezone")) return "timezone";
+  if (message.includes("country")) return "country";
+  if (message.includes("logo")) return "logoUrl";
+  if (message.includes("website")) return "website";
+  if (message.includes("email")) return "email";
+  if (message.includes("phone")) return "phone";
+  if (message.includes("name")) return "name";
+  return null;
+}
+
 function OrganizationDrawer({
   target,
   onClose,
@@ -242,11 +263,12 @@ function OrganizationDrawer({
   target: Organization | "new" | null;
   onClose: () => void;
 }) {
-  const { updateOrganization, isNameTaken, isCodeTaken } = useOrganizations();
+  const { updateOrganization, createOrganization, isNameTaken, isCodeTaken } = useOrganizations();
   const editing = target && target !== "new" ? target : null;
   const isNew = target === "new";
   const fieldId = useId();
   const [phoneTouched, setPhoneTouched] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
 
   const [form, setForm] = useState(() => blank());
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -288,29 +310,68 @@ function OrganizationDrawer({
     );
   }
 
-  const set = (field: keyof ReturnType<typeof blank>, value: string) =>
+  const set = (field: keyof ReturnType<typeof blank>, value: string) => {
     setForm((f) => ({ ...f, [field]: value }));
+    // The field's message goes once it is edited, not at the next submit.
+    setErrors((current) =>
+      field in current
+        ? Object.fromEntries(Object.entries(current).filter(([key]) => key !== field))
+        : current,
+    );
+  };
 
   const phoneError = validatePhone(form.phone);
   // Invalid characters show at once; length once the field is left (FD-050).
   const showPhoneError = !!phoneError && (phoneTouched || /[^0-9+\-() ]/.test(form.phone) || !!errors['phone']);
 
+  const close = () => {
+    if (submitting) return;
+    setLoadedFor(null);
+    onClose();
+  };
+
+  /**
+   * The server creates the organization, seeds its default roles and settings,
+   * and makes the caller its admin — then the list reloads with it in.
+   */
+  const create = async (payload: Omit<Organization, "id">) => {
+    setSubmitting(true);
+    const result = await createOrganization(payload);
+    setSubmitting(false);
+    if (!result.ok) {
+      const field = organizationErrorField(result.error);
+      if (field) setErrors({ [field]: result.error.message });
+      else toast.error(result.error.message);
+      return;
+    }
+    toast.success(`${payload.name} created. You're its admin.`);
+    setLoadedFor(null);
+    onClose();
+  };
+
   const submit = () => {
+    if (submitting) return;
     const next: Record<string, string> = {};
     if (!form.name.trim()) next['name'] = "Organization name is required";
     else if (isNameTaken(form.name, editing?.id)) next['name'] = "An organization with this name already exists";
     if (!form.code.trim()) next['code'] = "Code is required";
     else if (form.code.trim().length > 8) next['code'] = "Keep the code short (max 8 characters)";
     else if (isCodeTaken(form.code, editing?.id)) next['code'] = "This code is already in use";
+    else if (isNew && !/^[A-Za-z0-9]{2,8}$/.test(form.code.trim()))
+      next['code'] = "Use 2 to 8 letters or digits";
     if (!form.country) next['country'] = "Country is required";
     if (!form.timezone) next['timezone'] = "Timezone is required";
     if (phoneError) next['phone'] = phoneError;
+    // The same rules the server applies to a new organization.
+    if (isNew && form.email.trim() && !EMAIL_PATTERN.test(form.email.trim()))
+      next['email'] = "Enter a valid email";
+    if (isNew && form.logoUrl.trim() && !HTTP_URL.test(form.logoUrl.trim()))
+      next['logoUrl'] = "Use a link that starts with https://";
+    if (isNew && form.website.trim() && !HTTP_URL.test(form.website.trim()))
+      next['website'] = "Use a web address that starts with https://";
     setErrors(next);
     setPhoneTouched(true);
     if (Object.keys(next).length) return;
-    // Organizations can only be created on the server (row-level security refuses
-    // the insert). This used to add a row that disappeared on refresh.
-    if (!editing) return;
 
     const payload = {
       name: form.name.trim(),
@@ -324,6 +385,11 @@ function OrganizationDrawer({
       status: form.status,
     };
 
+    if (!editing) {
+      void create(payload);
+      return;
+    }
+
     updateOrganization(editing.id, payload);
     toast.success("Organization updated");
     setLoadedFor(null);
@@ -331,7 +397,7 @@ function OrganizationDrawer({
   };
 
   return (
-    <Sheet open={!!target} onOpenChange={(open) => { if (!open) { setLoadedFor(null); onClose(); } }}>
+    <Sheet open={!!target} onOpenChange={(open) => { if (!open) close(); }}>
       <SheetContent side="right" className="flex w-full flex-col gap-0 p-0 sm:max-w-md">
         <SheetHeader className="border-b border-border px-5 py-4">
           <SheetTitle className="text-base">
@@ -344,12 +410,9 @@ function OrganizationDrawer({
 
         <div className="flex-1 space-y-4 overflow-y-auto px-5 py-5">
           {isNew && (
-            <div className="flex gap-2 rounded-xl border border-border bg-muted/40 px-3 py-2.5 text-xs text-muted-foreground">
-              <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              <p>
-                New organizations can't be created from the browser: they are set up on the server by the
-                FlowDesk administrator, together with their default roles and settings.
-              </p>
+            <div className="flex gap-2 rounded-xl border border-primary/15 bg-primary/5 px-3 py-2.5 text-xs text-foreground/80">
+              <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
+              <p>It starts with the default roles and settings, and you become its admin.</p>
             </div>
           )}
           <Field label="Organization Name" required error={errors['name']} htmlFor={`${fieldId}-name`}>
@@ -370,7 +433,7 @@ function OrganizationDrawer({
               placeholder="TTII"
             />
           </Field>
-          <Field label="Logo URL" htmlFor={`${fieldId}-logo`}>
+          <Field label="Logo URL" error={errors['logoUrl']} htmlFor={`${fieldId}-logo`}>
             <input
               id={`${fieldId}-logo`}
               className={inputClass}
@@ -380,7 +443,7 @@ function OrganizationDrawer({
             />
           </Field>
           <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="Official Email" htmlFor={`${fieldId}-email`}>
+            <Field label="Official Email" error={errors['email']} htmlFor={`${fieldId}-email`}>
               <input
                 id={`${fieldId}-email`}
                 type="email"
@@ -390,7 +453,11 @@ function OrganizationDrawer({
                 placeholder="contact@ttii.in"
               />
             </Field>
-            <Field label="Phone" error={showPhoneError ? (phoneError ?? undefined) : undefined} htmlFor={`${fieldId}-phone`}>
+            <Field
+              label="Phone"
+              error={showPhoneError ? (phoneError ?? undefined) : errors['phone']}
+              htmlFor={`${fieldId}-phone`}
+            >
               <input
                 id={`${fieldId}-phone`}
                 type="tel"
@@ -406,7 +473,7 @@ function OrganizationDrawer({
               />
             </Field>
           </div>
-          <Field label="Website" htmlFor={`${fieldId}-website`}>
+          <Field label="Website" error={errors['website']} htmlFor={`${fieldId}-website`}>
             <input
               id={`${fieldId}-website`}
               className={inputClass}
@@ -439,18 +506,20 @@ function OrganizationDrawer({
 
         <div className="flex items-center justify-end gap-2 border-t border-border px-5 py-4">
           <button
-            onClick={() => { setLoadedFor(null); onClose(); }}
-            className="rounded-lg border border-border bg-card px-3 py-2 text-xs font-medium transition hover:bg-accent"
+            onClick={close}
+            disabled={submitting}
+            className="rounded-lg border border-border bg-card px-3 py-2 text-xs font-medium transition hover:bg-accent disabled:opacity-50"
           >
             Cancel
           </button>
           <button
             onClick={submit}
-            disabled={isNew}
-            title={isNew ? "Organizations are created on the server — see the note above." : undefined}
-            className="rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground shadow-sm transition hover:bg-primary/90 disabled:opacity-50"
+            disabled={submitting}
+            aria-busy={submitting || undefined}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground shadow-sm transition hover:bg-primary/90 disabled:opacity-70"
           >
-            {editing ? "Save Changes" : "Add Organization"}
+            {submitting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            {editing ? "Save Changes" : submitting ? "Creating…" : "Add Organization"}
           </button>
         </div>
       </SheetContent>
@@ -663,8 +732,11 @@ function OrganizationDetail({
         onClose={() => setUserOpen(false)}
         orgId={org.id}
         onSave={(userId, departmentId, teamId, role) => {
-          addUserToOrganization(userId, org.id, { departmentId, teamId, role });
-          toast.success("User added to organization");
+          void addUserToOrganization(userId, org.id, { departmentId, teamId, role }).then(
+            (saved) => {
+              if (saved) toast.success("User added to organization");
+            },
+          );
         }}
       />
 

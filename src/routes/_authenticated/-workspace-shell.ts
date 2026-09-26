@@ -67,6 +67,37 @@ export async function checkOnEntry(
 }
 
 /**
+ * Whether the signed-in person can use the workspace, and if not, why:
+ * "deactivated" (an admin switched their account off) or "no-organization"
+ * (no active membership anywhere). Deactivate also switches off every
+ * membership, so the account's own status is checked first to tell the two
+ * apart. Row-level security lets a person read their own profile and
+ * memberships whatever their status.
+ *
+ * Throws when the lookup itself fails: that is not a verdict, and the error
+ * page offers Try again.
+ */
+export type AccountAccess = "ok" | "deactivated" | "no-organization";
+
+export async function loadAccountAccess(userId: string): Promise<AccountAccess> {
+  const [profile, memberships] = await Promise.all([
+    supabase.from("profiles").select("status").eq("user_id", userId).maybeSingle(),
+    supabase
+      .from("organization_memberships")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .eq("status", "active"),
+  ]);
+  if (profile.error) throw new Error(`Could not load your account: ${profile.error.message}`);
+  if (memberships.error) {
+    throw new Error(`Could not load your organizations: ${memberships.error.message}`);
+  }
+  if (profile.data?.status === "inactive") return "deactivated";
+  if (!memberships.count) return "no-organization";
+  return "ok";
+}
+
+/**
  * Settings pages are listed only for admins. Now that each one has its own URL,
  * a deep link must not open them for everyone else either.
  */

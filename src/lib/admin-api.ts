@@ -58,6 +58,49 @@ export interface AdminSnapshot {
   roles: Role[];
 }
 
+/** The most privileged of a person's permissions in one organization (user_roles rows). */
+export function strongestRole(roles: readonly string[]): BaseRole | undefined {
+  return BASE_ROLES.find((role) => roles.includes(role));
+}
+
+/** The columns of a roles row that decide how a membership's role reads. */
+export interface RoleRowLite {
+  id: string;
+  name: string;
+  organization_id: string;
+  base_role: string;
+  is_system: boolean;
+}
+
+/**
+ * How one membership's role reads on screen, and the permission behind it.
+ *
+ * `privilege` is what row-level security checks (user_roles). The role shown
+ * is the membership's role when that is one of this organization's roles.
+ * When it is not — an old id from another organization, or a role the caller
+ * cannot read — `roleUnreadable` is set and the role shown is this
+ * organization's built-in role for the permission the person really holds.
+ * It used to read "Employee" whatever they held, and saving the person then
+ * really made them an Employee.
+ */
+export function describeMembershipRole(input: {
+  roleId: string | null;
+  orgId: string;
+  privileges: readonly string[];
+  roles: readonly RoleRowLite[];
+}): { role: string; privilege?: BaseRole; roleUnreadable: boolean } {
+  const privilege = strongestRole(input.privileges);
+  const own = input.roleId
+    ? input.roles.find((r) => r.id === input.roleId && r.organization_id === input.orgId)
+    : undefined;
+  if (own) return { role: own.name, privilege, roleUnreadable: false };
+  const base = privilege ?? "employee";
+  const builtIn =
+    input.roles.find((r) => r.is_system && r.base_role === base && r.organization_id === input.orgId) ??
+    input.roles.find((r) => r.is_system && r.base_role === base);
+  return { role: builtIn?.name ?? "Employee", privilege, roleUnreadable: Boolean(input.roleId) };
+}
+
 const mapOrganization = (row: Record<string, unknown>): Organization => ({
   id: row.id as string,
   name: row.name as string,
@@ -96,10 +139,13 @@ export async function loadAdminSnapshot(): Promise<AdminSnapshot | null> {
   const nameById = new Map<string, string>(
     profileRows.map((p) => [p.user_id as string, (p.full_name as string) || (p.username as string) || "Unknown"]),
   );
-  const roleNameById = new Map<string, string>((roleRows.data ?? []).map((r) => [r.id as string, r.name as string]));
-  const roleByBase = new Map<string, string>(
-    (roleRows.data ?? []).filter((r) => r.is_system).map((r) => [r.base_role as string, r.name as string]),
-  );
+  const roleLites: RoleRowLite[] = (roleRows.data ?? []).map((r) => ({
+    id: r.id as string,
+    name: r.name as string,
+    organization_id: r.organization_id as string,
+    base_role: r.base_role as string,
+    is_system: Boolean(r.is_system),
+  }));
 
   const departments: Department[] = (depts.data ?? []).map((d) => ({
     id: d.id as string,
@@ -125,12 +171,12 @@ export async function loadAdminSnapshot(): Promise<AdminSnapshot | null> {
     status: t.status as OrgStatus,
   }));
 
-  const roleFor = (userId: string, orgId: string): string => {
-    const membership = membershipRows.find((m) => m.user_id === userId && m.organization_id === orgId);
-    if (membership?.role_id) return roleNameById.get(membership.role_id as string) ?? "Employee";
-    const assigned = (userRoles.data ?? []).find((r) => r.user_id === userId && r.organization_id === orgId);
-    return roleByBase.get((assigned?.role as string) ?? "employee") ?? "Employee";
-  };
+  // The permission row-level security reads, per person and organization. The
+  // caller sees these rows only where they are admin (and their own).
+  const privilegesOf = (userId: string, orgId: string): string[] =>
+    (userRoles.data ?? [])
+      .filter((r) => r.user_id === userId && r.organization_id === orgId)
+      .map((r) => r.role as string);
 
   const users: OrgUser[] = profileRows.map((p) => {
     const userId = p.user_id as string;
@@ -147,14 +193,25 @@ export async function loadAdminSnapshot(): Promise<AdminSnapshot | null> {
       joiningDate: (p.joining_date as string) ?? undefined,
       status: (p.status as OrgStatus) ?? "active",
       primaryOrgId: (primary?.organization_id as string) ?? "",
-      memberships: mine.map<Membership>((m) => ({
-        orgId: m.organization_id as string,
-        departmentId: (m.department_id as string) ?? undefined,
-        teamId: (m.team_id as string) ?? undefined,
-        role: roleFor(userId, m.organization_id as string),
-        status: m.status as OrgStatus,
-        reportingManagerId: (m.reporting_manager_id as string) ?? undefined,
-      })),
+      memberships: mine.map<Membership>((m) => {
+        const orgId = m.organization_id as string;
+        const { role, privilege, roleUnreadable } = describeMembershipRole({
+          roleId: (m.role_id as string) ?? null,
+          orgId,
+          privileges: privilegesOf(userId, orgId),
+          roles: roleLites,
+        });
+        return {
+          orgId,
+          departmentId: (m.department_id as string) ?? undefined,
+          teamId: (m.team_id as string) ?? undefined,
+          role,
+          status: m.status as OrgStatus,
+          reportingManagerId: (m.reporting_manager_id as string) ?? undefined,
+          privilege,
+          ...(roleUnreadable ? { roleUnreadable } : {}),
+        };
+      }),
     };
   });
 
@@ -186,6 +243,31 @@ export async function loadAdminSnapshot(): Promise<AdminSnapshot | null> {
 /* — usually because RLS refused it, which is the correct outcome for a */
 /* user without the privilege.                                         */
 /* ------------------------------------------------------------------ */
+
+/**
+ * What a write behind the Users and Roles pages reports. The database refuses
+ * some saves on purpose — every organization keeps an active admin, and
+ * Deactivate refuses the last one — and says why in a sentence written for the
+ * admin (SQLSTATE P0001). That sentence is `refusal`. Anything else (no
+ * permission, the connection dropped) has none, and the screen says something
+ * general.
+ */
+export type WriteResult = { ok: true } | { ok: false; refusal: string | null };
+
+const SAVED: WriteResult = { ok: true };
+
+/** The database's own sentence when it refused a write on one of its rules (P0001), else null. */
+export function ruleRefusal(error: unknown): string | null {
+  const { code, message } = (error ?? {}) as { code?: unknown; message?: unknown };
+  if (code !== "P0001" || typeof message !== "string") return null;
+  return message.trim() || null;
+}
+
+/** Log, and report the refusal sentence when there is one. */
+function writeFailed(operation: string, error: unknown): WriteResult {
+  console.error(`[flowdesk] ${operation} failed`, error);
+  return { ok: false, refusal: ruleRefusal(error) };
+}
 
 /** Resolve a display name back to a user id. Unmatched names become NULL. */
 export function resolveUserId(users: OrgUser[], name?: string): string | null {
@@ -292,7 +374,7 @@ export async function createRoleRow(
 export async function updateRoleRow(
   id: string,
   updates: { name?: string; description?: string; scope?: string; permissions?: string[]; settings?: Database["public"]["Tables"]["roles"]["Update"]["settings"]; status?: OrgStatus; baseRole?: BaseRole },
-): Promise<boolean> {
+): Promise<WriteResult> {
   const payload: Upd<"roles"> = {};
   if (updates.name !== undefined) payload.name = updates.name;
   if (updates.description !== undefined) payload.description = updates.description;
@@ -301,10 +383,12 @@ export async function updateRoleRow(
   if (updates.settings !== undefined) payload.settings = updates.settings;
   if (updates.status !== undefined) payload.status = updates.status;
   if (updates.baseRole !== undefined) payload.base_role = updates.baseRole;
-  if (!Object.keys(payload).length) return true;
+  if (!Object.keys(payload).length) return SAVED;
   const { error } = await supabase.from("roles").update(payload).eq("id", id);
-  // A system role refuses base_role and status changes via a database trigger.
-  return error ? Boolean(fail("updateRole", error)) : true;
+  // A system role refuses base_role and status changes via a database trigger,
+  // and a new base_role that would leave an organization without an active
+  // admin is refused too; both say so.
+  return error ? writeFailed("updateRole", error) : SAVED;
 }
 
 export async function deleteRoleRow(id: string): Promise<boolean> {
@@ -312,25 +396,39 @@ export async function deleteRoleRow(id: string): Promise<boolean> {
   return error ? Boolean(fail("deleteRole", error)) : true;
 }
 
+/**
+ * Update a profile. undefined leaves a field alone; an empty string clears it
+ * (stored as NULL). Clearing used to be sent as undefined, so a removed photo,
+ * phone or employee ID came back on the next load.
+ */
 export async function updateProfileRow(
   userId: string,
-  updates: { name?: string; phone?: string; employeeId?: string; joiningDate?: string; status?: OrgStatus },
-): Promise<boolean> {
+  updates: {
+    name?: string;
+    phone?: string;
+    employeeId?: string;
+    joiningDate?: string;
+    status?: OrgStatus;
+    avatarUrl?: string;
+  },
+): Promise<WriteResult> {
   const payload: Upd<"profiles"> = {};
   if (updates.name !== undefined) payload.full_name = updates.name;
-  if (updates.phone !== undefined) payload.phone = updates.phone;
-  if (updates.employeeId !== undefined) payload.employee_id = updates.employeeId;
+  if (updates.phone !== undefined) payload.phone = updates.phone.trim() || null;
+  if (updates.avatarUrl !== undefined) payload.avatar_url = updates.avatarUrl.trim() || null;
+  if (updates.employeeId !== undefined) payload.employee_id = updates.employeeId.trim() || null;
   if (updates.joiningDate !== undefined) payload.joining_date = updates.joiningDate || null;
   if (updates.status !== undefined) payload.status = updates.status;
-  if (!Object.keys(payload).length) return true;
+  if (!Object.keys(payload).length) return SAVED;
   const { error } = await supabase.from("profiles").update(payload).eq("user_id", userId);
-  return error ? Boolean(fail("updateProfile", error)) : true;
+  // Deactivating an organization's last active admin is refused, with a reason.
+  return error ? writeFailed("updateProfile", error) : SAVED;
 }
 
 export async function upsertMembershipRow(
   userId: string,
   membership: { orgId: string; departmentId?: string; teamId?: string; roleId?: string | null; designation?: string; reportingManagerId?: string | null; status?: OrgStatus; isPrimary?: boolean },
-): Promise<boolean> {
+): Promise<WriteResult> {
   const { error } = await supabase.from("organization_memberships").upsert(
     {
       user_id: userId,
@@ -340,21 +438,26 @@ export async function upsertMembershipRow(
       role_id: membership.roleId ?? null,
       designation: membership.designation ?? null,
       reporting_manager_id: membership.reportingManagerId ?? null,
-      status: membership.status ?? "active",
+      // Left out, a new membership starts active (the column default) and an
+      // existing one keeps its status: Deactivate and Reactivate set it in the
+      // database, and a loaded copy written back could undo them.
+      ...(membership.status !== undefined ? { status: membership.status } : {}),
       is_primary: membership.isPrimary ?? false,
     },
     { onConflict: "user_id,organization_id" },
   );
-  return error ? Boolean(fail("upsertMembership", error)) : true;
+  // The role it sets carries a permission (the database keeps user_roles in
+  // step), so it can be refused for leaving an organization without an admin.
+  return error ? writeFailed("upsertMembership", error) : SAVED;
 }
 
-export async function removeMembershipRow(userId: string, orgId: string): Promise<boolean> {
+export async function removeMembershipRow(userId: string, orgId: string): Promise<WriteResult> {
   const { error } = await supabase
     .from("organization_memberships")
     .delete()
     .eq("user_id", userId)
     .eq("organization_id", orgId);
-  return error ? Boolean(fail("removeMembership", error)) : true;
+  return error ? writeFailed("removeMembership", error) : SAVED;
 }
 
 /**
@@ -369,20 +472,60 @@ export async function assignRoleRow(
   userId: string,
   orgId: string,
   role: { id: string; baseRole: BaseRole },
-): Promise<boolean> {
-  const [membership, privilege] = await Promise.all([
-    supabase
-      .from("organization_memberships")
-      .update({ role_id: role.id })
-      .eq("user_id", userId)
-      .eq("organization_id", orgId),
-    supabase
+): Promise<WriteResult> {
+  const membership = await supabase
+    .from("organization_memberships")
+    .update({ role_id: role.id })
+    .eq("user_id", userId)
+    .eq("organization_id", orgId);
+  if (membership.error) return writeFailed("assignRole (label)", membership.error);
+  return writePrivilegeRow(userId, orgId, role);
+}
+
+/**
+ * Make the person's privilege in one organization exactly `role`.
+ *
+ * user_roles is unique on (user_id, organization_id, role), not on the pair.
+ * This used to be an upsert keyed on the pair, which Postgres refuses outright
+ * (42P10, "no unique or exclusion constraint matching the ON CONFLICT
+ * specification"): every role change relabelled the person and granted
+ * nothing. Keying it on all three would be no better — it would add a second
+ * privilege instead of replacing the first. So: one row per person per
+ * organization — update it, insert it when missing, and drop any duplicates.
+ */
+async function writePrivilegeRow(
+  userId: string,
+  orgId: string,
+  role: { id: string; baseRole: BaseRole },
+): Promise<WriteResult> {
+  const { data: rows, error: readError } = await supabase
+    .from("user_roles")
+    .select("id, role")
+    .eq("user_id", userId)
+    .eq("organization_id", orgId)
+    .order("created_at");
+  if (readError) return writeFailed("assignRole (read privilege)", readError);
+
+  if (!rows?.length) {
+    const { error } = await supabase
       .from("user_roles")
-      .upsert({ user_id: userId, organization_id: orgId, role: role.baseRole, role_id: role.id }, { onConflict: "user_id,organization_id" }),
-  ]);
-  if (membership.error) return Boolean(fail("assignRole (label)", membership.error));
-  if (privilege.error) return Boolean(fail("assignRole (privilege)", privilege.error));
-  return true;
+      .insert({ user_id: userId, organization_id: orgId, role: role.baseRole, role_id: role.id });
+    return error ? writeFailed("assignRole (add privilege)", error) : SAVED;
+  }
+
+  // Keep the row that already carries this privilege, if any, so the update
+  // below cannot collide with the unique key.
+  const keep = rows.find((row) => row.role === role.baseRole) ?? rows[0];
+  const extras = rows.filter((row) => row.id !== keep.id).map((row) => row.id);
+  if (extras.length) {
+    const { error } = await supabase.from("user_roles").delete().in("id", extras);
+    if (error) return writeFailed("assignRole (drop duplicate privilege)", error);
+  }
+  const { error } = await supabase
+    .from("user_roles")
+    .update({ role: role.baseRole, role_id: role.id })
+    .eq("id", keep.id);
+  return error ? writeFailed("assignRole (privilege)", error) : SAVED;
 }
 
 export async function updateOrganizationRow(
@@ -402,6 +545,146 @@ export async function updateOrganizationRow(
   if (!Object.keys(payload).length) return true;
   const { error } = await supabase.from("organizations").update(payload).eq("id", id);
   return error ? Boolean(fail("updateOrganization", error)) : true;
+}
+
+/* ------------------------------------------------------------------ */
+/* Onboarding — new accounts and new organizations                     */
+/*                                                                     */
+/* The browser key cannot mint logins or insert organizations, and      */
+/* production has no service-role key. Both go through SECURITY DEFINER */
+/* functions (20260927000000_admin_onboarding.sql) that check the       */
+/* caller is an admin and raise a readable message when they refuse.    */
+/* ------------------------------------------------------------------ */
+
+/** What a refused or failed call reports: a sentence a person can act on, and the SQLSTATE. */
+export interface AdminRpcError {
+  message: string;
+  code: string;
+}
+
+export type AdminRpcResult<T> = { ok: true; value: T } | { ok: false; error: AdminRpcError };
+
+/**
+ * SQLSTATEs the onboarding functions raise on purpose, with a message written
+ * for the person at the screen: 42501 not allowed, 22023 invalid input,
+ * 23505 already exists, P0001 business rule (an expired link, a welcome email
+ * that could not be queued), PT429 too many in a short time (PostgREST
+ * answers it with HTTP 429).
+ */
+const MEANINGFUL_CODES = new Set(["42501", "22023", "23505", "P0001", "PT429"]);
+
+const CONNECTION_TROUBLE = "That didn't go through. Check your connection and try again.";
+
+/**
+ * Turn a PostgREST error into a sentence worth showing.
+ *
+ * The functions' own messages are passed through. Anything else — a network
+ * failure, a missing function, Postgres's raw "duplicate key value violates…"
+ * — would mean nothing to an admin, so it becomes a plain fallback.
+ */
+export function describeRpcError(
+  error: { message?: string | null; code?: string | null } | null | undefined,
+): AdminRpcError {
+  const message = (error?.message ?? "").trim();
+  const code = (error?.code ?? "").trim();
+  if (code === "42501" && /^permission denied/i.test(message)) {
+    return { code, message: "You don't have permission to do that." };
+  }
+  if (code === "23505" && /duplicate key value/i.test(message)) {
+    return { code, message: "That already exists." };
+  }
+  if (MEANINGFUL_CODES.has(code) && message) return { code, message };
+  return { code, message: CONNECTION_TROUBLE };
+}
+
+function rpcFailed(operation: string, error: unknown): { ok: false; error: AdminRpcError } {
+  console.error(`[flowdesk] ${operation} failed`, error);
+  return { ok: false, error: describeRpcError(error as { message?: string; code?: string }) };
+}
+
+/** Optional extras for a new account. Every id must belong to the account's organization. */
+export interface NewAccountDetails {
+  departmentId?: string;
+  teamId?: string;
+  reportingManagerId?: string;
+  /** A roles row in the organization; its base_role must equal the account's role. */
+  roleId?: string;
+  designation?: string;
+  employeeId?: string;
+  phone?: string;
+  /** yyyy-mm-dd */
+  joiningDate?: string;
+}
+
+/** Drop empty values, so the function sees only what was filled in. */
+function compact(details: object): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(details)
+      .filter(([, value]) => typeof value === "string" && value.trim() !== "")
+      .map(([key, value]) => [key, (value as string).trim()]),
+  );
+}
+
+/**
+ * Create a login and its first organization membership (admin_create_user).
+ *
+ * The membership insert queues the welcome email, and the function puts a
+ * one-time link on it for choosing a password. Nothing is created unless all
+ * of it succeeds. Returns the new user's id.
+ */
+export async function createAccountRpc(input: {
+  email: string;
+  fullName: string;
+  organizationId: string;
+  role: BaseRole;
+  details: NewAccountDetails;
+}): Promise<AdminRpcResult<string>> {
+  const { data, error } = await supabase.rpc("admin_create_user", {
+    p_email: input.email.trim(),
+    p_full_name: input.fullName.trim(),
+    p_organization_id: input.organizationId,
+    p_role: input.role,
+    p_details: compact(input.details),
+  });
+  if (error || !data) return rpcFailed("admin_create_user", error ?? new Error("no id returned"));
+  return { ok: true, value: data };
+}
+
+/** Send a fresh welcome email with a new link; the old links stop working (admin_resend_welcome). */
+export async function resendWelcomeRpc(userId: string): Promise<AdminRpcResult<null>> {
+  const { error } = await supabase.rpc("admin_resend_welcome", { p_user_id: userId });
+  if (error) return rpcFailed("admin_resend_welcome", error);
+  return { ok: true, value: null };
+}
+
+/**
+ * Create an organization (admin_create_organization). Its default roles and
+ * settings are seeded by the database, and the caller becomes its admin.
+ */
+export async function createOrganizationRpc(input: {
+  name: string;
+  code: string;
+  country: string;
+  timezone: string;
+  details: {
+    officialEmail?: string;
+    phone?: string;
+    website?: string;
+    logoUrl?: string;
+    status?: OrgStatus;
+  };
+}): Promise<AdminRpcResult<string>> {
+  const { data, error } = await supabase.rpc("admin_create_organization", {
+    p_name: input.name.trim(),
+    p_code: input.code.trim().toUpperCase(),
+    p_country: input.country,
+    p_timezone: input.timezone,
+    p_details: compact(input.details),
+  });
+  if (error || !data) {
+    return rpcFailed("admin_create_organization", error ?? new Error("no id returned"));
+  }
+  return { ok: true, value: data };
 }
 
 /* ------------------------------------------------------------------ */
@@ -741,8 +1024,12 @@ export async function archiveProjectRow(id: string): Promise<boolean> {
 /* note at the top of 20260922000000_admin_persistence.sql.             */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Every organization's rows the caller can see (RLS narrows them). Each row
+ * carries its organization: the screens show one organization's at a time.
+ */
 export interface LoadedSettings {
-  statuses: { id: string; value: string; label: string; order: number; isDefault: boolean; isCompleted: boolean; active: boolean }[];
+  statuses: { id: string; orgId: string; value: string; label: string; order: number; isDefault: boolean; isCompleted: boolean; active: boolean }[];
   categories: { id: string; name: string; orgId: string; active: boolean }[];
   tags: { id: string; name: string; orgId: string; active: boolean }[];
 }
@@ -759,6 +1046,7 @@ export async function loadSettings(): Promise<LoadedSettings | null> {
   return {
     statuses: (statusRows.data ?? []).map((r) => ({
       id: r.id,
+      orgId: r.organization_id,
       value: r.value,
       label: r.label,
       order: r.sort_order,

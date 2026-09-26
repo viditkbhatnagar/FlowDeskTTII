@@ -1,7 +1,7 @@
 import { useId, useMemo, useState } from "react";
 import {
   Plus, MoreHorizontal, Eye, Pencil, Ban, ArrowLeft, Mail, Phone, Search,
-  CheckCircle2, Trash2, Building2, Shield, CalendarDays, X, Info,
+  CheckCircle2, Trash2, Building2, Shield, CalendarDays, X, Loader2, Send,
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -20,7 +20,8 @@ import {
 } from "@/components/ui/dropdown-menu";
 import {
   useOrganizations, validatePhone, plural, PHONE_RULES,
-  type Department, type Membership, type OrgStatus, type OrgUser, type Organization, type Team,
+  type AdminRpcError, type Department, type Membership, type OrgStatus, type OrgUser,
+  type Organization, type Team,
 } from "@/lib/organizations-data";
 import { useWorkspace } from "@/lib/workspace-data";
 import { todayIn } from "@/lib/today";
@@ -85,6 +86,7 @@ function Detail({ label, value }: { label: string; value?: string }) {
 export function UsersPage() {
   const {
     status, users, organizations, departments, teams, roles, rolesFor, canManageUsers, setUserStatus,
+    currentUser,
   } = useOrganizations();
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -373,7 +375,8 @@ export function UsersPage() {
                               <Pencil className="mr-2 h-3.5 w-3.5" /> Edit
                             </DropdownMenuItem>
                           )}
-                          {canManageUsers &&
+                          {/* Nobody switches their own account off or on. */}
+                          {canManageUsers && user.id !== currentUser?.id &&
                             (user.status === "active" ? (
                               <DropdownMenuItem onClick={() => setDeactivateUser(user)}>
                                 <Ban className="mr-2 h-3.5 w-3.5" /> Deactivate
@@ -381,8 +384,9 @@ export function UsersPage() {
                             ) : (
                               <DropdownMenuItem
                                 onClick={() => {
-                                  setUserStatus(user.id, "active");
-                                  toast.success(`${user.name} activated`);
+                                  void setUserStatus(user.id, "active").then((saved) => {
+                                    if (saved) toast.success(`${user.name} activated`);
+                                  });
                                 }}
                               >
                                 <CheckCircle2 className="mr-2 h-3.5 w-3.5" /> Activate
@@ -597,15 +601,61 @@ function useRoleChoices() {
   return { roleNames, defaultRoleFor: defaultRoleName };
 }
 
+/**
+ * Which field a refusal from admin_create_user belongs to, so it shows next to
+ * that field instead of in a toast. The function's messages name the field.
+ */
+function userErrorField(error: AdminRpcError): string | null {
+  if (error.code === "23505") return "email";
+  if (error.code !== "22023") return null;
+  const message = error.message.toLowerCase();
+  if (message.includes("email")) return "email";
+  if (message.includes("employee id")) return "employeeId";
+  if (message.includes("designation")) return "designation";
+  if (message.includes("phone")) return "phone";
+  if (message.includes("joining")) return "joiningDate";
+  if (message.includes("manager")) return "manager";
+  if (message.includes("department") || message.includes("team")) return "dept";
+  if (message.includes("role")) return "role";
+  if (message.includes("name")) return "name";
+  if (message.includes("organization")) return "org";
+  return null;
+}
+
 function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClose: () => void }) {
   const {
-    organizations, departments, teams, users, updateUser, isEmailTaken, logUserActivity,
-    isAdminIn, activeAdminCountIn,
+    organizations,
+    departments,
+    teams,
+    users,
+    updateUser,
+    isEmailTaken,
+    logUserActivity,
+    isAdminIn,
+    roleGrantsAdmin,
+    soleAdminOrgIds,
+    createUser,
+    currentUser,
+    activeOrgId,
   } = useOrganizations();
+  const { refresh: refreshPeople } = useWorkspace();
   const { roleNames, defaultRoleFor } = useRoleChoices();
   const isNew = target === "new";
   const existing = target && target !== "new" ? target : null;
+  // Nobody can switch their own account off (or back on); the database ignores it.
+  const editingSelf = !!existing && existing.id === currentUser?.id;
+  const orgNameOf = (id: string) =>
+    organizations.find((o) => o.id === id)?.name ?? "this organization";
   const fieldId = useId();
+  const [submitting, setSubmitting] = useState(false);
+  // A new account's first organization must be one the caller administers:
+  // the server refuses any other.
+  const adminOrganizations = currentUser
+    ? organizations.filter((o) => isAdminIn(currentUser, o.id))
+    : organizations;
+  const firstOrgFor = () =>
+    adminOrganizations.find((o) => o.id === activeOrgId)?.id ??
+    (adminOrganizations.length === 1 ? adminOrganizations[0].id : "");
 
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
@@ -660,23 +710,84 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
     } else {
       setName(""); setEmail(""); setPhone(""); setAvatarUrl(""); setEmployeeId("");
       setDesignation(""); setJoiningDate(""); setStatus("active");
-      setPrimary(blankDraft("Employee"));
+      const orgId = firstOrgFor();
+      setPrimary({ ...blankDraft(orgId ? defaultRoleFor(orgId) : "Employee"), orgId });
       setAdditional([]);
     }
   }
+
+  // Forget the form on close, so the next Add User starts empty instead of
+  // showing the person just added.
+  const close = () => {
+    if (submitting) return;
+    setSeed(null);
+    onClose();
+  };
+
+  /** A message goes as soon as its field is edited, instead of lingering until the next submit. */
+  const clearErrors = (...keys: string[]) =>
+    setErrors((current) =>
+      keys.some((key) => key in current)
+        ? Object.fromEntries(Object.entries(current).filter(([key]) => !keys.includes(key)))
+        : current,
+    );
 
   const phoneError = validatePhone(phone);
   // Invalid characters show at once; length only once the field is left (FD-050).
   const showPhoneError =
     !!phoneError && (phoneTouched || /[^0-9+\-() ]/.test(phone) || !!errors.phone);
 
+  const toMembership = (draft: DraftMembership): Membership => ({
+    orgId: draft.orgId,
+    departmentId: draft.departmentId || undefined,
+    teamId: draft.teamId || undefined,
+    role: draft.role || defaultRoleFor(draft.orgId),
+    status: "active",
+    reportingManagerId: draft.reportingManagerId || undefined,
+  });
+
+  /**
+   * Add User for someone with no account: the server creates the login and the
+   * first membership and queues the welcome email with a link to choose a
+   * password. Additional organizations are added once the account exists.
+   */
+  const createAccount = async () => {
+    setSubmitting(true);
+    const trimmedEmail = email.trim();
+    const result = await createUser({
+      name: name.trim(),
+      email: trimmedEmail,
+      phone: phone.trim() || undefined,
+      avatarUrl: avatarUrl.trim() || undefined,
+      employeeId: employeeId.trim() || undefined,
+      designation: designation.trim(),
+      joiningDate: joiningDate || undefined,
+      primary: toMembership(primary),
+      additional: additional.map(toMembership),
+    });
+    setSubmitting(false);
+    if (!result.ok) {
+      const field = userErrorField(result.error);
+      if (field) setErrors({ [field]: result.error.message });
+      else toast.error(result.error.message);
+      return;
+    }
+    void refreshPeople();
+    toast.success(`Welcome email on its way to ${trimmedEmail}`);
+    setSeed(null);
+    onClose();
+  };
+
   const submit = () => {
+    if (submitting) return;
     const next: Record<string, string> = {};
     if (!name.trim()) next.name = "Full name is required";
     if (!email.trim()) next.email = "Email is required";
     else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) next.email = "Enter a valid email";
     else if (isEmailTaken(email, existing?.id)) next.email = "This email already has an account";
     if (phoneError) next.phone = phoneError;
+    if (avatarUrl.trim() && !/^https?:\/\/\S+$/i.test(avatarUrl.trim()))
+      next.avatarUrl = "Use a link that starts with https://";
     if (!designation.trim()) next.designation = "Designation is required";
     if (!primary.orgId) next.org = "Primary organization is required";
     if (!primary.departmentId) next.dept = "Department is required";
@@ -685,21 +796,43 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
       next.additional = "Each additional access needs an organization and department";
     if (new Set([primary.orgId, ...additional.map((a) => a.orgId)]).size !== additional.length + 1)
       next.additional = "An organization can only be assigned once";
+    if (isNew) {
+      // The server checks these too; saying so here saves a round trip.
+      const orgHasDepartments = departments.some(
+        (d) => d.orgId === primary.orgId && d.status === "active",
+      );
+      if (primary.orgId && !orgHasDepartments) {
+        next.dept = "This organization has no departments yet. Add one in Teams & Departments first.";
+      }
+      const manager = users.find((u) => u.id === primary.reportingManagerId);
+      const managerInOrg = manager?.memberships.some(
+        (m) => m.orgId === primary.orgId && m.status === "active",
+      );
+      if (manager && !managerInOrg) {
+        next.manager = "Choose a reporting manager from this organization";
+      }
+    }
     setErrors(next);
     setPhoneTouched(true);
     if (Object.keys(next).length > 0) return;
-    // Accounts are created on the server; the browser key cannot (and must not)
-    // mint logins. This used to add a row that vanished on refresh, with a toast
-    // saying login details had been sent — nothing was sent.
-    if (!existing) return;
+    if (!existing) {
+      void createAccount();
+      return;
+    }
 
+    // A membership keeps the status it has: this form has no control for it,
+    // and a deactivated person's memberships are off until Reactivate. It used
+    // to send "active" for every one, so saving a deactivated person's details
+    // switched their access back on.
+    const statusIn = (orgId: string): OrgStatus =>
+      existing.memberships.find((m) => m.orgId === orgId)?.status ?? "active";
     const memberships: Membership[] = [
       {
         orgId: primary.orgId,
         departmentId: primary.departmentId || undefined,
         teamId: primary.teamId || undefined,
         role: primary.role,
-        status: "active",
+        status: statusIn(primary.orgId),
         reportingManagerId: primary.reportingManagerId || undefined,
       },
       ...additional.map<Membership>((a) => ({
@@ -707,43 +840,67 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
         departmentId: a.departmentId || undefined,
         teamId: a.teamId || undefined,
         role: a.role,
-        status: "active",
+        status: statusIn(a.orgId),
         reportingManagerId: a.reportingManagerId || undefined,
       })),
     ];
 
-    // The Roles page refuses to demote the last Admin; this form did not.
-    const demotesLastAdmin = existing.memberships.some((before) => {
-      if (!isAdminIn(existing, before.orgId) || existing.status !== "active") return false;
-      const after = memberships.find((m) => m.orgId === before.orgId);
-      const stillAdmin = after && isAdminIn({ ...existing, memberships: [after] }, before.orgId);
-      return !stillAdmin && activeAdminCountIn(before.orgId) <= 1;
+    // Every organization keeps an active admin; the database refuses otherwise.
+    // Counted by the admin permission itself, not the role's name: a sole admin
+    // whose membership reads "Employee" is still the admin, and saving them
+    // unchanged would take it away (saving writes the permission the role shows).
+    const soleAdminOf = soleAdminOrgIds(existing);
+    if (status !== "active" && soleAdminOf.length) {
+      setErrors({
+        status: `${existing.name} is the last active admin of ${orgNameOf(soleAdminOf[0])}. Make someone else admin first.`,
+      });
+      return;
+    }
+    const demoted = soleAdminOf.find((orgId) => {
+      const after = memberships.find((m) => m.orgId === orgId);
+      return !after || !roleGrantsAdmin(orgId, after.role);
     });
-    if (demotesLastAdmin) {
-      setErrors({ role: "There must always be at least one active Admin. Make someone else Admin first." });
+    if (demoted) {
+      const before = existing.memberships.find((m) => m.orgId === demoted);
+      const after = memberships.find((m) => m.orgId === demoted);
+      const unchangedRole = before && after && before.role === after.role ? before.role : null;
+      const message = unchangedRole
+        ? `Their role in ${orgNameOf(demoted)} reads ${unchangedRole}, but they hold the admin permission there and are its only active admin, so saving would take it away. Choose an admin role for them, or make someone else admin first.`
+        : `There must always be at least one active admin in ${orgNameOf(demoted)}. Make someone else admin first.`;
+      // Next to the role it is about: the primary's, or the additional access list.
+      setErrors({ [demoted === primary.orgId ? "role" : "additional"]: message });
       return;
     }
 
-    updateUser(existing.id, {
+    const savedName = name.trim();
+    void updateUser(existing.id, {
       name: name.trim(),
       email: email.trim(),
-      phone: phone.trim() || undefined,
-      avatarUrl: avatarUrl.trim() || undefined,
-      employeeId: employeeId.trim() || undefined,
+      // An emptied field is sent as "" so it is cleared, not left as it was.
+      phone: phone.trim(),
+      avatarUrl: avatarUrl.trim(),
+      employeeId: employeeId.trim(),
       designation: designation.trim(),
-      joiningDate: joiningDate || undefined,
+      joiningDate,
       status,
       memberships,
+    }).then((saved) => {
+      // A refused save has already said why, and the list shows what is stored.
+      if (!saved) return;
+      logUserActivity(existing.id, "updated", "User details updated");
+      toast.success(`${savedName} updated`);
     });
-    logUserActivity(existing.id, "updated", "User details updated");
-    toast.success(`${name.trim()} updated`);
-    onClose();
+    close();
   };
 
-  const assignmentProps = { organizations, departments, teams, users, roleNames, defaultRoleFor };
+  const assignmentProps = {
+    // New people can only be given organizations the caller administers.
+    organizations: isNew ? adminOrganizations : organizations,
+    departments, teams, users, roleNames, defaultRoleFor,
+  };
 
   return (
-    <Sheet open={!!target} onOpenChange={(open) => !open && onClose()}>
+    <Sheet open={!!target} onOpenChange={(open) => !open && close()}>
       <SheetContent side="right" className="flex w-full flex-col gap-0 p-0 sm:max-w-xl">
         <SheetHeader className="border-b border-border px-6 py-4">
           <SheetTitle>{existing ? "Edit User" : "Add User"}</SheetTitle>
@@ -754,13 +911,9 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
 
         <div className="flex-1 space-y-6 overflow-y-auto px-6 py-5">
           {isNew && (
-            <div className="flex gap-2 rounded-xl border border-border bg-muted/40 px-3 py-2.5 text-xs text-muted-foreground">
-              <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              <p>
-                New accounts can't be created from the browser yet: the FlowDesk administrator sets up the
-                login and gives it a first organization on the server, which also sends the person a welcome
-                email. They then appear in this list, and you can assign their department, team and role here.
-              </p>
+            <div className="flex gap-2 rounded-xl border border-primary/15 bg-primary/5 px-3 py-2.5 text-xs text-foreground/80">
+              <Mail className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
+              <p>They'll get a welcome email from Flowdesk with a link to choose their password.</p>
             </div>
           )}
 
@@ -769,12 +922,25 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="space-y-1.5 sm:col-span-2">
                 <label htmlFor={`${fieldId}-name`} className={labelClass}>Full Name *</label>
-                <input id={`${fieldId}-name`} value={name} onChange={(e) => setName(e.target.value)} className={inputClass} placeholder="Full name" />
+                <input id={`${fieldId}-name`} value={name} onChange={(e) => { setName(e.target.value); clearErrors("name"); }} className={inputClass} placeholder="Full name" />
                 {errors.name && <p className="text-[11px] text-destructive">{errors.name}</p>}
               </div>
               <div className="space-y-1.5">
                 <label htmlFor={`${fieldId}-email`} className={labelClass}>Email *</label>
-                <input id={`${fieldId}-email`} type="email" value={email} onChange={(e) => setEmail(e.target.value)} className={inputClass} placeholder="name@company.com" />
+                <input
+                  id={`${fieldId}-email`}
+                  type="email"
+                  value={email}
+                  onChange={(e) => {
+                    setEmail(e.target.value);
+                    clearErrors("email");
+                  }}
+                  className={cn(inputClass, errors.email && "border-destructive")}
+                  placeholder="name@company.com"
+                  aria-invalid={!!errors.email || undefined}
+                  disabled={!!existing}
+                  title={existing ? "The sign-in email can't be changed here." : undefined}
+                />
                 {errors.email && <p className="text-[11px] text-destructive">{errors.email}</p>}
               </div>
               <div className="space-y-1.5">
@@ -786,20 +952,31 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
                   autoComplete="tel"
                   maxLength={PHONE_RULES.maxLength}
                   value={phone}
-                  onChange={(e) => setPhone(e.target.value)}
+                  onChange={(e) => { setPhone(e.target.value); clearErrors("phone"); }}
                   onBlur={() => setPhoneTouched(true)}
                   className={cn(inputClass, showPhoneError && "border-destructive")}
                   placeholder="+971 50 000 0000"
                   aria-invalid={showPhoneError || undefined}
                   aria-describedby={showPhoneError ? `${fieldId}-phone-error` : undefined}
                 />
-                {showPhoneError && (
-                  <p id={`${fieldId}-phone-error`} className="text-[11px] text-destructive">{phoneError}</p>
+                {(showPhoneError || errors.phone) && (
+                  <p id={`${fieldId}-phone-error`} className="text-[11px] text-destructive">
+                    {showPhoneError ? phoneError : errors.phone}
+                  </p>
                 )}
               </div>
               <div className="space-y-1.5 sm:col-span-2">
                 <label htmlFor={`${fieldId}-avatar`} className={labelClass}>Profile Photo URL</label>
-                <input id={`${fieldId}-avatar`} value={avatarUrl} onChange={(e) => setAvatarUrl(e.target.value)} className={inputClass} placeholder="https://" />
+                <input
+                  id={`${fieldId}-avatar`}
+                  value={avatarUrl}
+                  onChange={(e) => { setAvatarUrl(e.target.value); clearErrors("avatarUrl"); }}
+                  className={cn(inputClass, errors.avatarUrl && "border-destructive")}
+                  placeholder="https://"
+                />
+                {errors.avatarUrl && (
+                  <p className="text-[11px] text-destructive">{errors.avatarUrl}</p>
+                )}
               </div>
             </div>
           </section>
@@ -809,16 +986,22 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="space-y-1.5">
                 <label htmlFor={`${fieldId}-employee`} className={labelClass}>Employee ID</label>
-                <input id={`${fieldId}-employee`} value={employeeId} onChange={(e) => setEmployeeId(e.target.value)} className={inputClass} />
+                <input id={`${fieldId}-employee`} value={employeeId} onChange={(e) => { setEmployeeId(e.target.value); clearErrors("employeeId"); }} className={inputClass} />
+                {errors.employeeId && (
+                  <p className="text-[11px] text-destructive">{errors.employeeId}</p>
+                )}
               </div>
               <div className="space-y-1.5">
                 <label htmlFor={`${fieldId}-designation`} className={labelClass}>Designation *</label>
-                <input id={`${fieldId}-designation`} value={designation} onChange={(e) => setDesignation(e.target.value)} className={inputClass} />
+                <input id={`${fieldId}-designation`} value={designation} onChange={(e) => { setDesignation(e.target.value); clearErrors("designation"); }} className={inputClass} />
                 {errors.designation && <p className="text-[11px] text-destructive">{errors.designation}</p>}
               </div>
               <div className="space-y-1.5">
                 <label htmlFor={`${fieldId}-joining`} className={labelClass}>Joining Date</label>
-                <input id={`${fieldId}-joining`} type="date" value={joiningDate} onChange={(e) => setJoiningDate(e.target.value)} className={inputClass} />
+                <input id={`${fieldId}-joining`} type="date" value={joiningDate} onChange={(e) => { setJoiningDate(e.target.value); clearErrors("joiningDate"); }} className={inputClass} />
+                {errors.joiningDate && (
+                  <p className="text-[11px] text-destructive">{errors.joiningDate}</p>
+                )}
               </div>
             </div>
           </section>
@@ -829,13 +1012,13 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
                 moving it means removing their access to the old one. */}
             <AssignmentFields
               value={primary}
-              onChange={setPrimary}
+              onChange={(next) => { setPrimary(next); clearErrors("org", "dept", "manager", "role"); }}
               allowRole={false}
               lockOrganization={!!existing}
               {...assignmentProps}
             />
-            {(errors.org || errors.dept) && (
-              <p className="text-[11px] text-destructive">{errors.org ?? errors.dept}</p>
+            {(errors.org || errors.dept || errors.manager) && (
+              <p className="text-[11px] text-destructive">{errors.org ?? errors.dept ?? errors.manager}</p>
             )}
           </section>
 
@@ -865,7 +1048,10 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
                 </button>
                 <AssignmentFields
                   value={item}
-                  onChange={(next) => setAdditional((c) => c.map((v, i) => (i === index ? next : v)))}
+                  onChange={(next) => {
+                    setAdditional((c) => c.map((v, i) => (i === index ? next : v)));
+                    clearErrors("additional");
+                  }}
                   {...assignmentProps}
                 />
               </div>
@@ -881,7 +1067,7 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
                 <select
                   id={`${fieldId}-role`}
                   value={primary.role}
-                  onChange={(e) => setPrimary({ ...primary, role: e.target.value })}
+                  onChange={(e) => { setPrimary({ ...primary, role: e.target.value }); clearErrors("role"); }}
                   className={inputClass}
                   disabled={!primary.orgId}
                 >
@@ -891,33 +1077,52 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
                 </select>
                 {errors.role && <p className="text-[11px] text-destructive">{errors.role}</p>}
               </div>
-              <div className="space-y-1.5">
-                <label htmlFor={`${fieldId}-status`} className={labelClass}>Status</label>
-                <select
-                  id={`${fieldId}-status`}
-                  value={status}
-                  onChange={(e) => setStatus(e.target.value as OrgStatus)}
-                  className={inputClass}
-                >
-                  <option value="active">Active</option>
-                  <option value="inactive">Inactive</option>
-                </select>
-              </div>
+              {/* A new account starts active: it is created to be used. */}
+              {existing && (
+                <div className="space-y-1.5">
+                  <label htmlFor={`${fieldId}-status`} className={labelClass}>Status</label>
+                  <select
+                    id={`${fieldId}-status`}
+                    value={status}
+                    onChange={(e) => {
+                      setStatus(e.target.value as OrgStatus);
+                      clearErrors("status");
+                    }}
+                    className={inputClass}
+                    disabled={editingSelf}
+                    aria-describedby={editingSelf ? `${fieldId}-status-note` : undefined}
+                  >
+                    <option value="active">Active</option>
+                    <option value="inactive">Inactive</option>
+                  </select>
+                  {editingSelf && (
+                    <p id={`${fieldId}-status-note`} className="text-[11px] text-muted-foreground">
+                      You can't change your own account status.
+                    </p>
+                  )}
+                  {errors.status && <p className="text-[11px] text-destructive">{errors.status}</p>}
+                </div>
+              )}
             </div>
           </section>
         </div>
 
         <div className="flex items-center justify-end gap-2 border-t border-border px-6 py-4">
-          <button onClick={onClose} className="rounded-lg border border-border px-3 py-2 text-xs hover:bg-accent">
+          <button
+            onClick={close}
+            disabled={submitting}
+            className="rounded-lg border border-border px-3 py-2 text-xs hover:bg-accent disabled:opacity-50"
+          >
             Cancel
           </button>
           <button
             onClick={submit}
-            disabled={isNew}
-            title={isNew ? "Accounts are created on the server — see the note above." : undefined}
-            className="rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+            disabled={submitting}
+            aria-busy={submitting || undefined}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-70"
           >
-            {existing ? "Save Changes" : "Add User"}
+            {submitting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            {existing ? "Save Changes" : submitting ? "Adding…" : "Add User"}
           </button>
         </div>
       </SheetContent>
@@ -939,10 +1144,24 @@ function UserDetail({
 }) {
   const {
     organizations, departments, teams, users, userActivity, canManageUsers,
-    setUserStatus, removeMembership, upsertMembership, logUserActivity,
+    setUserStatus, removeMembership, upsertMembership, logUserActivity, resendWelcome, currentUser,
+    soleAdminOrgIds,
   } = useOrganizations();
   const { tasks } = useWorkspace();
   const [tab, setTab] = useState<Tab>("overview");
+  const [resending, setResending] = useState(false);
+
+  // A new link for someone who never signed in — the first one expired, or the
+  // email went astray. The server refuses anyone who already has (they use
+  // Forgot password) and says so; that message is what the toast shows.
+  const resend = async () => {
+    if (resending) return;
+    setResending(true);
+    const result = await resendWelcome(user.id);
+    setResending(false);
+    if (result.ok) toast.success(`A new welcome email is on its way to ${user.email}`);
+    else toast.error(result.error.message);
+  };
   const [assignmentOrg, setAssignmentOrg] = useState<string | "new" | null>(null);
   const [removeOrg, setRemoveOrg] = useState<string | null>(null);
 
@@ -994,19 +1213,36 @@ function UserDetail({
           </div>
         </div>
         {canManageUsers && (
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            {user.id !== currentUser?.id && (
+              <button
+                onClick={() => void resend()}
+                disabled={resending}
+                aria-busy={resending || undefined}
+                title="Send a new link to choose a password. For people who have not signed in yet."
+                className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs hover:bg-accent disabled:opacity-60"
+              >
+                {resending ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Send className="h-3.5 w-3.5" />
+                )}
+                {resending ? "Sending…" : "Resend welcome email"}
+              </button>
+            )}
             <button onClick={onEdit} className="rounded-lg border border-border px-3 py-2 text-xs hover:bg-accent">
               Edit User
             </button>
-            {user.status === "active" ? (
+            {user.id === currentUser?.id ? null : user.status === "active" ? (
               <button onClick={onDeactivate} className="rounded-lg border border-border px-3 py-2 text-xs hover:bg-accent">
                 Deactivate
               </button>
             ) : (
               <button
                 onClick={() => {
-                  setUserStatus(user.id, "active");
-                  toast.success(`${user.name} activated`);
+                  void setUserStatus(user.id, "active").then((saved) => {
+                    if (saved) toast.success(`${user.name} activated`);
+                  });
                 }}
                 className="rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground hover:bg-primary/90"
               >
@@ -1195,15 +1431,17 @@ function UserDetail({
         orgId={assignmentOrg}
         onClose={() => setAssignmentOrg(null)}
         onSave={(membership, isNew) => {
-          upsertMembership(user.id, membership);
-          logUserActivity(
-            user.id,
-            isNew ? "organization-added" : "department-changed",
-            isNew
-              ? `Added to ${orgName(membership.orgId)} as ${membership.role}`
-              : `Assignment updated for ${orgName(membership.orgId)}`,
-          );
-          toast.success("Organization access saved");
+          void upsertMembership(user.id, membership).then((saved) => {
+            if (!saved) return;
+            logUserActivity(
+              user.id,
+              isNew ? "organization-added" : "department-changed",
+              isNew
+                ? `Added to ${orgName(membership.orgId)} as ${membership.role}`
+                : `Assignment updated for ${orgName(membership.orgId)}`,
+            );
+            toast.success("Organization access saved");
+          });
           setAssignmentOrg(null);
         }}
       />
@@ -1221,16 +1459,21 @@ function UserDetail({
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
               onClick={() => {
-                if (removeOrg) {
-                  removeMembership(user.id, removeOrg);
-                  logUserActivity(
-                    user.id,
-                    "organization-removed",
-                    `Access removed from ${orgName(removeOrg)}`,
-                  );
-                  toast.success("Organization access removed");
-                }
+                const orgId = removeOrg;
                 setRemoveOrg(null);
+                if (!orgId) return;
+                // Without a membership there they no longer count as its admin.
+                if (soleAdminOrgIds(user).includes(orgId)) {
+                  toast.error(
+                    `There must always be at least one active admin in ${orgName(orgId)}. Make someone else admin first.`,
+                  );
+                  return;
+                }
+                void removeMembership(user.id, orgId).then((saved) => {
+                  if (!saved) return;
+                  logUserActivity(user.id, "organization-removed", `Access removed from ${orgName(orgId)}`);
+                  toast.success("Organization access removed");
+                });
               }}
             >
               Remove Access
@@ -1250,7 +1493,8 @@ function AssignmentDialog({
   onClose: () => void;
   onSave: (membership: Membership, isNew: boolean) => void;
 }) {
-  const { organizations, departments, teams, users, isAdminIn, activeAdminCountIn } = useOrganizations();
+  const { organizations, departments, teams, users, soleAdminOrgIds, roleGrantsAdmin } =
+    useOrganizations();
   const { roleNames, defaultRoleFor } = useRoleChoices();
   const fieldId = useId();
   const existing = orgId && orgId !== "new" ? user.memberships.find((m) => m.orgId === orgId) : null;
@@ -1387,17 +1631,23 @@ function AssignmentDialog({
                 departmentId: draft.departmentId,
                 teamId: draft.teamId || undefined,
                 role,
-                status: "active",
+                // An organization switched off apart from Deactivate stays off: an edit
+                // must not quietly turn it back on (or make Activate restore it).
+                status: existing?.status ?? "active",
                 reportingManagerId: draft.reportingManagerId || undefined,
               };
+              // By the admin permission they hold, not the role's name (the same
+              // rule the database applies when it saves this).
               if (
                 existing &&
-                user.status === "active" &&
-                isAdminIn(user, draft.orgId) &&
-                !isAdminIn({ ...user, memberships: [next] }, draft.orgId) &&
-                activeAdminCountIn(draft.orgId) <= 1
+                soleAdminOrgIds(user).includes(draft.orgId) &&
+                !roleGrantsAdmin(draft.orgId, role)
               ) {
-                toast.error("There must always be at least one active Admin.");
+                const orgLabel =
+                  organizations.find((o) => o.id === draft.orgId)?.name ?? "this organization";
+                toast.error(
+                  `There must always be at least one active admin in ${orgLabel}. Make someone else admin first.`,
+                );
                 return;
               }
               onSave(next, !existing);
@@ -1415,17 +1665,17 @@ function AssignmentDialog({
 /* ------------------------------ deactivate flow ----------------------------- */
 
 function DeactivateDialog({ user, onClose }: { user: OrgUser | null; onClose: () => void }) {
-  const { users, setUserStatus, isAdminIn, activeAdminCountIn } = useOrganizations();
+  const { users, organizations, setUserStatus, soleAdminOrgIds } = useOrganizations();
   const { tasks, updateTask } = useWorkspace();
   const [reassignTo, setReassignTo] = useState("");
 
   // By id: matching on the display name missed people and caught namesakes.
   const openTasks = user ? tasks.filter((t) => t.assigneeId === user.id && t.status !== "done") : [];
   const managedProjects = Array.from(new Set(openTasks.map((t) => t.project)));
-  const isLastAdmin =
-    !!user &&
-    user.status === "active" &&
-    user.memberships.some((m) => isAdminIn(user, m.orgId) && activeAdminCountIn(m.orgId) <= 1);
+  // Counted by the admin permission, as the database does when it refuses this.
+  const soleAdminOf = user ? soleAdminOrgIds(user) : [];
+  const isLastAdmin = soleAdminOf.length > 0;
+  const soleOrgName = organizations.find((o) => o.id === soleAdminOf[0])?.name ?? "an organization";
 
   return (
     <AlertDialog open={!!user} onOpenChange={(open) => !open && onClose()}>
@@ -1434,8 +1684,8 @@ function DeactivateDialog({ user, onClose }: { user: OrgUser | null; onClose: ()
           <AlertDialogTitle>Deactivate {user?.name}?</AlertDialogTitle>
           <AlertDialogDescription>
             {isLastAdmin
-              ? "This is the only active Admin. Give another employee the Admin role before deactivating this account."
-              : "Login access will be disabled. Tasks, comments, projects, and activity history remain unchanged."}
+              ? `${user?.name} is the last active admin of ${soleOrgName}. Make someone else admin first.`
+              : "They're signed out and lose access to every organization until they're activated again. Tasks, comments, projects, and activity history remain unchanged."}
           </AlertDialogDescription>
         </AlertDialogHeader>
 
@@ -1471,15 +1721,22 @@ function DeactivateDialog({ user, onClose }: { user: OrgUser | null; onClose: ()
             onClick={() => {
               if (!user || isLastAdmin) return;
               const target = users.find((u) => u.id === reassignTo);
-              if (target && openTasks.length) {
-                // Was an `assignee` display object, which updateTask never saved.
-                openTasks.forEach((t) => void updateTask(t.id, { assigneeId: target.id }));
-                toast.success(`${plural(openTasks.length, "task")} reassigned to ${target.name}`);
-              }
-              setUserStatus(user.id, "inactive");
-              toast.success(`${user.name} deactivated`);
+              const tasksToMove = openTasks;
               setReassignTo("");
               onClose();
+              // Tasks move only once the account really is switched off: the
+              // database can still refuse (the last active admin of an organization).
+              void setUserStatus(user.id, "inactive").then((saved) => {
+                if (!saved) return;
+                toast.success(`${user.name} deactivated`);
+                if (target && tasksToMove.length) {
+                  // Was an `assignee` display object, which updateTask never saved.
+                  tasksToMove.forEach((t) => void updateTask(t.id, { assigneeId: target.id }));
+                  toast.success(
+                    `${plural(tasksToMove.length, "task")} reassigned to ${target.name}`,
+                  );
+                }
+              });
             }}
           >
             Deactivate

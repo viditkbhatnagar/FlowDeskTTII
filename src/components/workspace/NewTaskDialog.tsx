@@ -14,6 +14,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { supabase } from "@/integrations/supabase/client";
 import { useWorkspace, type Priority, type Status, type WorkspaceTask } from "@/lib/workspace-data";
+import { useOrganizations } from "@/lib/organizations-data";
 import { useTaskSettings, type TagConfig, type TaskStatusType } from "@/lib/task-settings-data";
 import { FILE_RULES, formatBytes, personRef, validateFile, type PersonRef } from "@/lib/task-api";
 import { TASK_LIMITS, normalizeTags, parseTags, validateTaskFields } from "@/lib/task-validation";
@@ -63,6 +64,8 @@ interface ProjectOption {
   key: string;
   id?: string;
   name: string;
+  /** The project's organization: the task is filed there, so its tags come from there. */
+  orgId?: string;
 }
 
 const newRecurrenceDraft = (): RecurrenceDraft => ({
@@ -131,10 +134,10 @@ function useSignedInUserId(): string | null {
  * belongs to. The picker listed five hardcoded demo projects before (FD-001).
  */
 function useProjectOptions(tasks: WorkspaceTask[], projectName?: string): ProjectOption[] {
-  const [loaded, setLoaded] = useState<{ id: string; name: string }[]>([]);
+  const [loaded, setLoaded] = useState<{ id: string; name: string; organization_id: string }[]>([]);
   useEffect(() => {
     let active = true;
-    void supabase.from("work_projects").select("id, name").is("archived_at", null)
+    void supabase.from("work_projects").select("id, name, organization_id").is("archived_at", null)
       .not("status", "in", "(cancelled,archived)").order("name")
       .then(({ data, error }) => {
         if (!active) return;
@@ -146,10 +149,22 @@ function useProjectOptions(tasks: WorkspaceTask[], projectName?: string): Projec
 
   return useMemo(() => {
     const byKey = new Map<string, ProjectOption>();
-    for (const project of loaded) byKey.set(project.id, { key: project.id, id: project.id, name: project.name });
+    for (const project of loaded) {
+      byKey.set(project.id, {
+        key: project.id,
+        id: project.id,
+        name: project.name,
+        orgId: project.organization_id,
+      });
+    }
     for (const task of tasks) {
       if (task.projectId && !byKey.has(task.projectId)) {
-        byKey.set(task.projectId, { key: task.projectId, id: task.projectId, name: task.project });
+        byKey.set(task.projectId, {
+          key: task.projectId,
+          id: task.projectId,
+          name: task.project,
+          orgId: task.organizationId,
+        });
       }
     }
     const list = [...byKey.values()].sort((a, b) => a.name.localeCompare(b.name));
@@ -185,7 +200,8 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
   const uid = useId();
   const fieldId = (name: string) => `${uid}-${name}`;
   const { addTask, tasks, people } = useWorkspace();
-  const { activeTaskStatuses, priorities: priorityOptions, activeTags, defaultTaskStatus, statusLabel } = useTaskSettings();
+  const { priorities: priorityOptions, tagsFor, statusesFor, statusLabelFor } = useTaskSettings();
+  const { currentUser, accessibleOrganizations } = useOrganizations();
   const signedInUserId = useSignedInUserId();
   const projectOptions = useProjectOptions(tasks, projectName);
 
@@ -220,6 +236,16 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
   const selectedProjectKey = fixedProject?.key ?? projectKey;
   const selectedProject = projectOptions.find((option) => option.key === selectedProjectKey);
 
+  // The organization the task will be filed in, as addTask decides it: its
+  // project's, else the creator's primary. Only that organization's tags are
+  // offered; with every organization's, someone in two saw each tag twice.
+  const primaryOrgId =
+    currentUser?.primaryOrgId && accessibleOrganizations.some((o) => o.id === currentUser.primaryOrgId)
+      ? currentUser.primaryOrgId
+      : accessibleOrganizations[0]?.id;
+  const taskOrgId = (selectedProject?.id ? selectedProject.orgId : undefined) ?? primaryOrgId;
+  const tagOptions = tagsFor(taskOrgId);
+
   // Real users. This listed five demo people and defaulted to one of them, and the
   // pick was then ignored: every task was saved against its creator (FD-001).
   const assigneeOptions = useMemo<PersonRef[]>(() => {
@@ -228,15 +254,22 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
   }, [people, signedInUserId]);
   const effectiveAssigneeId = assigneeId || signedInUserId || "";
 
-  // Names come from Settings via statusLabel, never hardcoded (FD-018).
+  // Names come from Settings, never hardcoded (FD-018): the statuses, names and
+  // default of the organization the task is filed in, not the settings page's.
+  const orgStatuses = useMemo(() => statusesFor(taskOrgId), [statusesFor, taskOrgId]);
   const statusOptions = useMemo(() => {
     const values: Status[] = [];
-    for (const option of activeTaskStatuses) {
+    for (const option of orgStatuses) {
+      if (option.status !== "active") continue;
       const value = option.key ?? statusForType[option.type];
       if (value && !values.includes(value)) values.push(value);
     }
-    return (values.length ? values : builtInStatuses).map((value) => ({ value, label: statusLabel(value) }));
-  }, [activeTaskStatuses, statusLabel]);
+    return (values.length ? values : builtInStatuses).map((value) => ({
+      value,
+      label: statusLabelFor(value, taskOrgId),
+    }));
+  }, [orgStatuses, statusLabelFor, taskOrgId]);
+  const defaultTaskStatus = orgStatuses.find((option) => option.isDefault);
   const defaultStatus = defaultTaskStatus ? (defaultTaskStatus.key ?? statusForType[defaultTaskStatus.type]) : undefined;
   const preferredStatus = statusChoice ?? defaultStatus ?? "todo";
   const status = statusOptions.some((option) => option.value === preferredStatus)
@@ -399,7 +432,7 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
           </Field>
           <Field label="Tags" labelId={fieldId("tags-label")} error={fieldErrors.tags} errorId={fieldId("tags-error")} className="sm:col-span-2">
             <TagPicker
-              id={fieldId("tags")} options={activeTags} selected={tags} onChange={setTags}
+              id={fieldId("tags")} options={tagOptions} selected={tags} onChange={setTags}
               draft={tagDraft} onDraftChange={setTagDraft} error={fieldErrors.tags}
             />
           </Field>

@@ -11,7 +11,9 @@ import { fullTime, timeAgo, useTaskResource } from "./utils";
  * days ago" for a task made minutes earlier (FD-005, FD-033).
  */
 export function TaskActivity({ task, refreshKey }: { task: WorkspaceTask; refreshKey: string }) {
-  const { statusLabel } = useTaskSettings();
+  // In the task's own organization's words.
+  const { statusLabelFor } = useTaskSettings();
+  const statusLabel = (value: string) => statusLabelFor(value, task.organizationId);
   // Reloaded after any change made here (status, edit, comment, file), so a
   // status change from this panel shows up in its own history (FD-033).
   const activity = useTaskResource(() => listTaskActivity(task.id), `${task.id}:${refreshKey}`);

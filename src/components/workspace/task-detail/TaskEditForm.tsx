@@ -93,7 +93,9 @@ function changesFrom(task: WorkspaceTask, draft: Draft): Partial<WorkspaceTask> 
  */
 export function TaskEditForm({ task, onDone }: { task: WorkspaceTask; onDone: () => void }) {
   const { updateTask, people } = useWorkspace();
-  const { priorities, activeTags } = useTaskSettings();
+  const { priorities, tagsFor } = useTaskSettings();
+  // The task's own organization's tags (every organization has its own).
+  const tagOptions = tagsFor(task.organizationId);
   const [draft, setDraft] = useState<Draft>(() => draftFrom(task));
   const [submitted, setSubmitted] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -261,7 +263,7 @@ export function TaskEditForm({ task, onDone }: { task: WorkspaceTask; onDone: ()
             aria-describedby={errors.tags ? `${ids.tags}-error` : `${ids.tags}-hint`}
           />
           <datalist id={ids.tagOptions}>
-            {activeTags.map((tag) => (
+            {tagOptions.map((tag) => (
               <option key={tag.id} value={tag.name} />
             ))}
           </datalist>

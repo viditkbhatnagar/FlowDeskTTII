@@ -86,8 +86,77 @@ describe("account_access", () => {
     expect(email.subject).toBe("Your Flowdesk account is ready");
     expect(email.html).toContain(`${APP}/auth?mode=reset&amp;email=maya%40upcarrera.test`);
     expect(email.html).toContain(`href="${APP}/auth"`);
+    expect(email.html).not.toContain("/welcome");
+    expect(email.html).not.toContain("works once");
     expect(email.html.toLowerCase()).not.toContain("password:");
     expect(email.html).toContain("Hi Maya,");
+  });
+
+  describe("with a setup token from admin_create_user", () => {
+    const TOKEN = "0123456789abcdef".repeat(4);
+    const withToken = (setupToken: unknown) => ({
+      ...row,
+      payload: { fullName: "Maya Chen", setupToken },
+    });
+
+    test("links the one-time /welcome page instead of the reset flow", () => {
+      const email = sent(compose(withToken(TOKEN), baseSnapshot()));
+      expect(email.html).toContain(`href="${APP}/welcome#token=${TOKEN}"`);
+      expect(email.html).not.toContain("mode=reset");
+      expect(email.html).toContain("The link works once and expires in 7 days.");
+      expect(email.html).toContain(`href="${APP}/auth"`);
+      expect(email.to).toBe("maya@upcarrera.test");
+    });
+
+    test("the token rides in the fragment, never the query, so no server or Referer sees it", () => {
+      const email = sent(compose(withToken(TOKEN), baseSnapshot()));
+      const href = /href="([^"]*\/welcome[^"]*)"/.exec(email.html)?.[1] ?? "";
+      const url = new URL(href);
+      expect(url.pathname).toBe("/welcome");
+      expect(url.search).toBe("");
+      expect(url.hash).toBe(`#token=${TOKEN}`);
+      expect(email.html).not.toContain("?token=");
+    });
+
+    test("the token appears only in the link: not in the subject, the name or anywhere else", () => {
+      const email = sent(compose(withToken(TOKEN), baseSnapshot()));
+      expect(email.subject).toBe("Your Flowdesk account is ready");
+      expect(email.subject).not.toContain(TOKEN);
+      expect(email.toName).not.toContain(TOKEN);
+      expect(email.html.split(TOKEN).length - 1).toBe(1);
+    });
+
+    test.each([
+      ["too short", TOKEN.slice(1)],
+      ["too long", `${TOKEN}0`],
+      ["upper case", TOKEN.toUpperCase()],
+      ["not hex", `${TOKEN.slice(1)}g`],
+      ["padded", ` ${TOKEN}`],
+      ["a path", `../${TOKEN.slice(3)}`],
+      ["a query break", `${TOKEN.slice(4)}&x=1`],
+      ["empty", ""],
+      ["a number", 12345],
+      ["null", null],
+      ["an object", { token: TOKEN }],
+    ])("a malformed token (%s) falls back to the reset flow", (_: string, bad: unknown) => {
+      const email = sent(compose(withToken(bad), baseSnapshot()));
+      expect(email.html).toContain(`${APP}/auth?mode=reset&amp;email=maya%40upcarrera.test`);
+      expect(email.html).not.toContain("/welcome");
+      expect(email.html).not.toContain("works once");
+    });
+
+    test("is still withdrawn when the person no longer belongs to any organization", () => {
+      expect(reason(compose(withToken(TOKEN), baseSnapshot({ memberships: [] })))).toBe(
+        "recipient no longer belongs to any organization",
+      );
+    });
+
+    test("neither variant mentions a 6-digit code", () => {
+      for (const r of [row, withToken(TOKEN)]) {
+        const { html } = sent(compose(r, baseSnapshot()));
+        expect(html).not.toMatch(/6-digit|verification code/i);
+      }
+    });
   });
 
   test("cannot be switched off by preferences or organization settings", () => {

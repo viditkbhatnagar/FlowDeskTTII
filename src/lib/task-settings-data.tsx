@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useOrganizations } from "@/lib/organizations-data";
 import {
   createCategoryRow,
   createTagRow,
@@ -24,6 +25,8 @@ export interface TaskStatusConfig {
   /** links to the internal task status key when it maps to a built-in column */
   key?: "todo" | "progress" | "review" | "done";
   usedByHistory?: boolean;
+  /** The organization it belongs to: every organization has its own five. */
+  orgId?: string;
 }
 
 export interface PriorityConfig {
@@ -52,6 +55,8 @@ export interface TagConfig {
   id: string;
   name: string;
   status: ConfigStatus;
+  /** The organization it belongs to: every organization has its own tags. */
+  orgId?: string;
 }
 
 const seedTaskStatuses: TaskStatusConfig[] = [
@@ -168,6 +173,45 @@ const seedTags: TagConfig[] = [
 
 const normalize = (value: string) => value.trim().toLowerCase();
 
+/**
+ * The one organization Task & Project Settings, and the status and tag pickers,
+ * are scoped to: the active organization, else the caller's primary, else the
+ * first they can access. null until the organizations have loaded.
+ *
+ * Statuses, categories and tags are rows per organization, so someone in two
+ * organizations used to see every tag and status twice, and a default or
+ * completed-state change went to whichever organization happened to be first.
+ */
+function resolveSettingsOrgId(input: {
+  activeOrgId: string | "all";
+  primaryOrgId?: string;
+  accessibleOrgIds: readonly string[];
+}): string | null {
+  if (input.activeOrgId !== "all") return input.activeOrgId;
+  if (input.primaryOrgId && input.accessibleOrgIds.includes(input.primaryOrgId)) {
+    return input.primaryOrgId;
+  }
+  return input.accessibleOrgIds[0] ?? null;
+}
+
+/**
+ * The organization to show when none could be resolved (the organizations
+ * failed to load): the first one the loaded rows belong to, so one
+ * organization's rows are shown rather than everyone's mixed together.
+ */
+function firstOrgIdIn(...lists: readonly (readonly { orgId?: string }[])[]): string | null {
+  for (const list of lists) {
+    const found = list.find((row) => row.orgId)?.orgId;
+    if (found) return found;
+  }
+  return null;
+}
+
+/** Rows of one organization only. */
+function rowsOfOrg<T extends { orgId?: string }>(rows: readonly T[], orgId: string | null): T[] {
+  return orgId ? rows.filter((row) => row.orgId === orgId) : [];
+}
+
 /** Database value of a task status (the work_task_status enum). */
 export type TaskStatusValue = "todo" | "progress" | "review" | "done" | "cancelled";
 
@@ -187,6 +231,14 @@ const fallbackLabel: Record<TaskStatusValue, string> = {
   cancelled: "Cancelled",
 };
 
+const byOrder = (a: TaskStatusConfig, b: TaskStatusConfig) => a.order - b.order;
+
+/** The configured name for a status among one organization's statuses (in order). */
+function labelAmong(ordered: readonly TaskStatusConfig[], value: string): string {
+  const type = typeForValue[value as TaskStatusValue];
+  return ordered.find((s) => s.type === type)?.name ?? fallbackLabel[value as TaskStatusValue] ?? value;
+}
+
 interface TaskSettingsContextValue {
   /**
    * The configured name for a status, e.g. statusLabel("review").
@@ -194,6 +246,18 @@ interface TaskSettingsContextValue {
    * "Under Review" and "Awaiting review" on three different screens (FD-018).
    */
   statusLabel: (value: string) => string;
+  /**
+   * The name one organization gives a status. A task shows its own
+   * organization's names (task.organizationId); statusLabel uses the settings
+   * organization, which for someone in two organizations is often the other one.
+   */
+  statusLabelFor: (value: string, orgId?: string | null) => string;
+  /**
+   * Every status of one organization (a task's), active or not, in its
+   * configured order; defaults to the settings organization. The task drawer and
+   * New Task offer the task's organization's active ones, and its default.
+   */
+  statusesFor: (orgId?: string | null) => TaskStatusConfig[];
   taskStatuses: TaskStatusConfig[];
   activeTaskStatuses: TaskStatusConfig[];
   defaultTaskStatus: TaskStatusConfig | undefined;
@@ -216,8 +280,13 @@ interface TaskSettingsContextValue {
   setCategoryStatus: (id: string, status: ConfigStatus) => void;
   isCategoryNameTaken: (name: string, exceptId?: string) => boolean;
 
+  /** The organization this screen's statuses, categories and tags belong to. */
+  settingsOrgId: string | null;
+
   tags: TagConfig[];
   activeTags: TagConfig[];
+  /** Active tags of one organization (a task's), defaulting to the settings organization. */
+  tagsFor: (orgId?: string | null) => TagConfig[];
   addTag: (name: string) => void;
   renameTag: (id: string, name: string) => void;
   setTagStatus: (id: string, status: ConfigStatus) => void;
@@ -229,11 +298,26 @@ const TaskSettingsContext = createContext<TaskSettingsContextValue | null>(null)
 export function TaskSettingsProvider({ children }: { children: ReactNode }) {
   // Loaded from the database. These were hardcoded arrays, so every status
   // rename, category and tag an admin created was discarded on refresh.
-  const [taskStatuses, setTaskStatuses] = useState<TaskStatusConfig[]>([]);
-  const [projectCategories, setProjectCategories] = useState<ProjectCategory[]>([]);
-  const [tags, setTags] = useState<TagConfig[]>([]);
-  const [orgId, setOrgId] = useState<string | null>(null);
+  // Every organization's rows are kept (a project in another organization
+  // still needs its own categories); the screens see one organization's.
+  const [allStatuses, setTaskStatuses] = useState<TaskStatusConfig[]>([]);
+  const [allCategories, setProjectCategories] = useState<ProjectCategory[]>([]);
+  const [allTags, setTags] = useState<TagConfig[]>([]);
 
+  const { activeOrgId, accessibleOrganizations, currentUser } = useOrganizations();
+  const accessibleKey = accessibleOrganizations.map((organization) => organization.id).join(",");
+  const requestedOrgId = useMemo(
+    () =>
+      resolveSettingsOrgId({
+        activeOrgId,
+        primaryOrgId: currentUser?.primaryOrgId,
+        accessibleOrgIds: accessibleKey ? accessibleKey.split(",") : [],
+      }),
+    [activeOrgId, currentUser?.primaryOrgId, accessibleKey],
+  );
+
+  // Re-read when the organization changes, so switching shows that
+  // organization's current settings, including rows added by someone else.
   useEffect(() => {
     let active = true;
     void loadSettings().then((loaded) => {
@@ -241,6 +325,7 @@ export function TaskSettingsProvider({ children }: { children: ReactNode }) {
       setTaskStatuses(
         loaded.statuses.map((row) => ({
           id: row.id,
+          orgId: row.orgId,
           // The built-in column this status maps to. Missing before, so
           // defaultTaskStatus?.key was always undefined once settings loaded and
           // "Set as default" had no effect on the New Task form.
@@ -267,11 +352,29 @@ export function TaskSettingsProvider({ children }: { children: ReactNode }) {
           status: row.active ? "active" : "inactive",
         })),
       );
-      setTags(loaded.tags.map((row) => ({ id: row.id, name: row.name, status: row.active ? "active" : "inactive" })));
-      setOrgId(loaded.categories[0]?.orgId ?? loaded.tags[0]?.orgId ?? null);
+      setTags(
+        loaded.tags.map((row) => ({
+          id: row.id,
+          orgId: row.orgId,
+          name: row.name,
+          status: row.active ? "active" : "inactive",
+        })),
+      );
     });
     return () => { active = false; };
-  }, []);
+  }, [requestedOrgId]);
+
+  const categoryRows = useMemo(
+    () => allCategories.map((category) => ({ orgId: category.orgIds[0] })),
+    [allCategories],
+  );
+  const orgId = requestedOrgId ?? firstOrgIdIn(allStatuses, allTags, categoryRows);
+  const taskStatuses = useMemo(() => rowsOfOrg(allStatuses, orgId), [allStatuses, orgId]);
+  const tags = useMemo(() => rowsOfOrg(allTags, orgId), [allTags, orgId]);
+  const projectCategories = useMemo(
+    () => (orgId ? allCategories.filter((category) => category.orgIds.includes(orgId)) : []),
+    [allCategories, orgId],
+  );
 
   const resequence = useCallback(
     (list: TaskStatusConfig[]) => list.map((item, index) => ({ ...item, order: index + 1 })),
@@ -279,13 +382,14 @@ export function TaskSettingsProvider({ children }: { children: ReactNode }) {
   );
 
   const value = useMemo<TaskSettingsContextValue>(() => {
-    const ordered = [...taskStatuses].sort((a, b) => a.order - b.order);
-    const statusLabel = (value: string) => {
-      const type = typeForValue[value as TaskStatusValue];
-      return ordered.find((s) => s.type === type)?.name ?? fallbackLabel[value as TaskStatusValue] ?? value;
-    };
+    const ordered = [...taskStatuses].sort(byOrder);
+    const statusesFor = (forOrgId?: string | null) =>
+      !forOrgId || forOrgId === orgId ? ordered : rowsOfOrg(allStatuses, forOrgId).sort(byOrder);
+    const statusLabel = (value: string) => labelAmong(ordered, value);
     return {
       statusLabel,
+      statusLabelFor: (value, forOrgId) => labelAmong(statusesFor(forOrgId), value),
+      statusesFor,
       taskStatuses: ordered,
       activeTaskStatuses: ordered.filter((s) => s.status === "active"),
       defaultTaskStatus: ordered.find((s) => s.isDefault),
@@ -302,10 +406,11 @@ export function TaskSettingsProvider({ children }: { children: ReactNode }) {
           ...current,
           {
             id: `TS-${current.length + 1}-${Date.now()}`,
+            orgId: orgId ?? undefined,
             name: name.trim(),
             type,
             status,
-            order: current.length + 1,
+            order: ordered.length + 1,
             isDefault: false,
             isCompletedState: false,
           },
@@ -320,15 +425,18 @@ export function TaskSettingsProvider({ children }: { children: ReactNode }) {
       },
       reorderTaskStatuses: (fromId, toId) =>
         setTaskStatuses((current) => {
-          const list = [...current].sort((a, b) => a.order - b.order);
+          // Only this organization's statuses are renumbered.
+          const list = rowsOfOrg(current, orgId).sort((a, b) => a.order - b.order);
           const from = list.findIndex((s) => s.id === fromId);
           const to = list.findIndex((s) => s.id === toId);
           if (from < 0 || to < 0 || from === to) return current;
           const [moved] = list.splice(from, 1);
           list.splice(to, 0, moved);
-          const next = resequence(list);
-          for (const item of next) void updateStatusSettingRow(item.id, { order: item.order });
-          return next;
+          const next = new Map(resequence(list).map((item) => [item.id, item]));
+          for (const item of next.values()) {
+            void updateStatusSettingRow(item.id, { order: item.order });
+          }
+          return current.map((item) => next.get(item.id) ?? item);
         }),
       setTaskStatusActive: (id, status) => {
         const target = taskStatuses.find((s) => s.id === id);
@@ -337,19 +445,24 @@ export function TaskSettingsProvider({ children }: { children: ReactNode }) {
         setTaskStatuses((current) => current.map((s) => (s.id === id ? { ...s, status } : s)));
         void updateStatusSettingRow(id, { active: status === "active" });
       },
+      // Exclusive within the organization: another organization keeps its own.
       setDefaultTaskStatus: (id) => {
         setTaskStatuses((current) =>
-          current.map((s) => ({ ...s, isDefault: s.id === id, status: s.id === id ? "active" : s.status })),
+          current.map((s) =>
+            s.orgId !== orgId
+              ? s
+              : { ...s, isDefault: s.id === id, status: s.id === id ? "active" : s.status },
+          ),
         );
         if (orgId) void setExclusiveStatusFlag(orgId, id, "is_default");
       },
       setCompletedTaskStatus: (id) => {
         setTaskStatuses((current) =>
-          current.map((s) => ({
-            ...s,
-            isCompletedState: s.id === id,
-            status: s.id === id ? "active" : s.status,
-          })),
+          current.map((s) =>
+            s.orgId !== orgId
+              ? s
+              : { ...s, isCompletedState: s.id === id, status: s.id === id ? "active" : s.status },
+          ),
         );
         if (orgId) void setExclusiveStatusFlag(orgId, id, "is_completed");
       },
@@ -359,33 +472,51 @@ export function TaskSettingsProvider({ children }: { children: ReactNode }) {
       priorities,
       projectStatuses,
 
+      settingsOrgId: orgId,
+
       projectCategories,
-      categoriesFor: (orgId) =>
-        projectCategories.filter(
-          (c) =>
-            c.status === "active" &&
-            (c.scope === "global" || !orgId || orgId === "all" || c.orgIds.includes(orgId)),
-        ),
+      // A project's own organization (its categories are rows of that
+      // organization); without one, the settings organization.
+      categoriesFor: (forOrgId) => {
+        const target = forOrgId && forOrgId !== "all" ? forOrgId : orgId;
+        return allCategories.filter(
+          (c) => c.status === "active" && !!target && c.orgIds.includes(target),
+        );
+      },
+      // A category is a row of the settings organization.
       addCategory: (input) => {
+        const target = orgId ?? input.orgIds[0];
+        if (!target) return;
         const tempId = `PC-pending-${Date.now()}`;
         const name = input.name.trim();
-        setProjectCategories((current) => [...current, { ...input, name, id: tempId }]);
-        const target = orgId ?? input.orgIds[0];
-        if (target) {
-          void createCategoryRow(target, name).then((realId) =>
-            setProjectCategories((current) =>
-              realId
-                ? current.map((c) => (c.id === tempId ? { ...c, id: realId } : c))
-                : current.filter((c) => c.id !== tempId),
-            ),
+        setProjectCategories((current) => [
+          ...current,
+          { name, status: input.status, scope: "selected", orgIds: [target], id: tempId },
+        ]);
+        void createCategoryRow(target, name).then((realId) => {
+          setProjectCategories((current) =>
+            realId
+              ? current.map((c) => (c.id === tempId ? { ...c, id: realId } : c))
+              : current.filter((c) => c.id !== tempId),
           );
-        }
+          // New rows start active; "Inactive" in the drawer was dropped.
+          if (realId && input.status === "inactive") {
+            void updateCategoryRow(realId, { active: false });
+          }
+        });
       },
       updateCategory: (id, updates) => {
-        setProjectCategories((current) => current.map((c) => (c.id === id ? { ...c, ...updates } : c)));
+        // Name and status are what is stored; the organization never changes.
+        const stored: Partial<ProjectCategory> = {
+          ...(updates.name !== undefined ? { name: updates.name.trim() } : {}),
+          ...(updates.status !== undefined ? { status: updates.status } : {}),
+        };
+        setProjectCategories((current) =>
+          current.map((c) => (c.id === id ? { ...c, ...stored } : c)),
+        );
         void updateCategoryRow(id, {
-          name: updates.name,
-          active: updates.status ? updates.status === "active" : undefined,
+          name: stored.name,
+          active: stored.status ? stored.status === "active" : undefined,
         });
       },
       setCategoryStatus: (id, status) => {
@@ -397,10 +528,15 @@ export function TaskSettingsProvider({ children }: { children: ReactNode }) {
 
       tags,
       activeTags: tags.filter((t) => t.status === "active"),
+      tagsFor: (forOrgId) =>
+        rowsOfOrg(allTags, forOrgId ?? orgId).filter((t) => t.status === "active"),
       addTag: (name) => {
         const tempId = `TG-pending-${Date.now()}`;
         const clean = name.trim();
-        setTags((current) => [...current, { id: tempId, name: clean, status: "active" }]);
+        setTags((current) => [
+          ...current,
+          { id: tempId, orgId: orgId ?? undefined, name: clean, status: "active" },
+        ]);
         if (orgId) {
           void createTagRow(orgId, clean).then((realId) =>
             setTags((current) =>
@@ -423,7 +559,7 @@ export function TaskSettingsProvider({ children }: { children: ReactNode }) {
       isTagNameTaken: (name, exceptId) =>
         tags.some((t) => t.id !== exceptId && normalize(t.name) === normalize(name)),
     };
-  }, [taskStatuses, projectCategories, tags, resequence, orgId]);
+  }, [taskStatuses, allStatuses, projectCategories, tags, allCategories, allTags, resequence, orgId]);
 
   return <TaskSettingsContext.Provider value={value}>{children}</TaskSettingsContext.Provider>;
 }

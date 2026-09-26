@@ -9,6 +9,7 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
+import { Route as WelcomeRouteImport } from './routes/welcome'
 import { Route as AuthRouteImport } from './routes/auth'
 import { Route as AuthenticatedRouteRouteImport } from './routes/_authenticated/route'
 import { Route as AuthenticatedNoOrganizationRouteImport } from './routes/_authenticated/no-organization'
@@ -26,6 +27,11 @@ import { Route as AuthenticatedWorkspaceSettingsRolesRouteImport } from './route
 import { Route as AuthenticatedWorkspaceSettingsOrganizationsRouteImport } from './routes/_authenticated/_workspace/settings/organizations'
 import { Route as AuthenticatedWorkspaceSettingsNotificationsRouteImport } from './routes/_authenticated/_workspace/settings/notifications'
 
+const WelcomeRoute = WelcomeRouteImport.update({
+  id: '/welcome',
+  path: '/welcome',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const AuthRoute = AuthRouteImport.update({
   id: '/auth',
   path: '/auth',
@@ -122,6 +128,7 @@ const AuthenticatedWorkspaceSettingsNotificationsRoute =
 export interface FileRoutesByFullPath {
   '/': typeof AuthenticatedWorkspaceIndexRoute
   '/auth': typeof AuthRoute
+  '/welcome': typeof WelcomeRoute
   '/no-organization': typeof AuthenticatedNoOrganizationRoute
   '/settings': typeof AuthenticatedWorkspaceSettingsRouteRouteWithChildren
   '/my-tasks': typeof AuthenticatedWorkspaceMyTasksRoute
@@ -138,6 +145,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof AuthenticatedWorkspaceIndexRoute
   '/auth': typeof AuthRoute
+  '/welcome': typeof WelcomeRoute
   '/no-organization': typeof AuthenticatedNoOrganizationRoute
   '/my-tasks': typeof AuthenticatedWorkspaceMyTasksRoute
   '/projects': typeof AuthenticatedWorkspaceProjectsRoute
@@ -154,6 +162,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_authenticated': typeof AuthenticatedRouteRouteWithChildren
   '/auth': typeof AuthRoute
+  '/welcome': typeof WelcomeRoute
   '/_authenticated/_workspace': typeof AuthenticatedWorkspaceRouteRouteWithChildren
   '/_authenticated/no-organization': typeof AuthenticatedNoOrganizationRoute
   '/_authenticated/_workspace/settings': typeof AuthenticatedWorkspaceSettingsRouteRouteWithChildren
@@ -174,6 +183,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/auth'
+    | '/welcome'
     | '/no-organization'
     | '/settings'
     | '/my-tasks'
@@ -190,6 +200,7 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/auth'
+    | '/welcome'
     | '/no-organization'
     | '/my-tasks'
     | '/projects'
@@ -205,6 +216,7 @@ export interface FileRouteTypes {
     | '__root__'
     | '/_authenticated'
     | '/auth'
+    | '/welcome'
     | '/_authenticated/_workspace'
     | '/_authenticated/no-organization'
     | '/_authenticated/_workspace/settings'
@@ -224,10 +236,18 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   AuthenticatedRouteRoute: typeof AuthenticatedRouteRouteWithChildren
   AuthRoute: typeof AuthRoute
+  WelcomeRoute: typeof WelcomeRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
+    '/welcome': {
+      id: '/welcome'
+      path: '/welcome'
+      fullPath: '/welcome'
+      preLoaderRoute: typeof WelcomeRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/auth': {
       id: '/auth'
       path: '/auth'
@@ -416,6 +436,7 @@ const AuthenticatedRouteRouteWithChildren =
 const rootRouteChildren: RootRouteChildren = {
   AuthenticatedRouteRoute: AuthenticatedRouteRouteWithChildren,
   AuthRoute: AuthRoute,
+  WelcomeRoute: WelcomeRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

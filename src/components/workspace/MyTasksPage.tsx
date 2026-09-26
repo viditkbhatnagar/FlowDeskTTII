@@ -1010,7 +1010,9 @@ function MyTaskCard({
   onDragStart?: () => void;
   onStatus: (s: Status) => void;
 }) {
-  const { statusLabel } = useTaskSettings();
+  // The card's status picker reads in the task's own organization's words.
+  const { statusLabelFor } = useTaskSettings();
+  const statusLabel = (value: string) => statusLabelFor(value, task.organizationId);
   const overdue = isOverdue(task, today);
   // Real subtasks. This was progress / 20 out of a fixed 5, so a task with no
   // subtasks at 100% read "5/5" (FD-023).

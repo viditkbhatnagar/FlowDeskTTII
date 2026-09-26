@@ -160,7 +160,7 @@ export function TeamTasksPage({
   const [view, setView] = useState<"kanban" | "table" | "timeline">("kanban");
   const { tasks: workspaceTasks, updateTask, status: loadStatus, people } = useWorkspace();
   const { users, departments: orgDepartments, organizations, activeOrgId, canManageUsers } = useOrganizations();
-  const { statusLabel, priorities } = useTaskSettings();
+  const { statusLabel, statusLabelFor, priorities } = useTaskSettings();
 
   // "Today" and "completed today" are the organization's calendar day, not UTC's.
   const orgTimezone = useMemo(
@@ -289,7 +289,10 @@ export function TeamTasksPage({
     const task = workspaceTasks.find((t) => t.id === id);
     if (!task || task.status === status) return;
     // updateTask reverts and shows its own error toast when the write fails.
-    if (await updateTask(id, { status })) toast.success(`Moved to ${statusLabel(status)}`, { description: task.title });
+    if (await updateTask(id, { status }))
+      toast.success(`Moved to ${statusLabelFor(status, task.organizationId)}`, {
+        description: task.title,
+      });
   };
 
   const drop = (event: React.DragEvent, status: Status) => {
@@ -600,7 +603,7 @@ function TeamTaskCard({
   onOpen: () => void;
   onMove: (status: Status) => void;
 }) {
-  const { statusLabel } = useTaskSettings();
+  const { statusLabelFor } = useTaskSettings();
   const overdue = isOpen(task.status) && dueDay(task) < today;
   return (
     <div
@@ -630,7 +633,7 @@ function TeamTaskCard({
           className="h-6 max-w-[7.5rem] shrink-0 rounded border border-border bg-card px-1 text-[10px] text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
         >
           {BOARD_STATUSES.map((s) => (
-            <option key={s} value={s}>{statusLabel(s)}</option>
+            <option key={s} value={s}>{statusLabelFor(s, task.organizationId)}</option>
           ))}
         </select>
       </div>
@@ -683,7 +686,7 @@ function TeamTaskCard({
 }
 
 function TableView({ tasks, today, onOpen }: { tasks: TeamTask[]; today: string; onOpen: (id: string) => void }) {
-  const { statusLabel } = useTaskSettings();
+  const { statusLabelFor } = useTaskSettings();
   const headings = ["Task", "Assigned To", "Department", "Status", "Priority", "Due Date", "Progress", "Last Updated"];
   return (
     <div className="rounded-xl border border-border bg-card shadow-[var(--shadow-soft)] overflow-hidden">
@@ -731,7 +734,9 @@ function TableView({ tasks, today, onOpen }: { tasks: TeamTask[]; today: string;
                   </td>
                   <td className="whitespace-nowrap px-4 py-2.5 text-xs text-muted-foreground">{t.department}</td>
                   {/* Status names come from Settings; "review" was hardcoded as "Under Review" (FD-018). */}
-                  <td className="whitespace-nowrap px-4 py-2.5 text-xs">{statusLabel(t.status)}</td>
+                  <td className="whitespace-nowrap px-4 py-2.5 text-xs">
+                    {statusLabelFor(t.status, t.organizationId)}
+                  </td>
                   <td className="px-4 py-2.5">
                     <span className={cn("whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-medium capitalize", priorityClass[t.priority])}>
                       {t.priority}
@@ -1046,7 +1051,7 @@ const feedDot = (type: string) =>
  * "View all" did nothing (FD-012, FD-031).
  */
 function ActivityFeed({ tasks, onOpenTask }: { tasks: WorkspaceTask[]; onOpenTask: (id: string) => void }) {
-  const { statusLabel } = useTaskSettings();
+  const { statusLabelFor } = useTaskSettings();
   // undefined = loading, null = the query failed.
   const [entries, setEntries] = useState<ActivityEntry[] | null | undefined>(undefined);
   const [expanded, setExpanded] = useState(false);
@@ -1077,12 +1082,14 @@ function ActivityFeed({ tasks, onOpenTask }: { tasks: WorkspaceTask[]; onOpenTas
   );
 
   // Status words come from Settings rather than describeActivity's fixed names (FD-018).
+  // Each task's status in its own organization's words.
   const sentence = (entry: ActivityEntry) => {
+    const orgId = entry.taskId ? taskById.get(entry.taskId)?.organizationId : undefined;
     if (entry.type === "task_status_changed") {
       const to = (entry.details as { to?: string }).to;
-      return `moved this task to ${to ? statusLabel(to) : "a new status"}`;
+      return `moved this task to ${to ? statusLabelFor(to, orgId) : "a new status"}`;
     }
-    if (entry.type === "task_completed") return `marked this task ${statusLabel("done")}`;
+    if (entry.type === "task_completed") return `marked this task ${statusLabelFor("done", orgId)}`;
     return describeActivity(entry, entry.taskId ? "task" : "project");
   };
 

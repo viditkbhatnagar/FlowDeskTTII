@@ -55,7 +55,7 @@ export function Header({
   const queryClient = useQueryClient();
   const { tasks, people, refresh } = useWorkspace();
   const { users } = useOrganizations();
-  const { statusLabel } = useTaskSettings();
+  const { statusLabelFor } = useTaskSettings();
   const [query, setQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   // Below md the search box is hidden; the search icon opens it over the header (FD-053).
@@ -103,7 +103,10 @@ export function Header({
         key: `task-${t.id}`,
         kind: "task",
         title: t.title,
-        subtitle: ["Task", t.project, statusLabel(t.status)].filter(Boolean).join(" · "),
+        // In the task's own organization's words.
+        subtitle: ["Task", t.project, statusLabelFor(t.status, t.organizationId)]
+          .filter(Boolean)
+          .join(" · "),
         destination: "my-tasks",
         filter: `task:${t.id}`,
       }));
@@ -146,7 +149,7 @@ export function Header({
       }));
 
     return [...taskResults, ...projectResults, ...peopleResults];
-  }, [query, tasks, projectIndex, users, people, statusLabel]);
+  }, [query, tasks, projectIndex, users, people, statusLabelFor]);
 
   const closeSearch = () => {
     setSearchOpen(false);

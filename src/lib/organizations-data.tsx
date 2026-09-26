@@ -3,10 +3,13 @@ import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
 import {
   assignRoleRow,
+  createAccountRpc,
   createDepartmentRow,
+  createOrganizationRpc,
   createRoleRow,
   createTeamRow,
   loadAdminSnapshot,
+  resendWelcomeRpc,
   removeMembershipRow,
   resolveUserId,
   setUserTeam,
@@ -16,8 +19,13 @@ import {
   updateRoleRow,
   updateTeamRow,
   upsertMembershipRow,
+  type AdminRpcError,
+  type AdminRpcResult,
   type BaseRole,
+  type WriteResult,
 } from "@/lib/admin-api";
+
+export type { AdminRpcError, AdminRpcResult } from "@/lib/admin-api";
 
 export type OrgStatus = "active" | "inactive";
 
@@ -66,6 +74,19 @@ export interface Membership {
   role: string;
   status: OrgStatus;
   reportingManagerId?: string;
+  /**
+   * The permission row-level security checks for them here (user_roles), when
+   * the caller can see it: admins see it for their organizations. This, not
+   * the role's name, decides who counts as an admin.
+   */
+  privilege?: BaseRole;
+  /**
+   * The membership points at a role that is not one of this organization's
+   * (an old id from another organization, or one the caller cannot read). The
+   * role shown is the built-in one matching their permission, and a save that
+   * leaves the role alone does not rewrite the permission.
+   */
+  roleUnreadable?: boolean;
 }
 
 export interface OrgUser {
@@ -91,7 +112,8 @@ export type UserActivityType =
   | "organization-removed"
   | "activated"
   | "deactivated"
-  | "updated";
+  | "updated"
+  | "welcome-sent";
 
 export interface UserActivity {
   id: string;
@@ -100,6 +122,23 @@ export interface UserActivity {
   message: string;
   at: string;
 }
+
+/** Add User, for someone who has no account yet. */
+export interface NewUserInput {
+  name: string;
+  email: string;
+  phone?: string;
+  avatarUrl?: string;
+  employeeId?: string;
+  designation: string;
+  joiningDate?: string;
+  /** Their first organization: created together with the login. */
+  primary: Membership;
+  /** Further organizations, added once the account exists. */
+  additional: Membership[];
+}
+
+export type NewOrganizationInput = Omit<Organization, "id">;
 
 export interface OrgProject {
   id: string;
@@ -262,6 +301,11 @@ type OrganizationsContextValue = {
   projects: OrgProject[];
   /** Organizations the signed-in user may access. */
   accessibleOrganizations: Organization[];
+  /**
+   * Organizations whose task and project settings the signed-in user may
+   * change: they hold the admin or manager permission there.
+   */
+  managedOrganizations: Organization[];
   activeOrgId: string | "all";
   setActiveOrgId: (id: string | "all") => void;
   countsFor: (orgId: string) => OrgCounts;
@@ -278,19 +322,37 @@ type OrganizationsContextValue = {
     userId: string,
     orgId: string,
     membership: Omit<Membership, "orgId" | "status">,
-  ) => void;
+  ) => Promise<boolean>;
   isNameTaken: (name: string, exceptId?: string) => boolean;
   isCodeTaken: (code: string, exceptId?: string) => boolean;
   // Users
   userActivity: UserActivity[];
   currentUser: OrgUser | null;
   canManageUsers: boolean;
-  updateUser: (id: string, updates: Partial<OrgUser>) => void;
-  setUserStatus: (id: string, status: OrgStatus) => void;
-  upsertMembership: (userId: string, membership: Membership) => void;
-  removeMembership: (userId: string, orgId: string) => void;
+  /*
+   * The writes below update the screen at once and resolve true once
+   * everything is saved. When the database refuses (it keeps an active admin in
+   * every organization) its reason is shown as a toast, the screen is re-read
+   * and they resolve false.
+   */
+  updateUser: (id: string, updates: Partial<OrgUser>) => Promise<boolean>;
+  setUserStatus: (id: string, status: OrgStatus) => Promise<boolean>;
+  upsertMembership: (userId: string, membership: Membership) => Promise<boolean>;
+  removeMembership: (userId: string, orgId: string) => Promise<boolean>;
   isEmailTaken: (email: string, exceptId?: string) => boolean;
   logUserActivity: (userId: string, type: UserActivityType, message: string) => void;
+  /**
+   * Create the login and first membership on the server, then any additional
+   * organizations, then reload. Resolves with the new user's id, or the
+   * server's reason for refusing (nothing is created in that case).
+   */
+  createUser: (input: NewUserInput) => Promise<AdminRpcResult<string>>;
+  /** A new welcome email with a fresh link, for someone who has never signed in. */
+  resendWelcome: (userId: string) => Promise<AdminRpcResult<null>>;
+  /** Create an organization on the server; the caller becomes its admin. */
+  createOrganization: (input: NewOrganizationInput) => Promise<AdminRpcResult<string>>;
+  /** Re-read organizations, people, roles and the caller's own access. */
+  reload: () => Promise<void>;
   // Departments & teams
   createDepartment: (input: NewDepartmentInput) => Department;
   updateDepartment: (id: string, updates: Partial<Department>) => void;
@@ -312,31 +374,71 @@ type OrganizationsContextValue = {
   roleUserCount: (role: Role) => number;
   /** The role new people get in an organization ("Employee"). */
   defaultRoleName: (orgId: string) => string;
-  /** Active users holding an admin-level role anywhere. */
+  /**
+   * Active admins, counted the way the database counts them: the admin
+   * permission (user_roles), an active membership there and an active account.
+   * Not by role name: a membership showing "Employee" can still carry admin.
+   */
   activeAdminCount: number;
   activeAdminCountIn: (orgId: string) => number;
+  /** Holds the admin permission in this organization, with an active membership there. */
   isAdminIn: (user: OrgUser, orgId: string) => boolean;
+  /** Whether this organization's role of that name carries the admin permission. */
+  roleGrantsAdmin: (orgId: string, roleName: string) => boolean;
+  /** Organizations where this person is the only active admin. */
+  soleAdminOrgIds: (user: OrgUser) => string[];
   createRole: (input: NewRoleInput) => Role;
-  updateRole: (id: string, updates: Partial<Role>) => void;
+  updateRole: (id: string, updates: Partial<Role>) => Promise<boolean>;
   /** Returns false when refused (built-in roles cannot be deactivated). */
   setRoleStatus: (id: string, status: OrgStatus) => boolean;
   duplicateRole: (id: string) => void;
   isRoleNameTaken: (name: string, exceptId?: string, orgId?: string) => boolean;
   /** Give the user this role in the role's organization — label and privilege. */
-  assignRole: (userId: string, roleId: string) => void;
+  assignRole: (userId: string, roleId: string) => Promise<boolean>;
 };
 
 const OrganizationsContext = createContext<OrganizationsContextValue | null>(null);
+
+/**
+ * SQLSTATEs admin_create_user raises before creating anything: invalid input,
+ * not allowed, too many in a short time, a business rule. Any other failure
+ * may have followed a committed account.
+ */
+const SETTLED_REFUSALS = new Set(["22023", "42501", "PT429", "P0001"]);
+
+/** Optional profile fields Edit User can empty; "" is sent to clear them. */
+const CLEARABLE_PROFILE_FIELDS = new Set(["phone", "avatarUrl", "employeeId", "joiningDate"]);
+
+/** A retry's "already has an account" once the reload shows that the person exists. */
+const ALREADY_LISTED =
+  "They're already in the list — open them to add further organizations.";
 
 const normalize = (v: string) => v.trim().toLowerCase();
 
 const saveFailed = (what: string) =>
   toast.error(`${what} could not be saved. You may not have permission, or the connection dropped.`);
 
-/** Toast when a write reports failure. The cause is already in the console from admin-api. */
-const reportIfFailed = (what: string) => (ok: boolean) => {
-  if (!ok) saveFailed(what);
-  return ok;
+type Outcome = boolean | WriteResult;
+
+const succeeded = (outcome: Outcome) => (typeof outcome === "boolean" ? outcome : outcome.ok);
+
+/**
+ * Toast when a write reports failure. A save the database refused on one of
+ * its rules shows the database's own reason ("There must always be at least
+ * one active admin in …") and calls onRefused; anything else gets the general
+ * message. The cause is already in the console from admin-api.
+ */
+const reportIfFailed = (what: string, onRefused?: () => void) => (outcome: Outcome) => {
+  if (succeeded(outcome)) return true;
+  const refusal = typeof outcome === "boolean" || outcome.ok ? null : outcome.refusal;
+  if (refusal) {
+    // One toast however many of a save's writes were refused for the same reason.
+    toast.error(refusal, { id: refusal });
+    onRefused?.();
+  } else {
+    saveFailed(what);
+  }
+  return false;
 };
 
 async function loadOrgProjects(): Promise<OrgProject[] | null> {
@@ -356,6 +458,9 @@ async function loadOrgProjects(): Promise<OrgProject[] | null> {
     categoryId: row.category_id ?? undefined,
   }));
 }
+
+/** Resolves with the people just loaded, or null when nothing was loaded. */
+type LoadAll = (isActive: () => boolean, initial: boolean) => Promise<OrgUser[] | null>;
 
 export function OrganizationsProvider({ children }: { children: ReactNode }) {
   // Everything starts empty and is loaded from Supabase. These lists used to be
@@ -377,87 +482,124 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
   const [authenticatedUserId, setAuthenticatedUserId] = useState<string | null>(null);
   const [accessibleOrgIds, setAccessibleOrgIds] = useState<string[]>([]);
   const [authenticatedRoles, setAuthenticatedRoles] = useState<string[]>([]);
+  /** Organizations where the caller holds the admin permission (user_roles), which RLS checks. */
+  const [adminOrgIds, setAdminOrgIds] = useState<string[]>([]);
+  /** Organizations where the caller holds the admin or manager permission. */
+  const [managerOrgIds, setManagerOrgIds] = useState<string[]>([]);
 
   const reloadProjects = useCallback(async () => {
     const loaded = await loadOrgProjects();
     if (loaded) setProjects(loaded);
   }, []);
 
-  useEffect(() => {
-    let active = true;
-    const loadAccess = async () => {
-      const { data: authData } = await supabase.auth.getUser();
-      if (!authData.user || !active) return;
-      const [{ data: memberships }, { data: assignedRoles }] = await Promise.all([
-        supabase
-          .from("organization_memberships")
-          .select("organization_id, is_primary")
-          .eq("user_id", authData.user.id)
-          .eq("status", "active"),
-        supabase.from("user_roles").select("role").eq("user_id", authData.user.id),
-      ]);
-      if (!active) return;
-      setAuthenticatedUserId(authData.user.id);
+  /**
+   * Load the caller's access and everything the admin screens show. Runs on
+   * mount, and again after something is created on the server (a new account,
+   * a new organization) so it appears without a page refresh.
+   *
+   * `initial` is the first load: it may report "error" and picks the caller's
+   * primary organization. A later reload that fails keeps what is on screen.
+   */
+  const loadAll = useCallback<LoadAll>(async (isActive, initial) => {
+    const { data: authData } = await supabase.auth.getUser();
+    if (!authData.user || !isActive()) return null;
+    const [membershipsResult, rolesResult] = await Promise.all([
+      supabase
+        .from("organization_memberships")
+        .select("organization_id, is_primary")
+        .eq("user_id", authData.user.id)
+        .eq("status", "active"),
+      supabase.from("user_roles").select("role, organization_id").eq("user_id", authData.user.id),
+    ]);
+    const { data: memberships, error: membershipsError } = membershipsResult;
+    const { data: assignedRoles, error: rolesError } = rolesResult;
+    if (!isActive()) return null;
+    setAuthenticatedUserId(authData.user.id);
+    // A reload that fails must not strip the caller's access from the screen.
+    if (initial || !membershipsError) {
       setAccessibleOrgIds((memberships ?? []).map((membership) => membership.organization_id));
+    }
+    if (initial || !rolesError) {
       setAuthenticatedRoles((assignedRoles ?? []).map((assignedRole) => assignedRole.role));
-      // Load the admin surfaces from the database. RLS already narrows every
-      // table to this user's organizations, so no client-side scoping is needed.
-      const [snapshot, roleMeta, loadedProjects] = await Promise.all([
-        loadAdminSnapshot(),
-        // Which organization each role belongs to, and its real privilege. Roles
-        // are per organization, so with two organizations there are two "Admin"
-        // rows; without this the Roles page listed both and counted everyone's
-        // memberships against each (FD-037, FD-067).
-        supabase.from("roles").select("id, organization_id, base_role"),
-        loadOrgProjects(),
-      ]);
-      if (!active) return;
-      if (loadedProjects) setProjects(loadedProjects);
-      if (snapshot) {
-        const metaById = new Map((roleMeta.data ?? []).map((row) => [row.id, row]));
-        setOrganizations(snapshot.organizations);
-        setDepartments(snapshot.departments);
-        // admin-api maps a team lead to a display name, but every screen (and
-        // the Team type) works with the user id, so leads never showed or saved.
-        setTeams(
-          snapshot.teams.map((team) => ({
-            ...team,
-            lead:
-              team.lead && !snapshot.users.some((u) => u.id === team.lead)
-                ? snapshot.users.find((u) => u.name === team.lead)?.id
-                : team.lead,
-          })),
-        );
-        setUsers(snapshot.users);
-        setRoles(
-          snapshot.roles.map((role) => {
-            const meta = metaById.get(role.id);
-            return {
-              ...role,
-              orgId: meta?.organization_id,
-              baseRole: meta?.base_role,
-              // Keys for features that do not exist are dropped, so saving a role
-              // no longer writes them back (FD-068).
-              permissions: role.permissions.filter((key) => knownPermissionKeys.has(key)),
-              settings: Object.fromEntries(
-                Object.entries(role.settings ?? {}).filter(([key]) => knownSettingsKeys.has(key)),
-              ) as Record<string, SettingsAccess>,
-            };
-          }),
-        );
-        setAdminStatus("ready");
-      } else {
-        setAdminStatus("error");
-      }
+      setAdminOrgIds(
+        (assignedRoles ?? [])
+          .filter((assignedRole) => assignedRole.role === "admin")
+          .map((assignedRole) => assignedRole.organization_id),
+      );
+      setManagerOrgIds(
+        (assignedRoles ?? [])
+          .filter((assignedRole) => assignedRole.role === "admin" || assignedRole.role === "manager")
+          .map((assignedRole) => assignedRole.organization_id),
+      );
+    }
+    // Load the admin surfaces from the database. RLS already narrows every
+    // table to this user's organizations, so no client-side scoping is needed.
+    const [snapshot, roleMeta, loadedProjects] = await Promise.all([
+      loadAdminSnapshot(),
+      // Which organization each role belongs to, and its real privilege. Roles
+      // are per organization, so with two organizations there are two "Admin"
+      // rows; without this the Roles page listed both and counted everyone's
+      // memberships against each (FD-037, FD-067).
+      supabase.from("roles").select("id, organization_id, base_role"),
+      loadOrgProjects(),
+    ]);
+    if (!isActive()) return null;
+    if (loadedProjects) setProjects(loadedProjects);
+    if (snapshot) {
+      const metaById = new Map((roleMeta.data ?? []).map((row) => [row.id, row]));
+      setOrganizations(snapshot.organizations);
+      setDepartments(snapshot.departments);
+      // admin-api maps a team lead to a display name, but every screen (and
+      // the Team type) works with the user id, so leads never showed or saved.
+      setTeams(
+        snapshot.teams.map((team) => ({
+          ...team,
+          lead:
+            team.lead && !snapshot.users.some((u) => u.id === team.lead)
+              ? snapshot.users.find((u) => u.name === team.lead)?.id
+              : team.lead,
+        })),
+      );
+      setUsers(snapshot.users);
+      setRoles(
+        snapshot.roles.map((role) => {
+          const meta = metaById.get(role.id);
+          return {
+            ...role,
+            orgId: meta?.organization_id,
+            baseRole: meta?.base_role,
+            // Keys for features that do not exist are dropped, so saving a role
+            // no longer writes them back (FD-068).
+            permissions: role.permissions.filter((key) => knownPermissionKeys.has(key)),
+            settings: Object.fromEntries(
+              Object.entries(role.settings ?? {}).filter(([key]) => knownSettingsKeys.has(key)),
+            ) as Record<string, SettingsAccess>,
+          };
+        }),
+      );
+      setAdminStatus("ready");
+    } else if (initial) {
+      setAdminStatus("error");
+    }
 
+    if (initial) {
       const primary = memberships?.find((membership) => membership.is_primary)?.organization_id;
       if (primary) setActiveOrgId(primary);
-    };
-    void loadAccess();
+    }
+    return snapshot?.users ?? null;
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void loadAll(() => active, true);
     return () => {
       active = false;
     };
-  }, []);
+  }, [loadAll]);
+
+  const reload = useCallback(async () => {
+    await loadAll(() => true, false);
+  }, [loadAll]);
 
   /**
    * The screens call create* synchronously and use the returned object straight
@@ -521,12 +663,32 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
       roles.find((r) => inOrg(r, orgId) && normalize(r.name) === normalize(name));
     // A system role's privilege is fixed in the database; a custom one follows its scope.
     const privilegeOf = (role: Role): BaseRole => role.baseRole ?? baseRoleFor(role.scope);
-    const isAdminRole = (orgId: string, name: string) => {
+    const roleGrantsAdmin = (orgId: string, name: string) => {
       const role = roleIn(orgId, name);
       return role ? privilegeOf(role) === "admin" : normalize(name) === "admin";
     };
+    // By the permission itself, as the database counts admins. It used to go by
+    // the role's name, so a sole admin whose membership read "Employee" did not
+    // count, and saving them unchanged took the organization's last admin away.
     const isAdminIn = (user: OrgUser, orgId: string) =>
-      user.memberships.some((m) => m.orgId === orgId && isAdminRole(m.orgId, m.role));
+      user.memberships.some(
+        (m) => m.orgId === orgId && m.status === "active" && m.privilege === "admin",
+      );
+    /** The permission a membership will carry once its role is saved. */
+    const privilegeFor = (membership: Membership, previous?: Membership): BaseRole | undefined => {
+      if (
+        previous &&
+        normalize(previous.role) === normalize(membership.role) &&
+        previous.roleUnreadable
+      ) {
+        return previous.privilege;
+      }
+      const role = roleIn(membership.orgId, membership.role);
+      return role ? privilegeOf(role) : previous?.privilege;
+    };
+    // After a refused save the screen showed a change that did not happen.
+    const reloadAfterRefusal = () => void reload();
+    const report = (what: string) => reportIfFailed(what, reloadAfterRefusal);
     const roleMembers = (role: Role) =>
       users.filter((u) =>
         u.memberships.some((m) => inOrg(role, m.orgId) && normalize(m.role) === normalize(role.name)),
@@ -540,9 +702,9 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
       lead ? (users.some((u) => u.id === lead) ? lead : resolveUserId(users, lead)) : null;
 
     /**
-     * Write one membership: department, team, manager, role label — and, when the
-     * role changed, the privilege too. Without the privilege write a role change
-     * on the Users page only relabelled the person (FD-067).
+     * Write one membership: department, team, manager, role label — and, when
+     * asked, the privilege too. Without the privilege write a role change on the
+     * Users page only relabelled the person (FD-067).
      *
      * is_primary and designation are passed explicitly: the upsert otherwise
      * writes false / null, which cleared them on every assignment edit.
@@ -550,7 +712,17 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
     const persistMembership = async (
       userId: string,
       membership: Membership,
-      options: { isPrimary: boolean; designation?: string; roleChanged: boolean },
+      options: {
+        isPrimary: boolean;
+        designation?: string;
+        writePrivilege: boolean;
+        /**
+         * The status is unchanged from the loaded copy: leave it to the
+         * database. Deactivate switches memberships off and Reactivate back on
+         * there, so writing the loaded status back could undo either.
+         */
+        keepStatus?: boolean;
+      },
     ): Promise<boolean> => {
       const role = roleIn(membership.orgId, membership.role);
       const saved = await upsertMembershipRow(userId, {
@@ -559,20 +731,39 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
         teamId: membership.teamId,
         roleId: role?.id ?? null,
         reportingManagerId: membership.reportingManagerId ?? null,
-        status: membership.status,
+        status: options.keepStatus ? undefined : membership.status,
         designation: options.designation,
         isPrimary: options.isPrimary,
       });
-      if (!saved) {
-        saveFailed("The organization assignment");
-        return false;
-      }
-      if (options.roleChanged && role) {
-        return reportIfFailed("The role change")(
-          await assignRoleRow(userId, membership.orgId, { id: role.id, baseRole: privilegeOf(role) }),
+      if (!report("The organization assignment")(saved)) return false;
+      if (options.writePrivilege && role) {
+        return report("The role change")(
+          await assignRoleRow(userId, membership.orgId, {
+            id: role.id,
+            baseRole: privilegeOf(role),
+          }),
         );
       }
       return true;
+    };
+
+    /**
+     * Make the permission row-level security reads (user_roles) match the role
+     * shown for this membership, without rewriting the rest of it. Idempotent.
+     * `membership` is the one as loaded, so it knows whether its role is readable.
+     */
+    const reassertPrivilege = async (userId: string, membership: Membership): Promise<boolean> => {
+      // Only where the caller may write it: RLS refuses anywhere else, and an
+      // unchanged row there is not worth an error toast.
+      if (!adminOrgIds.includes(membership.orgId)) return true;
+      // The role shown stands in for one this organization does not have (or
+      // the caller cannot read), so it says nothing about the permission.
+      if (membership.roleUnreadable) return true;
+      const role = roleIn(membership.orgId, membership.role);
+      if (!role || role.id.startsWith("R-pending")) return true;
+      return report("The role")(
+        await assignRoleRow(userId, membership.orgId, { id: role.id, baseRole: privilegeOf(role) }),
+      );
     };
 
     const sameMembership = (a: Membership, b: Membership) =>
@@ -582,38 +773,87 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
       a.reportingManagerId === b.reportingManagerId &&
       a.status === b.status;
 
+    /** The membership as the screen should show it once saved, permission included. */
+    const shownMembership = (membership: Membership, previous?: Membership): Membership => {
+      const keepsRole =
+        !!previous &&
+        normalize(previous.role) === normalize(membership.role) &&
+        !!previous.roleUnreadable;
+      return {
+        ...membership,
+        privilege: privilegeFor(membership, previous),
+        roleUnreadable: keepsRole || undefined,
+      };
+    };
+
     const replaceMembership = (userId: string, membership: Membership) =>
       setUsers((current) =>
         current.map((u) => {
           if (u.id !== userId) return u;
-          const exists = u.memberships.some((m) => m.orgId === membership.orgId);
+          const previous = u.memberships.find((m) => m.orgId === membership.orgId);
+          const shown = shownMembership(membership, previous);
           return {
             ...u,
             primaryOrgId: u.primaryOrgId || membership.orgId,
-            memberships: exists
-              ? u.memberships.map((m) => (m.orgId === membership.orgId ? { ...m, ...membership } : m))
-              : [...u.memberships, membership],
+            memberships: previous
+              ? u.memberships.map((m) => (m.orgId === membership.orgId ? { ...m, ...shown } : m))
+              : [...u.memberships, shown],
           };
         }),
       );
 
-    const upsertMembership = (userId: string, membership: Membership) => {
+    const upsertMembership = async (userId: string, membership: Membership): Promise<boolean> => {
       const user = users.find((u) => u.id === userId);
       const before = user?.memberships.find((m) => m.orgId === membership.orgId);
       replaceMembership(userId, membership);
-      void persistMembership(userId, membership, {
+      return persistMembership(userId, membership, {
         isPrimary: user?.primaryOrgId ? user.primaryOrgId === membership.orgId : true,
         designation: user?.designation,
-        roleChanged: !before || normalize(before.role) !== normalize(membership.role),
+        writePrivilege: !before || normalize(before.role) !== normalize(membership.role),
+        keepStatus: !!before && before.status === membership.status,
       });
     };
 
+    /**
+     * A refusal the server raised on purpose (invalid input, not allowed, too
+     * many, a business rule) created nothing. Anything else — the connection
+     * dropped, the reply was lost — may have come after the account was
+     * committed, so the people list is re-read to show it if it exists.
+     */
+    const afterFailedCreate = async (
+      email: string,
+      failed: { ok: false; error: AdminRpcError },
+    ): Promise<AdminRpcResult<string>> => {
+      if (SETTLED_REFUSALS.has(failed.error.code)) return failed;
+      const reloaded = await loadAll(() => true, false);
+      const listed = reloaded?.some((u) => normalize(u.email) === normalize(email));
+      if (!listed) return failed;
+      return {
+        ok: false,
+        error: {
+          code: failed.error.code,
+          message:
+            failed.error.code === "23505"
+              ? ALREADY_LISTED
+              : "The account was created, but the reply didn't reach us. They're in the list now — open them to add further organizations.",
+        },
+      };
+    };
+
+    // The database's rule: the admin permission, an active membership there and
+    // an active account (private.org_has_other_active_admin).
     const adminCountIn = (orgId?: string) =>
       users.filter(
         (u) =>
           u.status === "active" &&
-          u.memberships.some((m) => (!orgId || m.orgId === orgId) && isAdminRole(m.orgId, m.role)),
+          u.memberships.some((m) => (!orgId || m.orgId === orgId) && isAdminIn(u, m.orgId)),
       ).length;
+    const soleAdminOrgIds = (user: OrgUser) =>
+      user.status !== "active"
+        ? []
+        : user.memberships
+            .filter((m) => isAdminIn(user, m.orgId) && adminCountIn(m.orgId) <= 1)
+            .map((m) => m.orgId);
 
     return {
       status: adminStatus,
@@ -623,6 +863,10 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
       users,
       projects,
       accessibleOrganizations: organizations.filter((organization) => accessibleOrgIds.includes(organization.id)),
+      managedOrganizations: organizations.filter(
+        (organization) =>
+          accessibleOrgIds.includes(organization.id) && managerOrgIds.includes(organization.id),
+      ),
       activeOrgId,
       setActiveOrgId,
       countsFor,
@@ -658,17 +902,40 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
       logUserActivity: pushActivity,
       isEmailTaken: (email, exceptId) =>
         users.some((u) => u.id !== exceptId && normalize(u.email) === normalize(email)),
-      updateUser: (id, updates) => {
+      updateUser: async (id, updates) => {
         const before = users.find((u) => u.id === id);
-        setUsers((current) => current.map((u) => (u.id === id ? { ...u, ...updates } : u)));
-        void updateProfileRow(id, {
-          name: updates.name,
-          phone: updates.phone,
-          employeeId: updates.employeeId,
-          joiningDate: updates.joiningDate,
-          status: updates.status,
-        }).then(reportIfFailed("The user's details"));
-        if (!before) return;
+        // "" means cleared: stored as NULL, shown as absent.
+        const shown = Object.fromEntries(
+          Object.entries(updates).map(([key, value]) => [
+            key,
+            value === "" && CLEARABLE_PROFILE_FIELDS.has(key) ? undefined : value,
+          ]),
+        ) as Partial<OrgUser>;
+        if (updates.memberships) {
+          shown.memberships = updates.memberships.map((next) =>
+            shownMembership(
+              next,
+              before?.memberships.find((m) => m.orgId === next.orgId),
+            ),
+          );
+        }
+        setUsers((current) => current.map((u) => (u.id === id ? { ...u, ...shown } : u)));
+        // The profile goes first, on its own. Deactivate and Reactivate (a
+        // status change) switch the person's memberships off or on in the
+        // database; the membership writes below then leave their status alone.
+        const profileSaved = report("The user's details")(
+          await updateProfileRow(id, {
+            name: updates.name,
+            phone: updates.phone,
+            employeeId: updates.employeeId,
+            joiningDate: updates.joiningDate,
+            status: updates.status,
+            avatarUrl: updates.avatarUrl,
+          }),
+        );
+        const writes: Promise<boolean>[] = [Promise.resolve(profileSaved)];
+        if (!before) return (await Promise.all(writes)).every(Boolean);
+        const statusChanged = updates.status !== undefined && updates.status !== before.status;
 
         // Department, team, manager, role and designation live on the membership
         // rows. This used to update the screen only, so those edits vanished on
@@ -676,40 +943,128 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
         const primaryOrgId = before.primaryOrgId;
         const designation = updates.designation ?? before.designation;
         const designationChanged = designation !== before.designation;
+        // The permission is written on every save, even when the role name
+        // looks unchanged. Before this release every role change saved the name
+        // but the permission write failed (42P10), so "Employee" on screen could
+        // still carry admin rights; saving the person now repairs that.
         for (const next of updates.memberships ?? []) {
           const previous = before.memberships.find((m) => m.orgId === next.orgId);
           const isPrimary = next.orgId === primaryOrgId;
-          if (previous && sameMembership(previous, next) && !(isPrimary && designationChanged)) continue;
-          void persistMembership(id, next, {
-            isPrimary,
-            designation,
-            roleChanged: !previous || normalize(previous.role) !== normalize(next.role),
-          });
+          if (previous && sameMembership(previous, next) && !(isPrimary && designationChanged)) {
+            writes.push(reassertPrivilege(id, previous));
+            continue;
+          }
+          writes.push(
+            persistMembership(id, next, {
+              isPrimary,
+              designation,
+              writePrivilege: true,
+              keepStatus: !!previous && previous.status === next.status,
+            }),
+          );
         }
         if (updates.memberships) {
           // Additional access removed in the drawer. The primary is never removed here.
           for (const previous of before.memberships) {
             if (previous.orgId === primaryOrgId) continue;
             if (updates.memberships.some((m) => m.orgId === previous.orgId)) continue;
-            void removeMembershipRow(id, previous.orgId).then(reportIfFailed("Removing organization access"));
+            writes.push(
+              removeMembershipRow(id, previous.orgId).then(report("Removing organization access")),
+            );
           }
         }
+        const saved = (await Promise.all(writes)).every(Boolean);
+        // The database switched their memberships off (or back on) as well.
+        if (statusChanged && profileSaved) void reload();
+        return saved;
       },
-      setUserStatus: (id, status) => {
+      setUserStatus: async (id, status) => {
         setUsers((current) => current.map((u) => (u.id === id ? { ...u, status } : u)));
-        void updateProfileRow(id, { status }).then(reportIfFailed("The account status"));
+        const saved = report("The account status")(await updateProfileRow(id, { status }));
+        if (!saved) return false;
         pushActivity(
           id,
           status === "active" ? "activated" : "deactivated",
           status === "active" ? "Account activated" : "Account deactivated",
         );
+        // The database switched their memberships off (or back on) as well.
+        void reload();
+        return true;
       },
       upsertMembership,
-      removeMembership: (userId, orgId) => {
+      createUser: async (input) => {
+        const role = roleIn(input.primary.orgId, input.primary.role);
+        if (!role || role.id.startsWith("R-pending")) {
+          return {
+            ok: false,
+            error: { code: "22023", message: "Choose a role that exists in this organization." },
+          };
+        }
+        const created = await createAccountRpc({
+          email: input.email,
+          fullName: input.name,
+          organizationId: input.primary.orgId,
+          // The privilege row-level security enforces; roleId keeps the exact
+          // (possibly custom) role, whose base_role the server checks matches.
+          role: privilegeOf(role),
+          details: {
+            roleId: role.id,
+            departmentId: input.primary.departmentId,
+            teamId: input.primary.teamId,
+            reportingManagerId: input.primary.reportingManagerId,
+            designation: input.designation,
+            employeeId: input.employeeId,
+            phone: input.phone,
+            joiningDate: input.joiningDate,
+          },
+        });
+        if (!created.ok) return afterFailedCreate(input.email, created);
+
+        const userId = created.value;
+        // The account exists from here on. What follows is best effort: each
+        // failure is reported on its own and can be redone from the user's page.
+        if (input.avatarUrl) {
+          reportIfFailed("The profile photo")(
+            await updateProfileRow(userId, { avatarUrl: input.avatarUrl }),
+          );
+        }
+        for (const membership of input.additional) {
+          await persistMembership(userId, membership, { isPrimary: false, writePrivilege: true });
+        }
+        pushActivity(userId, "created", "Account created and welcome email queued");
+        await reload();
+        return created;
+      },
+      resendWelcome: async (userId) => {
+        const result = await resendWelcomeRpc(userId);
+        if (result.ok) {
+          pushActivity(userId, "welcome-sent", "Welcome email sent again with a new link");
+        }
+        return result;
+      },
+      createOrganization: async (input) => {
+        const created = await createOrganizationRpc({
+          name: input.name,
+          code: input.code,
+          country: input.country,
+          timezone: input.timezone,
+          details: {
+            officialEmail: input.email,
+            phone: input.phone,
+            website: input.website,
+            logoUrl: input.logoUrl,
+            status: input.status,
+          },
+        });
+        if (created.ok) await reload();
+        return created;
+      },
+      reload,
+      removeMembership: async (userId, orgId) => {
         // The primary organization is never removed; that would leave the account
         // with no route into any workspace.
         const user = users.find((u) => u.id === userId);
-        if (!user || user.primaryOrgId === orgId) return;
+        if (!user || user.primaryOrgId === orgId) return false;
         setUsers((current) =>
           current.map((u) =>
             u.id === userId
@@ -717,7 +1072,7 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
               : u,
           ),
         );
-        void removeMembershipRow(userId, orgId).then(reportIfFailed("Removing organization access"));
+        return report("Removing organization access")(await removeMembershipRow(userId, orgId));
       },
       createDepartment: (input) => {
         const tempId = `D-pending-${Date.now()}`;
@@ -860,6 +1215,8 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
       activeAdminCount: adminCountIn(),
       activeAdminCountIn: (orgId) => adminCountIn(orgId),
       isAdminIn,
+      roleGrantsAdmin,
+      soleAdminOrgIds,
       isRoleNameTaken: (name, exceptId, orgId) =>
         roles.some(
           (r) =>
@@ -885,16 +1242,16 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
         }
         return role;
       },
-      updateRole: (id, updates) => {
+      updateRole: async (id, updates) => {
         const before = roles.find((r) => r.id === id);
-        if (!before) return;
+        if (!before) return false;
         // A built-in role stays active whatever the form says (FD-062).
         const safe: Partial<Role> = before.system ? { ...updates, status: "active" } : updates;
         const nextBase = !before.system && safe.scope !== undefined ? baseRoleFor(safe.scope) : undefined;
         setRoles((current) =>
           current.map((r) => (r.id === id ? { ...r, ...safe, ...(nextBase ? { baseRole: nextBase } : {}) } : r)),
         );
-        void updateRoleRow(id, {
+        const outcome = await updateRoleRow(id, {
           name: safe.name,
           description: safe.description,
           scope: safe.scope,
@@ -903,11 +1260,16 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
           status: safe.status,
           // A system role refuses this at the database; a custom role follows its scope.
           ...(nextBase ? { baseRole: nextBase } : {}),
-        }).then((ok) => {
-          if (ok) return;
-          setRoles((current) => current.map((r) => (r.id === id ? before : r)));
-          saveFailed(`${before.name}`);
         });
+        if (!outcome.ok) {
+          setRoles((current) => current.map((r) => (r.id === id ? before : r)));
+          // A new permission that would leave an organization without an active
+          // admin is refused, and the database says so.
+          return report(before.name)(outcome);
+        }
+        // The database moved everyone holding the role to its new permission.
+        if (nextBase && nextBase !== before.baseRole) void reload();
+        return true;
       },
       setRoleStatus: (id, status) => {
         const role = roles.find((r) => r.id === id);
@@ -919,10 +1281,10 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
           return false;
         }
         setRoles((current) => current.map((r) => (r.id === id ? { ...r, status } : r)));
-        void updateRoleRow(id, { status }).then((ok) => {
-          if (ok) return;
+        void updateRoleRow(id, { status }).then((outcome) => {
+          if (outcome.ok) return;
           setRoles((current) => current.map((r) => (r.id === id ? { ...r, status: role.status } : r)));
-          saveFailed(`${role.name}'s status`);
+          reportIfFailed(`${role.name}'s status`)(outcome);
         });
         return true;
       },
@@ -954,10 +1316,10 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
           }).then((realId) => reconcileId(setRoles, tempId, realId, "The copied role"));
         }
       },
-      assignRole: (userId, roleId) => {
+      assignRole: async (userId, roleId) => {
         const role = roles.find((r) => r.id === roleId);
         const user = users.find((u) => u.id === userId);
-        if (!role || !user) return;
+        if (!role || !user) return false;
         // Only the membership in the role's own organization: the other
         // organization has its own role rows, and used to be handed this one's id.
         const targets = user.memberships.filter((m) => inOrg(role, m.orgId));
@@ -967,7 +1329,14 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
               ? {
                   ...u,
                   memberships: u.memberships.map((m) =>
-                    targets.some((t) => t.orgId === m.orgId) ? { ...m, role: role.name } : m,
+                    targets.some((t) => t.orgId === m.orgId)
+                      ? {
+                          ...m,
+                          role: role.name,
+                          privilege: privilegeOf(role),
+                          roleUnreadable: undefined,
+                        }
+                      : m,
                   ),
                 }
               : u,
@@ -975,15 +1344,41 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
         );
         // Writes the label AND the privilege. Without the second, the screen
         // would report a permission change that granted nothing.
-        for (const membership of targets) {
-          void assignRoleRow(userId, membership.orgId, { id: role.id, baseRole: privilegeOf(role) }).then(
-            reportIfFailed("The role change"),
-          );
-        }
+        const saved = await Promise.all(
+          targets.map((membership) =>
+            assignRoleRow(userId, membership.orgId, {
+              id: role.id,
+              baseRole: privilegeOf(role),
+            }).then(report("The role change")),
+          ),
+        );
+        if (!saved.every(Boolean)) return false;
         pushActivity(userId, "role-changed", `Role changed to ${role.name}`);
+        return true;
       },
     };
-  }, [organizations, departments, teams, users, projects, activeOrgId, countsFor, userActivity, pushActivity, roles, accessibleOrgIds, authenticatedUserId, authenticatedRoles, adminStatus, reconcileId, reloadProjects]);
+  }, [
+    organizations,
+    departments,
+    teams,
+    users,
+    projects,
+    activeOrgId,
+    countsFor,
+    userActivity,
+    pushActivity,
+    roles,
+    accessibleOrgIds,
+    authenticatedUserId,
+    authenticatedRoles,
+    adminOrgIds,
+    managerOrgIds,
+    adminStatus,
+    reconcileId,
+    reloadProjects,
+    reload,
+    loadAll,
+  ]);
 
   return <OrganizationsContext.Provider value={value}>{children}</OrganizationsContext.Provider>;
 }

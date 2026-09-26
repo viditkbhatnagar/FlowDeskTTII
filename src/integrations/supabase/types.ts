@@ -1396,6 +1396,31 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
+      admin_create_organization: {
+        Args: {
+          p_code: string
+          p_country: string
+          p_details?: Json
+          p_name: string
+          p_timezone: string
+        }
+        Returns: string
+      }
+      admin_create_user: {
+        Args: {
+          p_details?: Json
+          p_email: string
+          p_full_name: string
+          p_organization_id: string
+          p_role: Database["public"]["Enums"]["app_role"]
+        }
+        Returns: string
+      }
+      admin_resend_welcome: { Args: { p_user_id: string }; Returns: undefined }
+      complete_account_setup: {
+        Args: { p_password: string; p_token: string }
+        Returns: string
+      }
       email_worker_claim: {
         Args: { p_limit?: number; p_secret: string }
         Returns: Json

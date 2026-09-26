@@ -73,7 +73,7 @@ export function DashboardPage({
 }) {
   const queryClient = useQueryClient();
   const fetchDashboard = useServerFn(getDashboard);
-  const { statusLabel } = useTaskSettings();
+  const { statusLabel, statusLabelFor } = useTaskSettings();
   const [organizationId, setOrganizationId] = useState<string | null>(null);
   const [scope, setScope] = useState<Scope>("mine");
   // The query waits for the saved preferences. It used to fire once with the
@@ -210,7 +210,7 @@ export function DashboardPage({
           which pushed the page to 1962px wide at 375px (FD-019). */}
       <div className="grid gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
         <Panel title="Needs Attention" icon={AlertTriangle} tone="danger" action={() => onNavigate(page, "attention")}>
-          {needsAttention.length ? <div className="divide-y divide-border">{needsAttention.map((task) => <TaskRow key={task.id} task={task} today={today} statusLabel={statusLabel} onClick={() => onNavigate(page, `task:${task.id}`)} />)}</div> : <Empty icon={CheckCircle2} text={`No urgent, overdue or blocked tasks, and nothing in ${reviewName}.`} />}
+          {needsAttention.length ? <div className="divide-y divide-border">{needsAttention.map((task) => <TaskRow key={task.id} task={task} today={today} statusLabel={(value) => statusLabelFor(value, task.organization_id)} onClick={() => onNavigate(page, `task:${task.id}`)} />)}</div> : <Empty icon={CheckCircle2} text={`No urgent, overdue or blocked tasks, and nothing in ${reviewName}.`} />}
         </Panel>
         <Panel title="Upcoming Deadlines" icon={CalendarClock} tone="info">
           {deadlines.length ? <div className="space-y-3">{deadlines.map((item) => <button key={`${item.type}-${item.id}`} type="button" title={item.title} onClick={() => onNavigate(item.type === "Task" ? page : "projects", item.type === "Task" ? `task:${item.id}` : `project:${encodeURIComponent(item.project)}`)} className="flex w-full min-w-0 items-center justify-between gap-3 text-left"><div className="min-w-0"><p className="truncate text-sm font-medium">{item.title}</p><p className="truncate text-xs text-muted-foreground">{item.project} · {item.type}</p></div><span className="shrink-0 whitespace-nowrap text-xs font-medium">{deadlineLabel(String(item.due))}</span></button>)}</div> : <Empty icon={CalendarClock} text="No upcoming deadlines in this scope." />}
@@ -224,7 +224,7 @@ export function DashboardPage({
           {data.projects.length ? <div className="divide-y divide-border">{data.projects.slice(0, 6).map((project) => <button key={project.id} type="button" onClick={() => onNavigate("projects", `project:${encodeURIComponent(project.name)}`)} className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-4 py-3 text-left"><div className="min-w-0"><div className="flex min-w-0 items-center gap-2"><span className="truncate text-sm font-medium">{project.name}</span><Status text={healthLabel[project.health]} tone={healthTone[project.health]} /></div><div className="mt-2 h-1.5 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-primary" style={{ width: `${project.progress}%` }} /></div><p className="mt-1 text-[11px] text-muted-foreground">{project.complete} of {project.taskCount} tasks completed</p></div><span className="text-sm font-semibold">{project.progress}%</span></button>)}</div> : <Empty icon={FolderKanban} text="No active projects in this scope." />}
         </Panel>
         <Panel title="Recent Activity" icon={Clock3} tone="info">
-          {data.activity.length ? <div className="space-y-4">{data.activity.slice(0, 7).map((item) => { const sentence = describe(item, statusLabel); return <div key={item.id} className="flex gap-3"><span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-primary" /><div className="min-w-0"><p className="line-clamp-2 break-words text-sm"><span className="font-medium">{item.actorName}</span> {sentence.verb} <span className="font-medium">{sentence.target}</span>{sentence.suffix}</p><p className="text-xs text-muted-foreground">{formatDistanceToNow(new Date(item.occurred_at), { addSuffix: true })}</p></div></div>; })}</div> : <Empty icon={AlertCircle} text="No recorded activity in this scope." />}
+          {data.activity.length ? <div className="space-y-4">{data.activity.slice(0, 7).map((item) => { const sentence = describe(item, (value) => statusLabelFor(value, item.organization_id)); return <div key={item.id} className="flex gap-3"><span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-primary" /><div className="min-w-0"><p className="line-clamp-2 break-words text-sm"><span className="font-medium">{item.actorName}</span> {sentence.verb} <span className="font-medium">{sentence.target}</span>{sentence.suffix}</p><p className="text-xs text-muted-foreground">{formatDistanceToNow(new Date(item.occurred_at), { addSuffix: true })}</p></div></div>; })}</div> : <Empty icon={AlertCircle} text="No recorded activity in this scope." />}
         </Panel>
       </div>
 

@@ -1006,6 +1006,7 @@ export function ProjectWorkspace({
         <div className="mx-auto w-full max-w-6xl pb-8">
           {tab === "overview" && (
             <OverviewTab
+              orgId={organizationId}
               project={project}
               manager={manager}
               teamCount={teamCount}
@@ -1032,6 +1033,7 @@ export function ProjectWorkspace({
           )}
           {tab === "tasks" && (
             <TasksTab
+              orgId={organizationId}
               tasks={projectTasks}
               today={today}
               onAdd={() => setTaskOpen(true)}
@@ -1046,6 +1048,7 @@ export function ProjectWorkspace({
           )}
           {tab === "team" && (
             <TeamTab
+              orgId={organizationId}
               project={project}
               manager={manager}
               team={team}
@@ -1085,6 +1088,7 @@ export function ProjectWorkspace({
           )}
           {tab === "activity" && (
             <ActivityTab
+              orgId={organizationId}
               activity={activity}
               state={isSaved ? activityState : "loading"}
               taskTitles={taskTitles}
@@ -1218,6 +1222,7 @@ function StateMessage({
 }
 
 function OverviewTab({
+  orgId,
   project,
   manager,
   teamCount,
@@ -1241,6 +1246,8 @@ function OverviewTab({
   onEdit,
   onRetryActivity,
 }: {
+  /** The project's organization: its tasks read in that organization's status names. */
+  orgId: string | null;
   project: WorkspaceProject;
   manager: PersonRef;
   teamCount: number;
@@ -1264,7 +1271,8 @@ function OverviewTab({
   onEdit: () => void;
   onRetryActivity: () => void;
 }) {
-  const { statusLabel } = useTaskSettings();
+  const { statusLabelFor } = useTaskSettings();
+  const statusLabel = (value: string) => statusLabelFor(value, orgId);
   const labels: [string, Tab][] = [
     ["Basic Project Information", "overview"],
     ["Add Milestones", "timeline"],
@@ -1481,6 +1489,7 @@ function OverviewTab({
         }
       >
         <ActivityList
+          orgId={orgId}
           entries={activity.slice(0, 5)}
           state={activityState}
           taskTitles={taskTitles}
@@ -1521,6 +1530,7 @@ function readTaskView(): "list" | "board" {
 }
 
 function TasksTab({
+  orgId,
   tasks,
   today,
   onAdd,
@@ -1528,6 +1538,8 @@ function TasksTab({
   onUpdate,
   onDelete,
 }: {
+  /** The project's organization: its tasks read in that organization's status names. */
+  orgId: string | null;
   tasks: WorkspaceTask[];
   today: string;
   onAdd: () => void;
@@ -1535,7 +1547,8 @@ function TasksTab({
   onUpdate: (id: string, updates: Partial<WorkspaceTask>) => void;
   onDelete: (task: WorkspaceTask) => Promise<boolean>;
 }) {
-  const { statusLabel } = useTaskSettings();
+  const { statusLabelFor } = useTaskSettings();
+  const statusLabel = (value: string) => statusLabelFor(value, orgId);
   const [view, setViewState] = useState<"list" | "board">(() =>
     typeof window === "undefined" ? "list" : readTaskView(),
   );
@@ -1901,6 +1914,7 @@ function TasksTab({
 }
 
 function TeamTab({
+  orgId,
   project,
   manager,
   team,
@@ -1914,6 +1928,8 @@ function TeamTab({
   memberPickerOpen,
   setMemberPickerOpen,
 }: {
+  /** The project's organization: its tasks read in that organization's status names. */
+  orgId: string | null;
   project: WorkspaceProject;
   manager: PersonRef;
   team: PersonRef[];
@@ -1927,7 +1943,8 @@ function TeamTab({
   memberPickerOpen: boolean;
   setMemberPickerOpen: (open: boolean) => void;
 }) {
-  const { statusLabel } = useTaskSettings();
+  const { statusLabelFor } = useTaskSettings();
+  const statusLabel = (value: string) => statusLabelFor(value, orgId);
   const [selectedId, setSelectedId] = useState<string>();
   const [removeId, setRemoveId] = useState<string>();
   const [removing, setRemoving] = useState(false);
@@ -2858,11 +2875,14 @@ function DocumentsTab({
 }
 
 function ActivityTab({
+  orgId,
   activity,
   state,
   taskTitles,
   onRetry,
 }: {
+  /** The project's organization: its tasks read in that organization's status names. */
+  orgId: string | null;
   activity: ActivityEntry[];
   state: LoadState;
   taskTitles: Map<string, string>;
@@ -2899,6 +2919,7 @@ function ActivityTab({
       </div>
       <Section title="Activity Timeline">
         <ActivityList
+          orgId={orgId}
           entries={activity.filter(
             (entry) => filter === "all" || activityCategory(entry) === filter,
           )}
@@ -2960,19 +2981,23 @@ function activitySentence(
  * five invented entries and credited every change to "Alex Morgan" (FD-033).
  */
 function ActivityList({
+  orgId,
   entries,
   state,
   taskTitles,
   onRetry,
   detailed,
 }: {
+  /** The project's organization: its tasks read in that organization's status names. */
+  orgId: string | null;
   entries: ActivityEntry[];
   state: LoadState;
   taskTitles: Map<string, string>;
   onRetry: () => void;
   detailed?: boolean;
 }) {
-  const { statusLabel } = useTaskSettings();
+  const { statusLabelFor } = useTaskSettings();
+  const statusLabel = (value: string) => statusLabelFor(value, orgId);
   if (state !== "ready" && !entries.length) {
     return (
       <StateMessage

@@ -339,7 +339,15 @@ function PermissionEditor({
 function RoleDrawer({
   target, orgId, onClose,
 }: { target: Role | "new" | null; orgId: string; onClose: () => void }) {
-  const { createRole, updateRole, isRoleNameTaken } = useOrganizations();
+  const {
+    createRole,
+    updateRole,
+    isRoleNameTaken,
+    roleMembers,
+    isAdminIn,
+    activeAdminCountIn,
+    accessibleOrganizations,
+  } = useOrganizations();
   const editing = target && target !== "new" ? target : null;
   const open = !!target;
 
@@ -362,8 +370,25 @@ function RoleDrawer({
     if (isRoleNameTaken(draft.name, editing?.id, roleOrg)) return setError("A role with this name already exists.");
 
     if (editing) {
-      updateRole(editing.id, { ...draft, name: draft.name.trim() });
-      toast.success("Role updated");
+      // A custom role's Data Access is its permission: moving it off "All
+      // Organizations" takes admin away from everyone holding it. Refused when
+      // that would leave the organization without an active admin (the
+      // database refuses it too, and says so).
+      if (!editing.system && editing.baseRole === "admin" && draft.scope !== "all" && roleOrg) {
+        const adminHolders = roleMembers(editing).filter(
+          (u) => u.status === "active" && isAdminIn(u, roleOrg),
+        );
+        if (adminHolders.length && activeAdminCountIn(roleOrg) - adminHolders.length <= 0) {
+          const orgLabel =
+            accessibleOrganizations.find((o) => o.id === roleOrg)?.name ?? "this organization";
+          return setError(
+            `There must always be at least one active admin in ${orgLabel}. Make someone else admin first.`,
+          );
+        }
+      }
+      void updateRole(editing.id, { ...draft, name: draft.name.trim() }).then((saved) => {
+        if (saved) toast.success("Role updated");
+      });
     } else {
       createRole({ ...draft, name: draft.name.trim(), orgId: roleOrg || undefined });
       toast.success("Role created");
@@ -496,9 +521,12 @@ function RoleDetail({ role, onBack, onEdit }: { role: Role; onBack: () => void; 
     const userIsAdmin = orgId
       ? isAdminIn(user, orgId)
       : user.memberships.some((m) => isAdminIn(user, m.orgId));
+    // Counted by the admin permission people hold, as the database does.
     const adminsHere = orgId ? activeAdminCountIn(orgId) : activeAdminCount;
     if (userIsAdmin && !nextIsAdmin && user.status === "active" && adminsHere <= 1) {
-      toast.error("There must always be at least one active Admin.");
+      toast.error(
+        `There must always be at least one active admin in ${orgName ?? "this organization"}. Make someone else admin first.`,
+      );
       return;
     }
     setConfirm({ user, role: next });
@@ -654,9 +682,13 @@ function RoleDetail({ role, onBack, onEdit }: { role: Role; onBack: () => void; 
             <AlertDialogAction
               onClick={() => {
                 if (!confirm) return;
-                assignRole(confirm.user.id, confirm.role.id);
-                toast.success(`${confirm.user.name} is now ${confirm.role.name}`);
+                const { user, role: next } = confirm;
                 setConfirm(null);
+                // A change the database refuses (the organization's last active
+                // admin) shows its reason instead.
+                void assignRole(user.id, next.id).then((saved) => {
+                  if (saved) toast.success(`${user.name} is now ${next.name}`);
+                });
               }}
             >
               Change Role

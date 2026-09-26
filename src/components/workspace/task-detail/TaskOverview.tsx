@@ -65,10 +65,16 @@ export function TaskOverview({
   onChanged: () => void;
 }) {
   const { updateTask, tasks } = useWorkspace();
-  const { statusLabel, activeTaskStatuses, priorities } = useTaskSettings();
+  const { statusesFor, statusLabelFor, priorities } = useTaskSettings();
+  // The task's own organization's statuses and names, not the one the settings
+  // page shows: a task in another organization offered that one's statuses.
+  const statusLabel = (value: string) => statusLabelFor(value, task.organizationId);
   const dependencyTasks = tasks.filter((item) => task.dependencies.includes(item.id));
   const priorityName = priorities.find((item) => item.id === task.priority)?.name ?? task.priority;
-  const statuses = statusOptions(activeTaskStatuses, task.status);
+  const statuses = statusOptions(
+    statusesFor(task.organizationId).filter((item) => item.status === "active"),
+    task.status,
+  );
   const description = task.description?.trim();
   const statusHeadingId = useId();
 

@@ -87,7 +87,8 @@ function TaskDetail({
   onClose: () => void;
 }) {
   const { deleteTask } = useWorkspace();
-  const { statusLabel } = useTaskSettings();
+  const { statusLabelFor } = useTaskSettings();
+  const statusLabel = (value: string) => statusLabelFor(value, task.organizationId);
   const [editing, setEditing] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   // Bumped after comments and files change, so the activity list reloads.

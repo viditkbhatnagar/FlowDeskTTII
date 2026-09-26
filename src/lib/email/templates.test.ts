@@ -334,11 +334,15 @@ describe("subjects", () => {
 describe("account_access", () => {
   const c = byName("account_access");
   const { html } = run(c);
+  const WELCOME = `${APP}/welcome#token=${"ab12".repeat(16)}`;
+  const oneTime = run(c, { ...c.sample, setPasswordUrl: WELCOME, singleUseLink: true }).html;
 
   test("never carries a password", () => {
-    expect(html.toLowerCase()).not.toContain("password:");
-    expect(html).not.toContain("Temporary password");
-    expect(html).not.toMatch(/generated|credentials/i);
+    for (const variant of [html, oneTime]) {
+      expect(variant.toLowerCase()).not.toContain("password:");
+      expect(variant).not.toContain("Temporary password");
+      expect(variant).not.toMatch(/generated|credentials/i);
+    }
   });
 
   test("links the set-password flow and sign-in page", () => {
@@ -349,6 +353,23 @@ describe("account_access", () => {
     expect(html).toContain('href="https://flowdesk.upcarrera.com/auth"');
     expect(html).toContain("maya@upcarrera.com");
     expect(html).toContain("Flowdesk will never ask for your password by email.");
+  });
+
+  test("a one-time setup link says it works once and expires; the reset link does not", () => {
+    expect(oneTime).toContain(`href="${WELCOME}"`);
+    expect(oneTime).toContain(">Set your password</a>");
+    expect(oneTime).toContain(
+      "To get started, choose your password with the button below. The link works once and expires in 7 days.",
+    );
+    expect(html).toContain("To get started, choose your password with the button below.");
+    expect(html).not.toContain("works once");
+    expect(html).not.toContain("expires");
+  });
+
+  test("never promises a 6-digit code (the auth page explains the code when it sends one)", () => {
+    for (const variant of [html, oneTime]) {
+      expect(variant).not.toMatch(/6-digit|verification code/i);
+    }
   });
 });
 

@@ -136,16 +136,40 @@ function taskDetails(env: Env, task: SnapshotTask, org: SnapshotOrganization) {
   };
 }
 
+/**
+ * The one-time setup token that admin_create_user / admin_resend_welcome put on the row: 32 random
+ * bytes as lowercase hex (encode(…, 'hex')). The database keeps only its sha256 and strips it from
+ * the payload once the row is settled. It is a password-equivalent secret: it goes into the link
+ * and nowhere else (never a log line, a subject or an error).
+ */
+const SETUP_TOKEN = /^[0-9a-f]{64}$/;
+
+/**
+ * The one-time /welcome link when the row carries a setup token, else the reset-password flow.
+ * The token rides in the fragment (#token=…), never the query: a browser does not send the
+ * fragment to any server or in a Referer, so it stays out of the nginx access log. The page reads
+ * it in the browser and removes it from the address bar straight away.
+ */
+function setPasswordLink(env: Env): { url: string; singleUse: boolean } {
+  const token = env.row.payload.setupToken;
+  if (typeof token === "string" && SETUP_TOKEN.test(token)) {
+    return { url: `${env.ctx.appUrl}/welcome#token=${token}`, singleUse: true };
+  }
+  const email = encodeURIComponent(env.recipient.email);
+  return { url: `${env.ctx.appUrl}/auth?mode=reset&email=${email}`, singleUse: false };
+}
+
 function composeAccountAccess(env: Env): RenderedEmail {
   // Queued by a first membership; an admin who removes it again before the send withdraws it.
   if (!env.index.activeOrgsByUser.get(env.recipient.person.userId)?.length)
     suppress("recipient no longer belongs to any organization");
-  const email = env.recipient.email;
+  const link = setPasswordLink(env);
   return renderAccountAccess(
     {
       firstName: env.recipient.firstName,
-      emailAddress: email,
-      setPasswordUrl: `${env.ctx.appUrl}/auth?mode=reset&email=${encodeURIComponent(email)}`,
+      emailAddress: env.recipient.email,
+      setPasswordUrl: link.url,
+      singleUseLink: link.singleUse,
       signInUrl: `${env.ctx.appUrl}/auth`,
     },
     env.render,

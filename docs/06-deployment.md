@@ -408,10 +408,10 @@ build from the previous one.
 
 ## What still will not work afterwards
 
-- **Creating a new user account from the browser.** Minting accounts needs
-  privileges the public key must never have. Editing, deactivating and
-  role-assigning existing people all persist; inviting someone new needs a
-  server-side step that does not exist yet.
+- **Creating a new user account or organization from the browser.** Built since:
+  Settings → Users → Add User and Settings → Organizations → Add Organization work
+  once the onboarding migration is applied. See "Adding people and organizations
+  from the browser" at the end of this document.
 - **Adding a sixth task status or a new priority.** Those are Postgres enums on
   columns the board and dashboard key off; their presentation is editable, the
   set is not.
@@ -441,15 +441,23 @@ account-access emails from the last 7 days. To start clean, first run
 Rules the system enforces, so nobody is surprised by them:
 
 - **The welcome (account access) email goes out when a person is first given an
-  organization, and only if they have never signed in.** Creating the login alone sends
-  nothing. It is sent once per person, ever: adding a second organization, or removing and
-  re-adding one, sends nothing more. It is withdrawn if every membership is removed again
-  before it goes out. Because only an admin can add a membership, nobody can make FlowDesk
-  send a welcome email to an address of their choosing, even if sign-ups were ever switched
-  on.
+  organization, and only if they have never signed in.** A login created in Lovable Cloud
+  sends nothing until it gets an organization; Add User creates both at once. It goes out
+  once per person: adding a second organization, or removing and re-adding one, sends
+  nothing more. The only way to send another is an admin's **Resend welcome email** on the
+  person's page, which works until they first sign in (see "Adding people and
+  organizations from the browser"). It is withdrawn if every membership is removed again
+  before it goes out. Only an admin can add a person or a membership, so no one else can
+  make FlowDesk send a welcome email, even if sign-ups were ever switched on. An admin can
+  send one to any address they type; the abuse limits in "Adding people and organizations
+  from the browser" cap how many, per admin and for all admins together.
 
-  **Onboarding a new colleague** (a brand-new login has no organization yet, so it does not
-  appear in FlowDesk → Settings → Users, which only lists people in your organizations):
+  **Onboarding a new colleague:** once the onboarding migration is applied, use
+  **Settings → Users → Add User**. Their welcome email carries a one-time link to choose a
+  password. The SQL route below is the **fallback**, for when the browser route is not
+  available. Its welcome email links to the reset-password page instead, which sends a
+  6-digit code. A brand-new login has no organization yet, so it does not appear in
+  FlowDesk → Settings → Users until step 2:
   1. Lovable Cloud → Users → add the user with their email (and a temporary password if
      asked; they will set their own through the welcome email).
   2. Lovable Cloud → SQL editor, with their email and the organization code (`UPC` for
@@ -722,3 +730,217 @@ ones at the end of their send window.
 Paste `deploy/email/supabase-reset-password.html` into **Lovable Cloud → Emails → Reset
 password**, with the subject `Your Flowdesk password reset code`. `deploy/email/README.md`
 has the details. Do this after Step 4, so the logo URL already resolves.
+
+---
+
+# Adding people and organizations from the browser
+
+Naji reported that **Settings → Users → Add User** and **Settings → Organizations → Add
+Organization** did nothing. A login cannot be created with the browser key, and the hosted
+project has no service-role key: SQL pasted into its editor is the only way in. So both
+now run inside the database, in functions that check the caller is an admin before doing
+anything. Migration: `supabase/migrations/20260927000000_admin_onboarding.sql`.
+
+- **Add User** (admins only) creates the login with a random password nobody knows, gives
+  it its first organization, department, team, manager and role, and adds any further
+  organizations you picked. The welcome email carries a **one-time link**,
+  `https://flowdesk.upcarrera.com/welcome#token=…`. There the person chooses a password
+  and is signed straight in. The secret is after the `#`: browsers never send that part to
+  a server, so it is not in the nginx access log or in any Referer, and the page removes it
+  from the address bar as soon as it opens.
+- **Resend welcome email** (a button on the person's page in Settings → Users) sends a
+  fresh link. Every earlier link stops working at once.
+- **Add Organization** (admins only) creates the organization with the default roles and
+  settings, and makes you its admin. It is not made your primary organization.
+
+Rules, so nobody is surprised by them:
+
+- **A welcome link works once and expires after 7 days.** The database keeps only its
+  SHA-256, and the link leaves the email queue as soon as the email is sent. An expired,
+  used or superseded link shows "This link has expired or was already used", with **Reset
+  your password** and **Go to sign in**.
+- **Resend works only until the person first signs in.** After that the button answers
+  "They have already signed in — they can use Forgot password". It also refuses an
+  inactive account.
+- **A link that went to the wrong person can be taken back.** Deactivate the account
+  (Settings → Users → the person → Deactivate), or remove their last organization. Every
+  unused link of theirs stops working at once, and a welcome email still waiting to go out
+  is withdrawn. Reactivating does not bring an old link back; use **Resend welcome email**
+  for a new one. The link page also refuses anyone who is inactive or has no active
+  organization.
+- **Deactivate really switches a person off.** Their access to every organization is
+  switched off and they are signed out. If they sign in again (for example through Forgot
+  password, which still works), they see only "Your Flowdesk account is deactivated" and a
+  Sign out button, never the workspace, and the database gives them nothing: not even the
+  tasks they created or were assigned, their comments or their files. **Activate** gives
+  back exactly the organizations they had. Giving a deactivated person another
+  organization, or saving their details, keeps that access switched off too until
+  Activate. Nobody can deactivate or reactivate their own account, admins included.
+  Someone who signs in but is in no organization sees "You haven't been added to an
+  organization yet" instead.
+- **Every organization always keeps at least one active admin**: someone with the Admin
+  permission, an active membership there and an active account. The database refuses
+  anything that would leave an organization with none, and the screen shows its reason,
+  for example "There must always be at least one active admin in upCarrera. Make someone
+  else admin first." That covers deactivating that person, giving them a role without
+  admin rights, moving a custom admin role off "All Organizations", and removing or
+  switching off their access to the organization. The fix is always the same: make someone
+  else Admin there first, then try again. People are counted by the permission they
+  actually hold, not by the role name shown, so a sole admin whose role reads "Employee"
+  (see Step 5) still counts. **In the SQL editor**, removing a person's permission
+  (`user_roles`) is refused the same way while their membership is active: delete their
+  `organization_memberships` row first (the SQL editor may do that; the browser may not),
+  or delete the whole login in Lovable Cloud → Users. Deleting the last admin's login is
+  allowed, and leaves that organization with no admin until you make someone else Admin.
+- **Add User needs a department in that organization** (create one under Teams &
+  Departments first). New people can only be given organizations **you** administer.
+- **Organization codes are 2 to 8 letters or digits**, stored in capitals. Names and codes
+  must be unique, ignoring case. The time zone must be a real one from the list;
+  `posix/…`, `right/…` and `Factory` copies are refused, because the app and the email
+  engine would silently treat them as UTC.
+- **Abuse limits**, for each admin and for all admins together:
+  - new people: 30 an hour per admin; 60 an hour and 150 a day in all;
+  - resent welcome emails: 5 a day per person; 60 an hour in all;
+  - new organizations: 10 a day per admin; 20 a day in all.
+
+  Past a limit, the screen says so and nothing is created. Only an admin whose own account
+  is active can use Add User, Resend welcome email or Add Organization. The "in all"
+  limits are shared, so one hostile admin can use them up and block everyone else until
+  the hour or day has passed, which we accept because it also caps what one compromised
+  admin can do.
+- **Passwords chosen on /welcome must be 8 to 72 characters.** The database writes the
+  password itself, so Lovable Cloud's own password rules (for example leaked-password
+  protection, if it is ever switched on) are not applied to this first password.
+
+## Step 1 — apply the migration (SQL editor)
+
+This needs the email migration applied first (`build-email-upgrade.sh`, above). If it is
+missing, the bundle stops with a clear error before changing anything.
+
+```bash
+bash deploy/supabase/build-onboarding-upgrade.sh > onboarding-upgrade.sql   # locally
+```
+
+Paste `onboarding-upgrade.sql` into the Lovable Cloud SQL editor and run it once. It runs
+as a single transaction and is safe to re-run. **Apply it before deploying the new
+build.** Without it, Add User and Add Organization answer "That didn't go through. Check
+your connection and try again.", because the functions they call do not exist yet.
+
+**The result grid is not empty: read it and keep a copy.** The script ends by repairing
+people's permissions, switching off the access of anyone deactivated before this release,
+and listing every change it made (Step 5 explains what the rows mean). Copy the grid into
+the release notes, or take a screenshot, before you close the editor. It is shown once;
+running the script again lists only what is still left to do.
+
+## Step 2 — confirm it took
+
+```sql
+select proname from pg_proc
+ where proname in ('admin_create_user', 'admin_resend_welcome',
+                   'complete_account_setup', 'admin_create_organization');
+-- expect 4 rows
+```
+
+## Step 3 — rebuild and redeploy
+
+The new screens, the `/welcome` page and the new welcome-email link all ship in the build.
+No `.env` change is needed. Build against the hosted project exactly as in
+[Redeploying](#redeploying): never with a plain `bun run build` while `.env.local` points
+at local Supabase. Then rsync and `pm2 restart flowdesk`, and check that `upcarrera-api` is
+still online.
+
+## Step 4 — verify
+
+1. Sign in as an admin. Settings → Users → **Add User**, for a real colleague who needs an
+   account: name, email, designation, organization, department, role. Expect the toast
+   "Welcome email on its way to …", and the person listed straight away.
+2. Within about five minutes the welcome email arrives. Its **Set your password** button
+   opens `https://flowdesk.upcarrera.com/welcome#token=…`, and the address bar then shows
+   just `/welcome`. Choosing a password there signs them in to the dashboard.
+3. In the SQL editor, the email is recorded as sent and no link is left behind:
+
+   ```sql
+   select status, payload ? 'setupToken' as still_has_link, created_at
+     from public.email_outbox where kind = 'account_access'
+    order by created_at desc limit 5;
+   -- the new row: sent / false
+   ```
+
+## Step 5 — the automatic repair of existing roles (read its result)
+
+Before this release, every role change made in the browser saved the role's **name** but
+failed to save the **permission** it grants (the write did not match the table's unique
+key). So someone shown as "Employee" could still hold admin rights, and people added
+through Add Existing User could have no permission at all. Opening the person and saving
+their role again did not fix it either: the page skipped the permission write whenever the
+name looked unchanged.
+
+The migration repairs this itself, in the same transaction. Each person's permission in an
+organization is made exactly what their role there stands for: a wrong permission is
+changed, an extra one removed, a missing one added. The role name is what an admin chose,
+so it wins. A membership with no role recorded is never touched. From then on the database
+keeps the two in step on every role change, and Edit User always writes the permission on
+save. The one exception is a membership that points at another organization's role, which
+the repair also leaves alone: the Users page shows it as the role matching the permission
+the person really holds, and a save that keeps that role leaves the permission as it is. Changing a custom role's access level (Settings → Roles & Permissions) changes the
+permission of everyone who holds that role, at once.
+
+The grid the script ends with lists what the repair did, one row per person and
+organization:
+
+| Column | Meaning |
+|---|---|
+| `email`, `organization` | Who, and in which organization (its code). |
+| `role_shown` | The role FlowDesk shows for them there. "(inactive membership)" means that access is switched off. |
+| `permission_before` | What row-level security enforced before. `(none)`: they had no permission there. |
+| `permission_after` | What it enforces now. |
+| `what_happened` | `changed to match the role shown`, `extra permission removed`, `added: they had no permission in this organization`, `NOT changed: …` (below), and for accounts deactivated before this release `access switched off: …` or `NOT switched off: …` (below). |
+
+- **One row reading `(nobody)` / "Nothing to repair"**: every permission already matched,
+  and no deactivated account still had access. Nothing changed.
+- **`access switched off: their account was deactivated before this release`**
+  (`role_shown` ends in "(account deactivated)"): before this release Deactivate did not
+  switch off the person's organizations, so they kept access. Now it does. **Activate**
+  on their page gives it back if that was a mistake.
+- **`NOT switched off: they are the only admin … has left`**: that deactivated person still
+  holds the only admin permission of that organization, so their access there was left
+  on. Make someone else Admin there, then run the bundle again.
+- **`admin` → something else**: that person has lost admin rights they should not have
+  had. Tell the organization's admins, in case someone relied on them.
+- **`NOT changed: that would leave … with no active admin`**: the repair never removes the
+  last working admin of an organization. Make the right person Admin there (Settings →
+  Roles & Permissions, or Edit User), then run the bundle again. It changes nothing else
+  the second time and lists only the rows still left. Until then, saving that person with
+  the non-admin role they are shown is refused, with a message saying why, so nobody can
+  lock the organization out by accident.
+
+To check again later (read-only; expect 0 rows, or only rows the repair reported as NOT
+changed):
+
+```sql
+select u.email, o.code as organization, r.name as role_shown, r.base_role as should_be,
+       coalesce(string_agg(ur.role::text, ', ' order by ur.role), '(none)') as actually_is
+  from public.organization_memberships m
+  join auth.users u on u.id = m.user_id
+  join public.organizations o on o.id = m.organization_id
+  join public.roles r on r.id = m.role_id and r.organization_id = m.organization_id
+  left join public.user_roles ur on ur.user_id = m.user_id and ur.organization_id = m.organization_id
+ group by u.email, o.code, r.name, r.base_role
+having array_agg(ur.role order by ur.role) filter (where ur.role is not null)
+       is distinct from array[r.base_role]
+ order by 1, 2;
+```
+
+## Notes
+
+- **The welcome link is a secret until it is used**, and it stays out of every log: the
+  secret travels after the `#`, which browsers never send to a server, and the page drops
+  it from the address bar before loading anything else. No nginx change is needed.
+- **Task & Project Settings now shows one organization at a time.** Each organization has
+  its own statuses, categories and tags, and someone in several organizations used to see
+  them all merged (every tag twice, for instance). The page edits the organization picked
+  in its **Organization** menu, which is the same choice as the organization switcher in
+  the header. New Task offers the tags of the organization the task will belong to: its
+  project's, or the creator's primary organization.
+- **Fallback:** the SQL route in "Onboarding a new colleague" (Email notifications, above)
+  still works with this migration applied.

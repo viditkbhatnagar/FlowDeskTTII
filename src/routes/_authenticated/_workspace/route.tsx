@@ -5,17 +5,17 @@ import {
   useLocation,
   useNavigate,
 } from "@tanstack/react-router";
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Sidebar } from "@/components/workspace/Sidebar";
 import { Header } from "@/components/workspace/Header";
 import { NewTaskDialog } from "@/components/workspace/NewTaskDialog";
 import { WorkspaceProvider } from "@/lib/workspace-data";
 import { OrganizationsProvider, useOrganizations } from "@/lib/organizations-data";
 import { TaskSettingsProvider } from "@/lib/task-settings-data";
-import { supabase } from "@/integrations/supabase/client";
 import {
   checkOnEntry,
   DESTINATION_PATHS,
+  loadAccountAccess,
   WorkspaceShellContext,
   type WorkspaceShell,
 } from "@/routes/_authenticated/-workspace-shell";
@@ -35,17 +35,14 @@ const ORG_SWITCHER_PAGES = new Set(["my-tasks", "team", "projects"]);
  * (FD-038). As a layout it stays mounted between pages, so data is not reloaded.
  */
 export const Route = createFileRoute("/_authenticated/_workspace")({
-  // Checked on the way in, not on every move between workspace pages.
+  // Checked on the way in, not on every move between workspace pages. A
+  // deactivated account, or one in no organization, gets a page saying so
+  // instead of an empty workspace. A failed lookup is neither: it throws, and
+  // the error page offers Try again.
   beforeLoad: ({ context, cause }) =>
     checkOnEntry(`membership:${context.user.id}`, cause, async () => {
-      const { count, error } = await supabase
-        .from("organization_memberships")
-        .select("id", { count: "exact", head: true })
-        .eq("user_id", context.user.id)
-        .eq("status", "active");
-      // A failed lookup is not "no organization"; show the error page with Try again.
-      if (error) throw new Error(`Could not load your organizations: ${error.message}`);
-      if (!count) throw redirect({ to: "/no-organization" });
+      const access = await loadAccountAccess(context.user.id);
+      if (access !== "ok") throw redirect({ to: "/no-organization" });
     }),
   head: () => ({
     meta: [
@@ -71,10 +68,48 @@ function WorkspaceLayout() {
   );
 }
 
+/**
+ * Access can end while the workspace is open: an admin deactivates the person,
+ * or removes their last organization. The entry check does not run again for
+ * moves between pages, so this re-checks in the background after each move and
+ * when the tab comes back into view, and shows the page that explains it.
+ */
+function useAccessWatch(userId: string, pathname: string) {
+  const navigate = useNavigate();
+  const check = useCallback(() => {
+    void loadAccountAccess(userId)
+      .then((access) => {
+        if (access !== "ok") void navigate({ to: "/no-organization", replace: true });
+      })
+      // Not a verdict: the next move or focus checks again.
+      .catch((error: unknown) => console.warn("[flowdesk] access check failed", error));
+  }, [userId, navigate]);
+
+  // The entry check has just run for the first page.
+  const entered = useRef(false);
+  useEffect(() => {
+    if (!entered.current) {
+      entered.current = true;
+      return;
+    }
+    check();
+  }, [pathname, check]);
+
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === "visible") check();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [check]);
+}
+
 function WorkspaceFrame() {
   const { canManageUsers } = useOrganizations();
   const navigate = useNavigate();
   const pathname = useLocation({ select: (location) => location.pathname });
+  const userId = Route.useRouteContext({ select: (context) => context.user.id });
+  useAccessWatch(userId, pathname);
   const current = navItemForPath(pathname);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);

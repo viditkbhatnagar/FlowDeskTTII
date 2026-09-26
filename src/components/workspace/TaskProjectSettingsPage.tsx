@@ -56,11 +56,14 @@ export function TaskProjectSettingsPage() {
 
   return (
     <div className="space-y-6 animate-fade-in">
-      <div>
-        <h2 className="text-xl font-semibold tracking-tight">Task &amp; Project Settings</h2>
-        <p className="text-sm text-muted-foreground">
-          One place to configure the statuses, priorities, categories and tags used across the workspace.
-        </p>
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <h2 className="text-xl font-semibold tracking-tight">Task &amp; Project Settings</h2>
+          <p className="text-sm text-muted-foreground">
+            The statuses, priorities, categories and tags one organization works with.
+          </p>
+        </div>
+        <SettingsOrganizationPicker />
       </div>
 
       <div className="inline-flex flex-wrap items-center rounded-lg border border-border bg-card p-1 shadow-[var(--shadow-soft)]">
@@ -86,6 +89,55 @@ export function TaskProjectSettingsPage() {
       {tab === "project-category" && <CategoryTab />}
       {tab === "project-status" && <ProjectStatusTab />}
       {tab === "tags" && <TagsTab />}
+    </div>
+  );
+}
+
+/**
+ * Which organization these settings belong to. Each organization has its own
+ * statuses, categories and tags; someone in several organizations saw them all
+ * merged (every tag twice) and edited whichever came first. Switching here is
+ * the same as the organization switcher in the header.
+ *
+ * Only organizations where they hold the admin or manager permission are
+ * offered: anywhere else the database refuses every change, so the page used
+ * to accept edits there and silently lose them.
+ */
+function SettingsOrganizationPicker() {
+  const { managedOrganizations, setActiveOrgId } = useOrganizations();
+  const { settingsOrgId } = useTaskSettings();
+  const pickerId = useId();
+  const current = managedOrganizations.find((o) => o.id === settingsOrgId);
+  const currentId = current?.id;
+  const firstManagedId = managedOrganizations[0]?.id;
+  // Arriving with an organization they can't manage selected (the header's
+  // switcher is shared): show the first one they can.
+  useEffect(() => {
+    if (!currentId && firstManagedId) setActiveOrgId(firstManagedId);
+  }, [currentId, firstManagedId, setActiveOrgId]);
+  if (managedOrganizations.length <= 1) {
+    return current ? (
+      <p className="text-xs text-muted-foreground">
+        For <span className="font-medium text-foreground">{current.name}</span>
+      </p>
+    ) : null;
+  }
+  return (
+    <div className="space-y-1">
+      <label htmlFor={pickerId} className={labelClass}>Organization</label>
+      <select
+        id={pickerId}
+        value={settingsOrgId ?? ""}
+        onChange={(e) => setActiveOrgId(e.target.value)}
+        className={cn(inputClass, "min-w-[240px]")}
+      >
+        {!current && <option value="" disabled>Choose an organization</option>}
+        {managedOrganizations.map((o) => (
+          <option key={o.id} value={o.id}>
+            {o.name}
+          </option>
+        ))}
+      </select>
     </div>
   );
 }
@@ -495,22 +547,22 @@ function CategoryDrawer({
   target: ProjectCategory | "new" | null;
   onClose: () => void;
 }) {
-  const { addCategory, updateCategory, isCategoryNameTaken } = useTaskSettings();
+  const { addCategory, updateCategory, isCategoryNameTaken, settingsOrgId } = useTaskSettings();
   const { organizations } = useOrganizations();
   const fieldId = useId();
   const editing = target && target !== "new" ? target : null;
   const [name, setName] = useState("");
-  const [scope, setScope] = useState<"global" | "selected">("global");
-  const [orgIds, setOrgIds] = useState<string[]>([]);
   const [status, setStatus] = useState<ConfigStatus>("active");
   const [error, setError] = useState<string | null>(null);
   const [key, setKey] = useState(0);
+  // A category is a row of one organization: the one these settings are for.
+  // "All Organizations" / "Selected Organization(s)" here was never stored.
+  const ownerId = editing?.orgIds[0] ?? settingsOrgId;
+  const owner = organizations.find((o) => o.id === ownerId);
 
   const targetKey = editing?.id ?? (target === "new" ? "new" : "none");
   useEffect(() => {
     setName(editing?.name ?? "");
-    setScope(editing?.scope ?? "global");
-    setOrgIds(editing?.orgIds ?? []);
     setStatus(editing?.status ?? "active");
     setError(null);
     setKey((k) => k + 1);
@@ -519,9 +571,8 @@ function CategoryDrawer({
   const submit = () => {
     if (!name.trim()) return setError("Category name is required.");
     if (isCategoryNameTaken(name, editing?.id)) return setError("That category already exists.");
-    if (scope === "selected" && orgIds.length === 0)
-      return setError("Select at least one organization.");
-    const payload = { name, scope, orgIds: scope === "global" ? [] : orgIds, status };
+    if (!ownerId) return setError("Choose an organization first.");
+    const payload = { name, scope: "selected" as const, orgIds: [ownerId], status };
     if (editing) {
       updateCategory(editing.id, payload);
       toast.success("Category updated.");
@@ -545,41 +596,17 @@ function CategoryDrawer({
             <input id={`${fieldId}-name`} className={inputClass} value={name} onChange={(e) => setName(e.target.value)} />
           </div>
           <div className="space-y-1.5">
-            <label htmlFor={`${fieldId}-scope`} className={labelClass}>Available For</label>
-            <select
-              id={`${fieldId}-scope`}
-              className={inputClass}
-              value={scope}
-              onChange={(e) => setScope(e.target.value as "global" | "selected")}
-            >
-              <option value="global">All Organizations</option>
-              <option value="selected">Selected Organization(s)</option>
-            </select>
+            <div className={labelClass}>Organization</div>
+            <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm">
+              {owner ? (
+                <>
+                  {owner.name} <span className="text-xs text-muted-foreground">{owner.code}</span>
+                </>
+              ) : (
+                <span className="text-muted-foreground">—</span>
+              )}
+            </p>
           </div>
-          {scope === "selected" && (
-            <div className="space-y-1.5">
-              <div className={labelClass}>Organizations</div>
-              <div className="space-y-1 rounded-lg border border-border p-2">
-                {organizations.map((org) => (
-                  <label key={org.id} className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-accent">
-                    <input
-                      type="checkbox"
-                      checked={orgIds.includes(org.id)}
-                      onChange={(e) =>
-                        setOrgIds((current) =>
-                          e.target.checked
-                            ? [...current, org.id]
-                            : current.filter((id) => id !== org.id),
-                        )
-                      }
-                    />
-                    <span>{org.name}</span>
-                    <span className="text-xs text-muted-foreground">{org.code}</span>
-                  </label>
-                ))}
-              </div>
-            </div>
-          )}
           <div className="space-y-1.5">
             <label htmlFor={`${fieldId}-status`} className={labelClass}>Status</label>
             <select
