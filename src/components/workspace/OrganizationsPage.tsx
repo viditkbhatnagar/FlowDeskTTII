@@ -340,8 +340,15 @@ function OrganizationDrawer({
     setSubmitting(false);
     if (!result.ok) {
       const field = organizationErrorField(result.error);
-      if (field) setErrors({ [field]: result.error.message });
-      else toast.error(result.error.message);
+      // A duplicate among the organizations you can see is caught before the call, so
+      // one the server reports is an organization you are not a member of.
+      const message =
+        result.error.code === "23505"
+          ? `${result.error.message}, but you're not a member of it, so it isn't in your list. ` +
+            "Ask one of its admins to add you: Settings → Users → your name → Organization Access."
+          : result.error.message;
+      if (field) setErrors({ [field]: message });
+      else toast.error(message);
       return;
     }
     toast.success(`${payload.name} created. You're its admin.`);

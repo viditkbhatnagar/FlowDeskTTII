@@ -1680,8 +1680,19 @@ function AssignmentDialog({
           </button>
           <button
             onClick={() => {
-              if (!draft.orgId || !draft.departmentId) {
-                toast.error("Organization and department are required");
+              if (!draft.orgId) {
+                toast.error("Choose an organization");
+                return;
+              }
+              if (!draft.departmentId) {
+                const hasDepartments = departments.some(
+                  (d) => d.orgId === draft.orgId && d.status === "active",
+                );
+                toast.error(
+                  hasDepartments
+                    ? "Choose a department"
+                    : "This organization has no departments yet. Add one in Settings → Teams & Departments first.",
+                );
                 return;
               }
               const role = draft.role || defaultRoleFor(draft.orgId);
