@@ -473,13 +473,15 @@ const blankDraft = (role: string): DraftMembership => ({
  * a brand-new component on every keystroke and remounted every field.
  */
 function AssignmentFields({
-  value, onChange, allowRole = true, lockOrganization = false, organizations, departments, teams,
-  users, roleNames, defaultRoleFor,
+  value, onChange, allowRole = true, lockOrganization = false, takenOrgIds = [], organizations,
+  departments, teams, users, roleNames, defaultRoleFor,
 }: {
   value: DraftMembership;
   onChange: (next: DraftMembership) => void;
   allowRole?: boolean;
   lockOrganization?: boolean;
+  /** Chosen elsewhere in the same form, so not offered here (the current choice always stays). */
+  takenOrgIds?: string[];
   organizations: Organization[];
   departments: Department[];
   teams: Team[];
@@ -515,9 +517,11 @@ function AssignmentFields({
           disabled={lockOrganization}
         >
           <option value="">Select organization</option>
-          {organizations.map((o) => (
-            <option key={o.id} value={o.id}>{o.name}</option>
-          ))}
+          {organizations
+            .filter((o) => o.id === value.orgId || !takenOrgIds.includes(o.id))
+            .map((o) => (
+              <option key={o.id} value={o.id}>{o.name}</option>
+            ))}
         </select>
       </div>
       <div className="space-y-1.5">
@@ -795,7 +799,8 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
     if (additional.some((a) => !a.orgId || !a.departmentId))
       next.additional = "Each additional access needs an organization and department";
     if (new Set([primary.orgId, ...additional.map((a) => a.orgId)]).size !== additional.length + 1)
-      next.additional = "An organization can only be assigned once";
+      next.additional =
+        "An organization can only be assigned once. The primary organization is already included, so remove the duplicate row.";
     if (isNew) {
       // The server checks these too; saying so here saves a round trip.
       const orgHasDepartments = departments.some(
@@ -893,6 +898,10 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
     close();
   };
 
+  const usedOrgIds = [primary.orgId, ...additional.map((a) => a.orgId)].filter(Boolean);
+  const canAddAnotherOrg = (isNew ? adminOrganizations : organizations).some(
+    (o) => !usedOrgIds.includes(o.id),
+  );
   const assignmentProps = {
     // New people can only be given organizations the caller administers.
     organizations: isNew ? adminOrganizations : organizations,
@@ -1015,6 +1024,7 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
               onChange={(next) => { setPrimary(next); clearErrors("org", "dept", "manager", "role"); }}
               allowRole={false}
               lockOrganization={!!existing}
+              takenOrgIds={additional.map((a) => a.orgId).filter(Boolean)}
               {...assignmentProps}
             />
             {(errors.org || errors.dept || errors.manager) && (
@@ -1027,7 +1037,9 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
               <div className={sectionClass}>Additional Organization Access</div>
               <button
                 onClick={() => setAdditional((c) => [...c, blankDraft("")])}
-                className="inline-flex items-center gap-1 rounded-lg border border-border px-2 py-1 text-[11px] hover:bg-accent"
+                disabled={!canAddAnotherOrg}
+                title={canAddAnotherOrg ? undefined : "Every organization you manage is already assigned above."}
+                className="inline-flex items-center gap-1 rounded-lg border border-border px-2 py-1 text-[11px] hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
               >
                 <Plus className="h-3 w-3" /> Add Organization
               </button>
@@ -1052,6 +1064,7 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
                     setAdditional((c) => c.map((v, i) => (i === index ? next : v)));
                     clearErrors("additional");
                   }}
+                  takenOrgIds={[primary.orgId, ...additional.filter((_, i) => i !== index).map((a) => a.orgId)].filter(Boolean)}
                   {...assignmentProps}
                 />
               </div>
