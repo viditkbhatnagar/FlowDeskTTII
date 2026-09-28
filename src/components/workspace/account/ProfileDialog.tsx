@@ -13,8 +13,11 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { SavedAvatarPicker } from "@/components/workspace/account/AvatarPicker";
+import { AVATAR_LIMIT_LABEL } from "@/lib/avatar-photo";
 import { EMAIL_KIND_LABELS, MANAGEMENT_KINDS, type PreferenceKind } from "@/lib/email/kinds";
 import type { AppRole } from "@/lib/email/snapshot";
+import { useOrganizations } from "@/lib/organizations-data";
 import {
   loadMyPreferences,
   loadMyRoles,
@@ -54,6 +57,7 @@ export function ProfileDialog({
   email,
   name,
   onNameSaved,
+  onPhotoSaved,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -61,7 +65,10 @@ export function ProfileDialog({
   email: string;
   name: string;
   onNameSaved: (name: string) => void;
+  /** After the photo is changed or removed: its new URL, or null. */
+  onPhotoSaved?: (url: string | null) => void;
 }) {
+  const { reload: reloadPeople } = useOrganizations();
   const [draftName, setDraftName] = useState(name);
   const [nameError, setNameError] = useState<string | null>(null);
   const [savingName, setSavingName] = useState(false);
@@ -164,10 +171,23 @@ export function ProfileDialog({
         <DialogHeader>
           <DialogTitle>Profile &amp; password</DialogTitle>
           <DialogDescription>
-            Update how your name appears to colleagues, change your password, or choose which emails
-            you get.
+            Update your photo and how your name appears to colleagues, change your password, or
+            choose which emails you get.
           </DialogDescription>
         </DialogHeader>
+
+        <ProfilePhoto
+          open={open}
+          userId={userId}
+          name={name}
+          onSaved={(url) => {
+            onPhotoSaved?.(url);
+            // The Users list, the org chart and search show photos from there.
+            void reloadPeople();
+          }}
+        />
+
+        <div className="h-px bg-border" />
 
         <form className="space-y-3" onSubmit={saveName} noValidate>
           <div className="space-y-1.5">
@@ -258,6 +278,85 @@ export function ProfileDialog({
         <EmailPreferences />
       </DialogContent>
     </Dialog>
+  );
+}
+
+/**
+ * Your own photo. It is read afresh each time the dialog opens, so the photo
+ * replaced (and deleted) is the one actually on the profile.
+ */
+function ProfilePhoto({
+  open,
+  userId,
+  name,
+  onSaved,
+}: {
+  open: boolean;
+  userId: string | null;
+  name: string;
+  onSaved: (url: string | null) => void;
+}) {
+  const [photoUrl, setPhotoUrl] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+
+  useEffect(() => {
+    if (!open || !userId) return;
+    let cancelled = false;
+    setLoaded(false);
+    setFailed(false);
+    void supabase
+      .from("profiles")
+      .select("avatar_url")
+      .eq("user_id", userId)
+      .maybeSingle()
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error) {
+          console.error("[profile] Could not load the profile photo", error);
+          setFailed(true);
+          return;
+        }
+        setPhotoUrl(data?.avatar_url ?? null);
+        setLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, userId, attempt]);
+
+  return (
+    <section className="space-y-2" aria-labelledby="profile-photo-label">
+      <p id="profile-photo-label" className="text-sm font-medium">
+        Photo
+      </p>
+      {failed && (
+        <div className="flex items-center justify-between gap-3 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          <span role="alert">Your photo couldn&rsquo;t be loaded.</span>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => setAttempt((n) => n + 1)}
+          >
+            Try again
+          </Button>
+        </div>
+      )}
+      <SavedAvatarPicker
+        // Disabled until the current photo is known, so the right one is replaced.
+        userId={loaded ? userId : null}
+        name={name}
+        avatarUrl={photoUrl}
+        onSaved={(url) => {
+          setPhotoUrl(url);
+          onSaved(url);
+        }}
+        labelledBy="profile-photo-label"
+        hint={`Shown to colleagues next to your name. JPEG, PNG or WebP, up to ${AVATAR_LIMIT_LABEL}.`}
+      />
+    </section>
   );
 }
 

@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
+import { saveAvatarPhoto } from "@/lib/avatar-storage";
 import {
   assignRoleRow,
   createAccountRpc,
@@ -123,12 +124,20 @@ export interface UserActivity {
   at: string;
 }
 
+/**
+ * What Add User reports. The account can be created and its photo still fail
+ * (the upload needs the account to exist first): `photoError` then says why,
+ * and the photo can be added from Edit User.
+ */
+export type CreateUserResult = AdminRpcResult<string> & { photoError?: string };
+
 /** Add User, for someone who has no account yet. */
 export interface NewUserInput {
   name: string;
   email: string;
   phone?: string;
-  avatarUrl?: string;
+  /** The cropped profile photo, stored once the account exists. */
+  photo?: Blob;
   employeeId?: string;
   designation: string;
   joiningDate?: string;
@@ -346,7 +355,7 @@ type OrganizationsContextValue = {
    * organizations, then reload. Resolves with the new user's id, or the
    * server's reason for refusing (nothing is created in that case).
    */
-  createUser: (input: NewUserInput) => Promise<AdminRpcResult<string>>;
+  createUser: (input: NewUserInput) => Promise<CreateUserResult>;
   /** A new welcome email with a fresh link, for someone who has never signed in. */
   resendWelcome: (userId: string) => Promise<AdminRpcResult<null>>;
   /** Create an organization on the server; the caller becomes its admin. */
@@ -1023,17 +1032,20 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
         const userId = created.value;
         // The account exists from here on. What follows is best effort: each
         // failure is reported on its own and can be redone from the user's page.
-        if (input.avatarUrl) {
-          reportIfFailed("The profile photo")(
-            await updateProfileRow(userId, { avatarUrl: input.avatarUrl }),
-          );
+        // The photo before the reload, so the list shows it at once. Storing it
+        // needs the membership just created: an admin may store photos only of
+        // their organization's people.
+        let photoError: string | undefined;
+        if (input.photo) {
+          const saved = await saveAvatarPhoto({ userId, photo: input.photo });
+          if (!saved.ok) photoError = saved.message;
         }
         for (const membership of input.additional) {
           await persistMembership(userId, membership, { isPrimary: false, writePrivilege: true });
         }
         pushActivity(userId, "created", "Account created and welcome email queued");
         await reload();
-        return created;
+        return photoError ? { ...created, photoError } : created;
       },
       resendWelcome: async (userId) => {
         const result = await resendWelcomeRpc(userId);

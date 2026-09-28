@@ -55,6 +55,15 @@ export function Header({
   const queryClient = useQueryClient();
   const { tasks, people, refresh } = useWorkspace();
   const { users } = useOrganizations();
+  // Your photo as the Users list has it. That list reloads after any photo change
+  // (your own Profile, or Settings → Users → Edit User), so the header follows it.
+  const listedAvatarUrl = useMemo(() => {
+    const me = userId ? users.find((user) => user.id === userId) : undefined;
+    return me ? (me.avatarUrl ?? null) : undefined;
+  }, [users, userId]);
+  useEffect(() => {
+    if (listedAvatarUrl !== undefined) setAvatarUrl(listedAvatarUrl);
+  }, [listedAvatarUrl]);
   const { statusLabelFor } = useTaskSettings();
   const [query, setQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
@@ -508,6 +517,7 @@ export function Header({
           // Task cards and pickers show the name from the workspace data; reload it.
           void refresh();
         }}
+        onPhotoSaved={setAvatarUrl}
       />
     </header>
   );

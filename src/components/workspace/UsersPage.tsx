@@ -1,4 +1,4 @@
-import { useId, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import {
   Plus, MoreHorizontal, Eye, Pencil, Ban, ArrowLeft, Mail, Phone, Search,
   CheckCircle2, Trash2, Building2, Shield, CalendarDays, X, Loader2, Send,
@@ -25,6 +25,8 @@ import {
 } from "@/lib/organizations-data";
 import { useWorkspace } from "@/lib/workspace-data";
 import { todayIn } from "@/lib/today";
+import { AVATAR_LIMIT_LABEL } from "@/lib/avatar-photo";
+import { AvatarPicker, SavedAvatarPicker } from "@/components/workspace/account/AvatarPicker";
 
 const inputClass =
   "h-9 w-full rounded-lg border border-input bg-card px-3 text-sm outline-none transition focus:border-ring focus:ring-2 focus:ring-ring/20";
@@ -641,6 +643,7 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
     createUser,
     currentUser,
     activeOrgId,
+    reload,
   } = useOrganizations();
   const { refresh: refreshPeople } = useWorkspace();
   const { roleNames, defaultRoleFor } = useRoleChoices();
@@ -665,7 +668,14 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
   const [email, setEmail] = useState("");
   const [phone, setPhone] = useState("");
   const [phoneTouched, setPhoneTouched] = useState(false);
+  // Edit User stores a new photo at once; this is the one the profile has now.
   const [avatarUrl, setAvatarUrl] = useState("");
+  // Add User keeps the cropped photo until the account exists to store it under.
+  const [pendingPhoto, setPendingPhoto] = useState<{ blob: Blob; previewUrl: string } | null>(null);
+  useEffect(() => {
+    if (!pendingPhoto) return;
+    return () => URL.revokeObjectURL(pendingPhoto.previewUrl);
+  }, [pendingPhoto]);
   const [employeeId, setEmployeeId] = useState("");
   const [designation, setDesignation] = useState("");
   const [joiningDate, setJoiningDate] = useState("");
@@ -681,6 +691,7 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
     setSeed(key);
     setErrors({});
     setPhoneTouched(false);
+    setPendingPhoto(null);
     if (existing) {
       const primaryMembership =
         existing.memberships.find((m) => m.orgId === existing.primaryOrgId) ?? existing.memberships[0];
@@ -725,6 +736,7 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
   const close = () => {
     if (submitting) return;
     setSeed(null);
+    setPendingPhoto(null);
     onClose();
   };
 
@@ -762,7 +774,7 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
       name: name.trim(),
       email: trimmedEmail,
       phone: phone.trim() || undefined,
-      avatarUrl: avatarUrl.trim() || undefined,
+      photo: pendingPhoto?.blob,
       employeeId: employeeId.trim() || undefined,
       designation: designation.trim(),
       joiningDate: joiningDate || undefined,
@@ -778,7 +790,15 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
     }
     void refreshPeople();
     toast.success(`Welcome email on its way to ${trimmedEmail}`);
+    if (result.photoError) {
+      // The account is there; only the photo is missing, and Edit User can add it.
+      toast.error(`${name.trim()} was added, but their photo wasn't saved.`, {
+        description: `${result.photoError} You can add it from Edit User.`,
+        duration: 10000,
+      });
+    }
     setSeed(null);
+    setPendingPhoto(null);
     onClose();
   };
 
@@ -790,8 +810,6 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
     else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) next.email = "Enter a valid email";
     else if (isEmailTaken(email, existing?.id)) next.email = "This email already has an account";
     if (phoneError) next.phone = phoneError;
-    if (avatarUrl.trim() && !/^https?:\/\/\S+$/i.test(avatarUrl.trim()))
-      next.avatarUrl = "Use a link that starts with https://";
     if (!designation.trim()) next.designation = "Designation is required";
     if (!primary.orgId) next.org = "Primary organization is required";
     if (!primary.departmentId) next.dept = "Department is required";
@@ -883,7 +901,8 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
       email: email.trim(),
       // An emptied field is sent as "" so it is cleared, not left as it was.
       phone: phone.trim(),
-      avatarUrl: avatarUrl.trim(),
+      // Not avatarUrl: the photo was saved when it was chosen, and sending the
+      // value this form opened with could put back one just replaced.
       employeeId: employeeId.trim(),
       designation: designation.trim(),
       joiningDate,
@@ -930,6 +949,46 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
             <div className={sectionClass}>Personal</div>
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="space-y-1.5 sm:col-span-2">
+                <div id={`${fieldId}-photo`} className={labelClass}>
+                  Profile Photo
+                </div>
+                {existing ? (
+                  <SavedAvatarPicker
+                    userId={existing.id}
+                    name={name.trim() || existing.name}
+                    avatarUrl={avatarUrl || null}
+                    onSaved={(url) => {
+                      setAvatarUrl(url ?? "");
+                      logUserActivity(
+                        existing.id,
+                        "updated",
+                        url ? "Profile photo updated" : "Profile photo removed",
+                      );
+                      // The list, the detail page and the org chart show it from there.
+                      void reload();
+                    }}
+                    labelledBy={`${fieldId}-photo`}
+                    hint={`JPEG, PNG or WebP, up to ${AVATAR_LIMIT_LABEL}. Saved as soon as you choose it.`}
+                  />
+                ) : (
+                  <AvatarPicker
+                    name={name}
+                    imageUrl={pendingPhoto?.previewUrl ?? null}
+                    onPhoto={(blob) => {
+                      setPendingPhoto({ blob, previewUrl: URL.createObjectURL(blob) });
+                      return true;
+                    }}
+                    onRemove={() => {
+                      setPendingPhoto(null);
+                      return true;
+                    }}
+                    labelledBy={`${fieldId}-photo`}
+                    hint={`JPEG, PNG or WebP, up to ${AVATAR_LIMIT_LABEL}. Saved when you add the user.`}
+                    disabled={submitting}
+                  />
+                )}
+              </div>
+              <div className="space-y-1.5 sm:col-span-2">
                 <label htmlFor={`${fieldId}-name`} className={labelClass}>Full Name *</label>
                 <input id={`${fieldId}-name`} value={name} onChange={(e) => { setName(e.target.value); clearErrors("name"); }} className={inputClass} placeholder="Full name" />
                 {errors.name && <p className="text-[11px] text-destructive">{errors.name}</p>}
@@ -972,19 +1031,6 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
                   <p id={`${fieldId}-phone-error`} className="text-[11px] text-destructive">
                     {showPhoneError ? phoneError : errors.phone}
                   </p>
-                )}
-              </div>
-              <div className="space-y-1.5 sm:col-span-2">
-                <label htmlFor={`${fieldId}-avatar`} className={labelClass}>Profile Photo URL</label>
-                <input
-                  id={`${fieldId}-avatar`}
-                  value={avatarUrl}
-                  onChange={(e) => { setAvatarUrl(e.target.value); clearErrors("avatarUrl"); }}
-                  className={cn(inputClass, errors.avatarUrl && "border-destructive")}
-                  placeholder="https://"
-                />
-                {errors.avatarUrl && (
-                  <p className="text-[11px] text-destructive">{errors.avatarUrl}</p>
                 )}
               </div>
             </div>
