@@ -949,17 +949,44 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
         // Department, team, manager, role and designation live on the membership
         // rows. This used to update the screen only, so those edits vanished on
         // reload and the Users and Roles pages disagreed (FD-067).
-        const primaryOrgId = before.primaryOrgId;
         const designation = updates.designation ?? before.designation;
         const designationChanged = designation !== before.designation;
+        // Edit User can move someone to another primary organization.
+        const primaryOrgId = (updates.memberships && updates.primaryOrgId) || before.primaryOrgId;
+        const movedFrom = primaryOrgId !== before.primaryOrgId ? before.primaryOrgId : "";
+        const keptOld = updates.memberships?.find((m) => m.orgId === movedFrom);
+        if (movedFrom) {
+          // Only one active membership can be primary, so the old one steps down
+          // before the new one takes over, even when it is about to be removed.
+          const previous = before.memberships.find((m) => m.orgId === movedFrom);
+          const steppedDown =
+            !previous ||
+            (await persistMembership(id, keptOld ?? previous, {
+              isPrimary: false,
+              designation,
+              writePrivilege: !!keptOld,
+              keepStatus: !keptOld || previous.status === keptOld.status,
+            }));
+          if (!steppedDown) {
+            void reload();
+            return false;
+          }
+        }
         // The permission is written on every save, even when the role name
         // looks unchanged. Before this release every role change saved the name
         // but the permission write failed (42P10), so "Employee" on screen could
         // still carry admin rights; saving the person now repairs that.
         for (const next of updates.memberships ?? []) {
+          if (movedFrom && next.orgId === movedFrom) continue; // written above
           const previous = before.memberships.find((m) => m.orgId === next.orgId);
           const isPrimary = next.orgId === primaryOrgId;
-          if (previous && sameMembership(previous, next) && !(isPrimary && designationChanged)) {
+          const becamePrimary = isPrimary && !!movedFrom;
+          if (
+            previous &&
+            sameMembership(previous, next) &&
+            !(isPrimary && designationChanged) &&
+            !becamePrimary
+          ) {
             writes.push(reassertPrivilege(id, previous));
             continue;
           }
@@ -972,19 +999,26 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
             }),
           );
         }
+        let saved = (await Promise.all(writes)).every(Boolean);
         if (updates.memberships) {
-          // Additional access removed in the drawer. The primary is never removed here.
+          // Access removed in the drawer, only once the rest is written: someone
+          // left with no organization even for a moment loses their unused
+          // welcome link. The primary is never removed here.
+          const removals: Promise<boolean>[] = [];
           for (const previous of before.memberships) {
             if (previous.orgId === primaryOrgId) continue;
             if (updates.memberships.some((m) => m.orgId === previous.orgId)) continue;
-            writes.push(
+            // Not the old primary if the new one wasn't saved: that would leave none.
+            if (previous.orgId === movedFrom && !saved) continue;
+            removals.push(
               removeMembershipRow(id, previous.orgId).then(report("Removing organization access")),
             );
           }
+          saved = (await Promise.all(removals)).every(Boolean) && saved;
         }
-        const saved = (await Promise.all(writes)).every(Boolean);
-        // The database switched their memberships off (or back on) as well.
-        if (statusChanged && profileSaved) void reload();
+        // The database switched their memberships off (or back on) as well, or
+        // the primary moved and the list should show it as stored.
+        if ((statusChanged && profileSaved) || movedFrom) void reload();
         return saved;
       },
       setUserStatus: async (id, status) => {

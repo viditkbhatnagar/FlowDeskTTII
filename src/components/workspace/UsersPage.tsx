@@ -475,13 +475,15 @@ const blankDraft = (role: string): DraftMembership => ({
  * a brand-new component on every keystroke and remounted every field.
  */
 function AssignmentFields({
-  value, onChange, allowRole = true, lockOrganization = false, takenOrgIds = [], organizations,
-  departments, teams, users, roleNames, defaultRoleFor,
+  value, onChange, allowRole = true, lockOrganization = false, lockedReason, takenOrgIds = [],
+  organizations, departments, teams, users, roleNames, defaultRoleFor,
 }: {
   value: DraftMembership;
   onChange: (next: DraftMembership) => void;
   allowRole?: boolean;
   lockOrganization?: boolean;
+  /** Shown on the locked organization field, so it says why it can't be changed. */
+  lockedReason?: string;
   /** Chosen elsewhere in the same form, so not offered here (the current choice always stays). */
   takenOrgIds?: string[];
   organizations: Organization[];
@@ -517,6 +519,7 @@ function AssignmentFields({
           }
           className={inputClass}
           disabled={lockOrganization}
+          title={lockOrganization ? lockedReason : undefined}
         >
           <option value="">Select organization</option>
           {organizations
@@ -748,6 +751,42 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
         : current,
     );
 
+  // Moving someone to another primary organization rewrites the membership they
+  // have now, so it takes an admin of that organization. Someone without one
+  // can be given one.
+  const canMovePrimary =
+    !!existing &&
+    !!currentUser &&
+    (!existing.primaryOrgId || isAdminIn(currentUser, existing.primaryOrgId));
+  // The organization they are moving out of, while the form moves them.
+  const movedFrom =
+    existing && primary.orgId && primary.orgId !== existing.primaryOrgId
+      ? existing.primaryOrgId
+      : null;
+
+  /**
+   * Edit User: a different primary organization. The one it replaces moves down
+   * to Additional Organization Access, so changing it takes nobody's access
+   * away; removing it there does. One already in that list moves up with its
+   * department and role.
+   */
+  const changePrimary = (next: DraftMembership) => {
+    if (!existing || next.orgId === primary.orgId) {
+      setPrimary(next);
+      return;
+    }
+    if (!next.orgId) return;
+    const movedUp = additional.find((a) => a.orgId === next.orgId);
+    // Only a membership they really have is kept; one picked in this form and
+    // left again goes.
+    const keepsCurrent = existing.memberships.some((m) => m.orgId === primary.orgId);
+    setPrimary(movedUp ?? next);
+    setAdditional([
+      ...(keepsCurrent ? [primary] : []),
+      ...additional.filter((a) => a.orgId !== next.orgId),
+    ]);
+  };
+
   const phoneError = validatePhone(phone);
   // Invalid characters show at once; length only once the field is left (FD-050).
   const showPhoneError =
@@ -819,7 +858,7 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
     if (new Set([primary.orgId, ...additional.map((a) => a.orgId)]).size !== additional.length + 1)
       next.additional =
         "An organization can only be assigned once. The primary organization is already included, so remove the duplicate row.";
-    if (isNew) {
+    if (isNew || movedFrom) {
       // The server checks these too; saying so here saves a round trip.
       const orgHasDepartments = departments.some(
         (d) => d.orgId === primary.orgId && d.status === "active",
@@ -907,11 +946,19 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
       designation: designation.trim(),
       joiningDate,
       status,
+      primaryOrgId: primary.orgId,
       memberships,
     }).then((saved) => {
       // A refused save has already said why, and the list shows what is stored.
       if (!saved) return;
       logUserActivity(existing.id, "updated", "User details updated");
+      if (movedFrom) {
+        logUserActivity(
+          existing.id,
+          "updated",
+          `Primary organization changed from ${orgNameOf(movedFrom)} to ${orgNameOf(primary.orgId)}`,
+        );
+      }
       toast.success(`${savedName} updated`);
     });
     close();
@@ -1063,18 +1110,35 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
 
           <section className="space-y-3">
             <div className={sectionClass}>Organization Assignment</div>
-            {/* The primary organization of an existing account is not moved from here:
-                moving it means removing their access to the old one. */}
+            {/* An existing account can be moved to another organization the admin
+                runs; one already in its additional access is offered too, and
+                moves up (see changePrimary). */}
             <AssignmentFields
               value={primary}
-              onChange={(next) => { setPrimary(next); clearErrors("org", "dept", "manager", "role"); }}
+              onChange={(next) => {
+                changePrimary(next);
+                clearErrors("org", "dept", "manager", "role", "additional");
+              }}
               allowRole={false}
-              lockOrganization={!!existing}
-              takenOrgIds={additional.map((a) => a.orgId).filter(Boolean)}
+              lockOrganization={!!existing && !canMovePrimary}
+              lockedReason={
+                existing
+                  ? `Only an admin of ${orgNameOf(existing.primaryOrgId)} can move them to another organization.`
+                  : undefined
+              }
+              takenOrgIds={existing ? [] : additional.map((a) => a.orgId).filter(Boolean)}
               {...assignmentProps}
+              organizations={canMovePrimary ? adminOrganizations : assignmentProps.organizations}
             />
             {(errors.org || errors.dept || errors.manager) && (
               <p className="text-[11px] text-destructive">{errors.org ?? errors.dept ?? errors.manager}</p>
+            )}
+            {movedFrom && (
+              <p className="text-[11px] text-muted-foreground">
+                {additional.some((a) => a.orgId === movedFrom)
+                  ? `${orgNameOf(movedFrom)} moves to Additional Organization Access below, so they keep it. Remove it there if they should only be in ${orgNameOf(primary.orgId)}.`
+                  : `They will no longer have access to ${orgNameOf(movedFrom)}.`}
+              </p>
             )}
           </section>
 
