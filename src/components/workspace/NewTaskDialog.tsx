@@ -13,7 +13,7 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { supabase } from "@/integrations/supabase/client";
-import { useWorkspace, type Priority, type Status, type WorkspaceTask } from "@/lib/workspace-data";
+import { useWorkspace, type Priority, type Status } from "@/lib/workspace-data";
 import { useOrganizations } from "@/lib/organizations-data";
 import { useTaskSettings, type TagConfig, type TaskStatusType } from "@/lib/task-settings-data";
 import { FILE_RULES, formatBytes, personRef, validateFile, type PersonRef } from "@/lib/task-api";
@@ -130,24 +130,32 @@ function useSignedInUserId(): string | null {
 }
 
 /**
- * Real projects: every live work_projects row plus any project a loaded task
- * belongs to. The picker listed five hardcoded demo projects before (FD-001).
+ * Real projects: every live work_projects row the person can see. The picker
+ * listed five hardcoded demo projects before (FD-001). It also offered the
+ * projects of loaded tasks, which put archived and cancelled projects in the
+ * list for new work.
  */
-function useProjectOptions(tasks: WorkspaceTask[], projectName?: string): ProjectOption[] {
+function useProjectOptions(projectName?: string): { options: ProjectOption[]; state: ProjectsState } {
   const [loaded, setLoaded] = useState<{ id: string; name: string; organization_id: string }[]>([]);
+  const [state, setState] = useState<ProjectsState>("loading");
   useEffect(() => {
     let active = true;
     void supabase.from("work_projects").select("id, name, organization_id").is("archived_at", null)
       .not("status", "in", "(cancelled,archived)").order("name")
       .then(({ data, error }) => {
         if (!active) return;
-        if (error) console.error("[flowdesk] failed to load projects for the task form", error);
-        else setLoaded(data ?? []);
+        if (error) {
+          console.error("[flowdesk] failed to load projects for the task form", error);
+          setState("failed");
+          return;
+        }
+        setLoaded(data ?? []);
+        setState("ready");
       });
     return () => { active = false; };
   }, []);
 
-  return useMemo(() => {
+  const options = useMemo(() => {
     const byKey = new Map<string, ProjectOption>();
     for (const project of loaded) {
       byKey.set(project.id, {
@@ -157,23 +165,16 @@ function useProjectOptions(tasks: WorkspaceTask[], projectName?: string): Projec
         orgId: project.organization_id,
       });
     }
-    for (const task of tasks) {
-      if (task.projectId && !byKey.has(task.projectId)) {
-        byKey.set(task.projectId, {
-          key: task.projectId,
-          id: task.projectId,
-          name: task.project,
-          orgId: task.organizationId,
-        });
-      }
-    }
     const list = [...byKey.values()].sort((a, b) => a.name.localeCompare(b.name));
     if (projectName && !list.some((option) => option.name === projectName)) {
       list.push({ key: `name:${projectName}`, name: projectName });
     }
     return list;
-  }, [loaded, tasks, projectName]);
+  }, [loaded, projectName]);
+  return { options, state };
 }
+
+type ProjectsState = "loading" | "ready" | "failed";
 
 interface NewTaskDialogProps {
   open: boolean;
@@ -201,9 +202,9 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
   const fieldId = (name: string) => `${uid}-${name}`;
   const { addTask, tasks, people } = useWorkspace();
   const { priorities: priorityOptions, tagsFor, statusesFor, statusLabelFor } = useTaskSettings();
-  const { currentUser, accessibleOrganizations } = useOrganizations();
+  const { currentUser, accessibleOrganizations, managedOrganizations } = useOrganizations();
   const signedInUserId = useSignedInUserId();
-  const projectOptions = useProjectOptions(tasks, projectName);
+  const { options: projectOptions, state: projectsState } = useProjectOptions(projectName);
 
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
@@ -235,6 +236,21 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
     (projectName ? projectOptions.find((option) => option.name === projectName) : undefined);
   const selectedProjectKey = fixedProject?.key ?? projectKey;
   const selectedProject = projectOptions.find((option) => option.key === selectedProjectKey);
+  // Only live projects load, so a fixed one without its id here can't take the
+  // task: not saved yet, or archived or cancelled since. Nor can a same-named
+  // project of another organization found in its place.
+  const fixedProjectUnusable =
+    !!fixedProject && (!fixedProject.id || (!!projectId && fixedProject.id !== projectId));
+  const projectBlock =
+    projectsState === "loading"
+      ? "Loading projects…"
+      : projectsState === "failed"
+        ? "Projects couldn't be loaded. Close this and try again."
+        : fixedProjectUnusable
+          ? projectId
+            ? "This project is archived or cancelled, so it can't take new tasks."
+            : "Save this project first, then add its tasks."
+          : undefined;
 
   // The organization the task will be filed in, as addTask decides it: its
   // project's, else the creator's primary. Only that organization's tags are
@@ -287,12 +303,19 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
   const allTags = normalizeTags([...tags, ...parseTags(tagDraft)]);
   const allSubtasks = [...subtasks, subtaskDraft.trim()].filter(Boolean);
 
-  const fieldErrors = validateTaskFields({ title, description, startDate, dueDate, estimatedHours, tags: allTags, requireDueDate: true });
+  const fieldErrors = validateTaskFields({
+    title, description, startDate, dueDate, estimatedHours, tags: allTags, requireDueDate: true,
+    requireProject: true, projectId: selectedProject?.id ?? null,
+  });
   const recurrenceErrors = recurring ? validateRecurrence(recurrenceDraft, dueDate) : {};
   // Why Create is disabled. It was disabled with no word of explanation (FD-017).
-  const blockingReason = [...Object.values(fieldErrors), ...Object.values(recurrenceErrors)][0];
+  const blockingReason =
+    projectBlock ?? [...Object.values(fieldErrors), ...Object.values(recurrenceErrors)][0];
   // Required-field errors wait until the field is touched; range errors show at once.
   const titleError = touched.has("title") ? fieldErrors.title : undefined;
+  const projectError = touched.has("project") ? fieldErrors.project : undefined;
+  const choosableProjects = projectOptions.filter((option) => option.id);
+  const canCreateProjects = managedOrganizations.length > 0;
   const dueDateError = touched.has("dueDate") ? fieldErrors.dueDate : undefined;
 
   const addSubtaskDraft = () => {
@@ -398,8 +421,16 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
         </Field>
         <div className="grid gap-4 sm:grid-cols-2">
           <SelectField
-            label="Project" id={fieldId("project")} value={selectedProjectKey} onChange={setProjectKey} disabled={Boolean(fixedProject)}
-            options={[{ value: NO_PROJECT, label: "No project" }, ...projectOptions.map((item) => ({ value: item.key, label: item.name }))]}
+            label="Project*" id={fieldId("project")} value={selectedProjectKey === NO_PROJECT ? "" : selectedProjectKey}
+            onChange={(value) => { setProjectKey(value); touch("project"); }} disabled={Boolean(fixedProject)}
+            placeholder={
+              projectsState === "loading" ? "Loading projects…" : choosableProjects.length ? "Choose a project" : "No projects yet"
+            }
+            error={projectError}
+            hint={projectsState !== "ready" || choosableProjects.length || fixedProject ? undefined : canCreateProjects ? (
+              <>No projects yet. <a href="/projects" className="font-medium text-primary underline-offset-2 hover:underline">Create one in Projects</a> first.</>
+            ) : "No projects yet. Ask a manager or admin to create one in Projects."}
+            options={projectOptions.map((item) => ({ value: item.key, label: item.name }))}
           />
           <SelectField
             label="Assignee" id={fieldId("assignee")} value={effectiveAssigneeId} onChange={setAssigneeId} placeholder="Choose a person"
@@ -762,18 +793,20 @@ function AttachmentsField({ id, files, onAdd, onRemove }: { id: string; files: F
   );
 }
 
-function SelectField({ label, id, value, onChange, options, placeholder, disabled }: {
+function SelectField({ label, id, value, onChange, options, placeholder, disabled, error, hint }: {
   label: string; id: string; value: string; onChange: (value: string) => void;
   options: { value: string; label: string }[]; placeholder?: string; disabled?: boolean;
+  error?: string; hint?: ReactNode;
 }) {
   return (
-    <Field label={label} htmlFor={id}>
+    <Field label={label} htmlFor={id} error={error}>
       <Select value={value} onValueChange={onChange} disabled={disabled}>
-        <SelectTrigger id={id}><SelectValue placeholder={placeholder} /></SelectTrigger>
+        <SelectTrigger id={id} {...describedBy(id, error)}><SelectValue placeholder={placeholder} /></SelectTrigger>
         <SelectContent>
           {options.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
         </SelectContent>
       </Select>
+      {hint && !error && <p className="text-[11px] text-muted-foreground">{hint}</p>}
     </Field>
   );
 }

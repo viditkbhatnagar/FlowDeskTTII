@@ -44,9 +44,14 @@ export interface TaskFieldInput {
   tags?: string[];
   /** Whether a due date is mandatory in this form. */
   requireDueDate?: boolean;
+  /** The chosen project's id; with requireProject, a task cannot be created without one. */
+  projectId?: string | null;
+  requireProject?: boolean;
 }
 
-export type TaskFieldErrors = Partial<Record<"title" | "description" | "startDate" | "dueDate" | "estimatedHours" | "tags", string>>;
+export type TaskFieldErrors = Partial<
+  Record<"title" | "project" | "description" | "startDate" | "dueDate" | "estimatedHours" | "tags", string>
+>;
 
 /** Trim, lowercase, drop empties and duplicates — what the database stores. */
 export function normalizeTags(tags: string[]): string[] {
@@ -71,6 +76,8 @@ export function validateTaskFields(input: TaskFieldInput): TaskFieldErrors {
   const title = input.title.trim();
   if (!title) errors.title = "Title is required.";
   else if (title.length > TASK_LIMITS.titleMax) errors.title = `Title must be ${TASK_LIMITS.titleMax} characters or fewer (it is ${title.length}).`;
+
+  if (input.requireProject && !input.projectId) errors.project = "Choose a project. Every task belongs to one.";
 
   if ((input.description ?? "").length > TASK_LIMITS.descriptionMax) {
     errors.description = `Description must be ${TASK_LIMITS.descriptionMax} characters or fewer.`;
