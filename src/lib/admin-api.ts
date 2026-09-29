@@ -658,6 +658,31 @@ export async function resendWelcomeRpc(userId: string): Promise<AdminRpcResult<n
 }
 
 /**
+ * Put the right sign-in email on an account nobody has signed in to yet, and
+ * send the welcome again to it (admin_change_user_email). Returns the address
+ * as stored (trimmed, lower-case).
+ */
+export async function changeUserEmailRpc(userId: string, email: string): Promise<AdminRpcResult<string>> {
+  const { data, error } = await supabase.rpc("admin_change_user_email", {
+    p_user_id: userId,
+    p_email: email.trim(),
+  });
+  // PostgREST's "no such function": the site is newer than the database.
+  if (error?.code === "PGRST202") {
+    console.error("[flowdesk] admin_change_user_email is missing", error);
+    return {
+      ok: false,
+      error: {
+        code: "PGRST202",
+        message: "Changing a sign-in email needs a database update that hasn't been applied yet.",
+      },
+    };
+  }
+  if (error || !data) return rpcFailed("admin_change_user_email", error ?? new Error("no email returned"));
+  return { ok: true, value: data };
+}
+
+/**
  * Create an organization (admin_create_organization). Its default roles and
  * settings are seeded by the database, and the caller becomes its admin.
  */

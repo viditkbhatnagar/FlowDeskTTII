@@ -644,6 +644,7 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
     roleGrantsAdmin,
     soleAdminOrgIds,
     createUser,
+    changeUserEmail,
     currentUser,
     activeOrgId,
     reload,
@@ -934,10 +935,32 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
       return;
     }
 
+    const emailChanged = email.trim().toLowerCase() !== existing.email.toLowerCase();
+    if (!emailChanged) {
+      saveDetails(existing, memberships, existing.email);
+      return;
+    }
+    // The sign-in email goes first, on its own: the server refuses it for
+    // someone who has signed in already, or an address that is taken, and then
+    // nothing else is saved and the form stays open to say why.
+    void (async () => {
+      setSubmitting(true);
+      const changed = await changeUserEmail(existing.id, email);
+      setSubmitting(false);
+      if (!changed.ok) {
+        setErrors({ email: changed.error.message });
+        return;
+      }
+      toast.success(`Welcome email on its way to ${changed.value}`);
+      saveDetails(existing, memberships, changed.value);
+    })();
+  };
+
+  const saveDetails = (existing: OrgUser, memberships: Membership[], storedEmail: string) => {
     const savedName = name.trim();
     void updateUser(existing.id, {
       name: name.trim(),
-      email: email.trim(),
+      email: storedEmail,
       // An emptied field is sent as "" so it is cleared, not left as it was.
       phone: phone.trim(),
       // Not avatarUrl: the photo was saved when it was chosen, and sending the
@@ -984,7 +1007,12 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
           </SheetDescription>
         </SheetHeader>
 
-        <div className="flex-1 space-y-6 overflow-y-auto px-6 py-5">
+        {/* Locked while saving: the save sends the form as it was when Save was
+            pressed, so an edit made during the round trip would be lost. */}
+        <fieldset
+          disabled={submitting}
+          className="m-0 min-w-0 flex-1 space-y-6 overflow-y-auto border-0 px-6 py-5"
+        >
           {isNew && (
             <div className="flex gap-2 rounded-xl border border-primary/15 bg-primary/5 px-3 py-2.5 text-xs text-foreground/80">
               <Mail className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
@@ -1053,10 +1081,24 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
                   className={cn(inputClass, errors.email && "border-destructive")}
                   placeholder="name@company.com"
                   aria-invalid={!!errors.email || undefined}
-                  disabled={!!existing}
-                  title={existing ? "The sign-in email can't be changed here." : undefined}
+                  aria-describedby={
+                    errors.email || (existing && !editingSelf) ? `${fieldId}-email-hint` : undefined
+                  }
+                  // The server decides whether it can still change (not after
+                  // their first sign-in), and says so if not.
+                  disabled={editingSelf || submitting}
+                  title={editingSelf ? "Your own sign-in email can't be changed here." : undefined}
                 />
-                {errors.email && <p className="text-[11px] text-destructive">{errors.email}</p>}
+                {errors.email ? (
+                  <p id={`${fieldId}-email-hint`} className="text-[11px] text-destructive">{errors.email}</p>
+                ) : (
+                  existing &&
+                  !editingSelf && (
+                    <p id={`${fieldId}-email-hint`} className="text-[11px] text-muted-foreground">
+                      Can be corrected until they first sign in. The welcome email goes again, to the new address.
+                    </p>
+                  )
+                )}
               </div>
               <div className="space-y-1.5">
                 <label htmlFor={`${fieldId}-phone`} className={labelClass}>Phone</label>
@@ -1228,7 +1270,7 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
               )}
             </div>
           </section>
-        </div>
+        </fieldset>
 
         <div className="flex items-center justify-end gap-2 border-t border-border px-6 py-4">
           <button
@@ -1245,7 +1287,7 @@ function UserDrawer({ target, onClose }: { target: OrgUser | "new" | null; onClo
             className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-70"
           >
             {submitting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-            {existing ? "Save Changes" : submitting ? "Adding…" : "Add User"}
+            {existing ? (submitting ? "Saving…" : "Save Changes") : submitting ? "Adding…" : "Add User"}
           </button>
         </div>
       </SheetContent>

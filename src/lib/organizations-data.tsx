@@ -11,6 +11,7 @@ import {
   createTeamRow,
   loadAdminSnapshot,
   resendWelcomeRpc,
+  changeUserEmailRpc,
   removeMembershipRow,
   resolveUserId,
   setUserTeam,
@@ -358,6 +359,11 @@ type OrganizationsContextValue = {
   createUser: (input: NewUserInput) => Promise<CreateUserResult>;
   /** A new welcome email with a fresh link, for someone who has never signed in. */
   resendWelcome: (userId: string) => Promise<AdminRpcResult<null>>;
+  /**
+   * Correct the sign-in email of someone who has never signed in; the welcome
+   * goes again to the new address. Resolves with the address as stored.
+   */
+  changeUserEmail: (userId: string, email: string) => Promise<AdminRpcResult<string>>;
   /** Create an organization on the server; the caller becomes its admin. */
   createOrganization: (input: NewOrganizationInput) => Promise<AdminRpcResult<string>>;
   /** Re-read organizations, people, roles and the caller's own access. */
@@ -1086,6 +1092,18 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
         if (result.ok) {
           pushActivity(userId, "welcome-sent", "Welcome email sent again with a new link");
         }
+        return result;
+      },
+      changeUserEmail: async (userId, email) => {
+        const before = users.find((u) => u.id === userId)?.email;
+        const result = await changeUserEmailRpc(userId, email);
+        if (!result.ok) return result;
+        setUsers((current) => current.map((u) => (u.id === userId ? { ...u, email: result.value } : u)));
+        pushActivity(
+          userId,
+          "updated",
+          `Sign-in email changed${before ? ` from ${before}` : ""} to ${result.value}; welcome email sent again`,
+        );
         return result;
       },
       createOrganization: async (input) => {

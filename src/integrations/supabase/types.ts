@@ -1396,6 +1396,10 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
+      admin_change_user_email: {
+        Args: { p_email: string; p_user_id: string }
+        Returns: string
+      }
       admin_create_organization: {
         Args: {
           p_code: string
