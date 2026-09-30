@@ -338,6 +338,15 @@ type OrganizationsContextValue = {
   // Users
   userActivity: UserActivity[];
   currentUser: OrgUser | null;
+  /** The signed-in user's id, known before (and without) the people list. */
+  currentUserId: string | null;
+  /**
+   * The signed-in user's own permissions (user_roles) in one organization, or
+   * none where their membership there is not active, as the database counts
+   * them. A non-admin can read only their own rows, which is all the project
+   * screens need to hide what the database would refuse.
+   */
+  ownPrivilegesIn: (orgId: string | null | undefined) => BaseRole[];
   canManageUsers: boolean;
   /*
    * The writes below update the screen at once and resolve true once
@@ -501,6 +510,8 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
   const [adminOrgIds, setAdminOrgIds] = useState<string[]>([]);
   /** Organizations where the caller holds the admin or manager permission. */
   const [managerOrgIds, setManagerOrgIds] = useState<string[]>([]);
+  /** Every permission the caller holds, by organization. */
+  const [ownRoleRows, setOwnRoleRows] = useState<{ orgId: string; role: BaseRole }[]>([]);
 
   const reloadProjects = useCallback(async () => {
     const loaded = await loadOrgProjects();
@@ -545,6 +556,12 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
         (assignedRoles ?? [])
           .filter((assignedRole) => assignedRole.role === "admin" || assignedRole.role === "manager")
           .map((assignedRole) => assignedRole.organization_id),
+      );
+      setOwnRoleRows(
+        (assignedRoles ?? []).map((assignedRole) => ({
+          orgId: assignedRole.organization_id,
+          role: assignedRole.role,
+        })),
       );
     }
     // Load the admin surfaces from the database. RLS already narrows every
@@ -913,6 +930,11 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
         upsertMembership(userId, { ...membership, orgId, status: "active" }),
       userActivity,
       currentUser: users.find((u) => u.id === authenticatedUserId) ?? null,
+      currentUserId: authenticatedUserId,
+      ownPrivilegesIn: (orgId) =>
+        orgId && accessibleOrgIds.includes(orgId)
+          ? ownRoleRows.filter((row) => row.orgId === orgId).map((row) => row.role)
+          : [],
       canManageUsers: authenticatedRoles.includes("admin"),
       logUserActivity: pushActivity,
       isEmailTaken: (email, exceptId) =>
@@ -1437,6 +1459,7 @@ export function OrganizationsProvider({ children }: { children: ReactNode }) {
     authenticatedRoles,
     adminOrgIds,
     managerOrgIds,
+    ownRoleRows,
     adminStatus,
     reconcileId,
     reloadProjects,

@@ -4,6 +4,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { OrgSwitcher } from "@/components/workspace/OrgSwitcher";
+import { NotificationBell } from "@/components/workspace/notifications/NotificationBell";
 import { ProfileDialog } from "@/components/workspace/account/ProfileDialog";
 import { signOutEverywhere } from "@/components/workspace/account/session";
 import { Button } from "@/components/ui/button";
@@ -287,7 +288,8 @@ export function Header({
   const activeResult = showResults ? results[highlight] : undefined;
 
   return (
-    <header className="glass-surface sticky top-0 z-30 flex h-16 items-center gap-3 border-b border-border bg-background/75 px-4 md:px-6">
+    // Tighter gaps and a title that can shorten on phones, so the notification bell fits beside the other controls.
+    <header className="glass-surface sticky top-0 z-30 flex h-16 items-center gap-2 border-b border-border bg-background/75 px-4 sm:gap-3 md:px-6">
       <Button
         type="button"
         variant="ghost"
@@ -299,9 +301,9 @@ export function Header({
         <Menu className="h-5 w-5" aria-hidden="true" />
       </Button>
 
-      <div className="flex flex-col">
-        <span className="text-[11px] text-muted-foreground">Workspace</span>
-        <h1 className="text-sm font-semibold leading-none">{title}</h1>
+      <div className="flex min-w-0 flex-col">
+        <span className="truncate text-[11px] text-muted-foreground">Workspace</span>
+        <h1 className="truncate text-sm font-semibold leading-none">{title}</h1>
       </div>
 
       {showOrgSwitcher && (
@@ -416,6 +418,8 @@ export function Header({
       >
         <Plus className="h-4 w-4" aria-hidden="true" /> <span className="hidden sm:inline">New Task</span>
       </Button>
+
+      <NotificationBell />
 
       <Button
         type="button"

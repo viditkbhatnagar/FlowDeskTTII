@@ -1,10 +1,23 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import type { Priority, Status } from "@/lib/mock-data";
-import { useWorkspace, type WorkspaceTask } from "@/lib/workspace-data";
+import { useLinkedTask, useWorkspace, type WorkspaceTask } from "@/lib/workspace-data";
 import { useOrganizations } from "@/lib/organizations-data";
 import { useTaskSettings } from "@/lib/task-settings-data";
-import { colorFor, describeActivity, listRecentActivity, type ActivityEntry } from "@/lib/task-api";
+import { colorFor, describeActivity, listRecentActivity, personRef, type ActivityEntry } from "@/lib/task-api";
+import {
+  CAPACITY,
+  NO_DEPARTMENT,
+  UNASSIGNED,
+  assigneeOptions as buildAssigneeOptions,
+  buildScopedRoster,
+  buildWorkload,
+  countWithTasks,
+  departmentOptions as buildDepartmentOptions,
+  filterRoster,
+  rosterScopes,
+  type WorkloadMember,
+} from "@/lib/team-roster";
 import { todayIn } from "@/lib/today";
 import { WorkspaceState } from "@/components/workspace/WorkspaceState";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -53,8 +66,6 @@ const priorityClass: Record<Priority, string> = {
   critical: "bg-destructive/15 text-destructive",
 };
 
-const NO_DEPARTMENT = "No department";
-const UNASSIGNED = "__unassigned";
 const isOpen = (status: string) => status !== "done" && status !== "cancelled";
 const dueDay = (task: WorkspaceTask) => task.dueDate.slice(0, 10);
 
@@ -105,40 +116,6 @@ function matchesDashboardFilter(task: TeamTask, filter: string | undefined, toda
   return true;
 }
 
-/**
- * Team workload, computed from the tasks in view.
- *
- * This was five invented people with the literal arrays [7,5,9,6,4] and
- * [92,87,78,95,84] rendered next to live Supabase data. Keyed by user id, not
- * name, so two people who share a name are not merged.
- */
-const CAPACITY = 10;
-function buildWorkload(tasks: TeamTask[]) {
-  const byPerson = new Map<string, { key: string; name: string; initials: string; color: string; active: number; done: number }>();
-  for (const task of tasks) {
-    if (!task.assigneeId) continue;
-    const entry = byPerson.get(task.assigneeId) ?? { key: task.assigneeId, ...task.assignee, active: 0, done: 0 };
-    byPerson.set(task.assigneeId, {
-      ...entry,
-      done: entry.done + (task.status === "done" ? 1 : 0),
-      active: entry.active + (isOpen(task.status) ? 1 : 0),
-    });
-  }
-  return [...byPerson.values()]
-    .map((person) => {
-      const total = person.active + person.done;
-      const pct = Math.min(100, Math.round((person.active / CAPACITY) * 100));
-      return {
-        ...person,
-        pct,
-        // Share of their work that is finished — a real ratio, not a fixed score.
-        productivity: total ? Math.round((person.done / total) * 100) : 0,
-        availability: pct > 80 ? "Busy" : pct > 50 ? "Available" : "Free",
-      };
-    })
-    .sort((a, b) => b.active - a.active);
-}
-
 export function TeamTasksPage({
   onNewTask,
   dashboardFilter,
@@ -152,14 +129,14 @@ export function TeamTasksPage({
   onClearFilter?: () => void;
   /** Opens Settings › Users. The Workload "Manage" link is hidden without it, rather than inert (FD-031). */
   onManageMembers?: () => void;
-  /** ?task=<id> from an email: the task to open once the tasks have loaded. */
+  /** ?task=<id> from an email or notification: the task to open once the tasks have loaded. */
   linkedTaskId?: string;
   /** Called when that task's drawer closes, to drop the id from the URL. */
   onLinkedTaskClosed?: () => void;
 }) {
   const [view, setView] = useState<"kanban" | "table" | "timeline">("kanban");
   const { tasks: workspaceTasks, updateTask, status: loadStatus, people } = useWorkspace();
-  const { users, departments: orgDepartments, organizations, activeOrgId, canManageUsers } = useOrganizations();
+  const { users, currentUser, departments: orgDepartments, organizations, activeOrgId, canManageUsers } = useOrganizations();
   const { statusLabel, statusLabelFor, priorities } = useTaskSettings();
 
   // "Today" and "completed today" are the organization's calendar day, not UTC's.
@@ -173,30 +150,43 @@ export function TeamTasksPage({
   // task's organization. Was `departments[index % departments.length]` over five
   // hardcoded names, so one task was Engineering on Kanban and Marketing in
   // Table (FD-009); the names now come from Teams & Departments (FD-036).
+  const departmentNames = useMemo(() => new Map(orgDepartments.map((d) => [d.id, d.name])), [orgDepartments]);
   const departmentOf = useMemo(() => {
-    const nameById = new Map(orgDepartments.map((d) => [d.id, d.name]));
     const membershipsByUser = new Map(users.map((u) => [u.id, u.memberships]));
     return (task: WorkspaceTask) => {
       const memberships = (task.assigneeId && membershipsByUser.get(task.assigneeId)) || [];
       const membership =
         memberships.find((m) => m.orgId === task.organizationId && m.departmentId) ??
         memberships.find((m) => m.departmentId);
-      return (membership?.departmentId && nameById.get(membership.departmentId)) || NO_DEPARTMENT;
+      return (membership?.departmentId && departmentNames.get(membership.departmentId)) || NO_DEPARTMENT;
     };
-  }, [users, orgDepartments]);
+  }, [users, departmentNames]);
 
   const items = useMemo<TeamTask[]>(
     () => workspaceTasks.map((task) => ({ ...task, department: departmentOf(task) })),
     [workspaceTasks, departmentOf],
   );
 
-  // Only offer options that actually appear, so no filter can match nothing.
-  const departmentOptions = useMemo(() => [...new Set(items.map((t) => t.department))].sort(), [items]);
-  const assigneeOptions = useMemo(() => {
-    const byId = new Map<string, string>();
-    for (const task of items) byId.set(task.assigneeId ?? UNASSIGNED, task.assigneeId ? task.assignee.name : "Unassigned");
-    return [...byId.entries()].sort((a, b) => a[1].localeCompare(b[1]));
-  }, [items]);
+  // Admins and managers see every task in their organizations, so they get the
+  // whole team — people with nothing assigned too — not only today's assignees
+  // (QA bug 6). A team lead gets their own team (see rosterScopes). Employees
+  // see only their own tasks, so they keep the assignee-only view (no roster).
+  const scopes = useMemo(() => rosterScopes(currentUser), [currentUser]);
+  const roster = useMemo(
+    () => buildScopedRoster(users, scopes, departmentNames, personRef),
+    [users, scopes, departmentNames],
+  );
+  const hasRoster = roster.length > 0;
+  // A team lead's counts leave out projects they are not part of.
+  const partialView = scopes.length > 0 && !scopes.every((scope) => scope.whole);
+
+  // Only offer options that actually appear (on a task or on the team), so no
+  // filter can match nothing.
+  const departmentOptions = useMemo(
+    () => buildDepartmentOptions(items.map((t) => t.department), roster),
+    [items, roster],
+  );
+  const assigneeOptions = useMemo(() => buildAssigneeOptions(items, roster), [items, roster]);
   const projectOptions = useMemo(() => [...new Set(items.map((t) => t.project))].sort(), [items]);
 
   const [dragId, setDragId] = useState<string | null>(null);
@@ -227,25 +217,15 @@ export function TeamTasksPage({
     if (dashboardFilter?.startsWith("task:")) setSelectedId(dashboardFilter.slice(5));
   }, [dashboardFilter]);
 
-  // ?task=<id> (management summaries): open it once, after the tasks load. A task
-  // this person cannot see (RLS), or one archived since, is not in the list.
-  const openedEmailTask = useRef<string | undefined>(undefined);
-  useEffect(() => {
-    if (!emailTaskId) {
-      openedEmailTask.current = undefined;
-      return;
-    }
-    if (loadStatus !== "ready" || openedEmailTask.current === emailTaskId) return;
-    openedEmailTask.current = emailTaskId;
-    if (workspaceTasks.some((task) => task.id === emailTaskId)) {
-      setSelectedId(emailTaskId);
-      return;
-    }
+  // ?task=<id> (management summaries, notifications): open it once, after the
+  // tasks load. A task this person cannot see (RLS), or one archived since, is
+  // not in the list; one created after the list loaded is, after the one re-read.
+  useLinkedTask(emailTaskId, loadStatus === "ready", setSelectedId, () => {
     toast.error("That task isn't available to you.", {
       description: "It may have been archived, or you may no longer have access to it.",
     });
     onLinkedTaskClosed?.();
-  }, [emailTaskId, loadStatus, workspaceTasks, onLinkedTaskClosed]);
+  });
 
   // The chip names the filter a dashboard card applied. It used to be applied
   // invisibly, so Team Tasks silently showed 4 tasks with no way back (FD-030).
@@ -268,7 +248,27 @@ export function TeamTasksPage({
     return null;
   }, [dashboardFilter, statusLabel, people]);
 
-  const workloadData = useMemo(() => buildWorkload(filtered), [filtered]);
+  // The team members the person filters leave in view, seeded at zero so
+  // choosing a department lists all of it, not only those with tasks.
+  const linkedAssignee = dashboardFilter?.startsWith("assignee:") ? dashboardFilter.slice(9) : undefined;
+  const rosterInView = useMemo(
+    () => filterRoster(roster, { department: dept, assignee: assigneeFilter, linkedAssignee, query }),
+    [roster, dept, assigneeFilter, linkedAssignee, query],
+  );
+  const workloadData = useMemo(() => buildWorkload(filtered, rosterInView), [filtered, rosterInView]);
+  const withTasks = countWithTasks(workloadData);
+  const memberLabel = `${workloadData.length} ${workloadData.length === 1 ? "member" : "members"}`;
+  const assigneeName = assigneeOptions.find(([id]) => id === assigneeFilter)?.[1];
+
+  // Workload and Heatmap names open that person's tasks; choosing them again
+  // shows everyone's. The board sits above those panels, so it is scrolled to,
+  // or the change would happen out of sight.
+  const toolbarRef = useRef<HTMLDivElement>(null);
+  const toggleAssignee = (key: string) => {
+    const next = assigneeFilter === key ? "all" : key;
+    setAssigneeFilter(next);
+    if (next !== "all") toolbarRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
 
   // Every figure describes the tasks in view (FD-013). "Active" counted In
   // Progress plus only some To Do tasks, and "Completed Today" was the all-time total.
@@ -323,8 +323,7 @@ export function TeamTasksPage({
         <div>
           <h2 className="text-2xl font-semibold tracking-tight">Team Tasks</h2>
           <p className="text-sm text-muted-foreground">
-            Collaborate, assign, and track progress across {workloadData.length}{" "}
-            {workloadData.length === 1 ? "member" : "members"} with tasks.
+            Collaborate, assign, and track progress across {memberLabel}.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-3">
@@ -333,7 +332,9 @@ export function TeamTasksPage({
               <Users className="h-4 w-4 text-primary" />
               <div className="leading-tight">
                 <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Members</div>
-                <div className="text-sm font-semibold">{workloadData.length} with tasks</div>
+                <div className="text-sm font-semibold">
+                  {memberLabel} · {withTasks} with tasks
+                </div>
               </div>
             </div>
             <div className="h-8 w-px bg-border" />
@@ -395,7 +396,7 @@ export function TeamTasksPage({
       </div>
 
       {/* Toolbar */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
+      <div ref={toolbarRef} className="scroll-mt-4 flex flex-wrap items-center justify-between gap-3">
         <div className="inline-flex items-center rounded-lg border border-border bg-card p-1 shadow-[var(--shadow-soft)]">
           {[
             { id: "kanban", label: "Kanban", Icon: LayoutGrid },
@@ -417,6 +418,20 @@ export function TeamTasksPage({
         </div>
 
         <div className="flex items-center gap-2 flex-wrap">
+          {/* Names whose tasks the board shows, e.g. after picking them in Team Workload. */}
+          {assigneeFilter !== "all" && assigneeName && (
+            <span className="inline-flex items-center gap-1 rounded-full border border-primary/30 bg-primary/10 py-1 pl-2.5 pr-1 text-xs font-medium text-primary">
+              {assigneeFilter === UNASSIGNED ? "Unassigned" : `${assigneeName}'s tasks`}
+              <button
+                type="button"
+                onClick={() => setAssigneeFilter("all")}
+                aria-label="Show everyone's tasks"
+                className="rounded-full p-0.5 hover:bg-primary/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </span>
+          )}
           <div className="relative">
             <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
             <input
@@ -575,8 +590,23 @@ export function TeamTasksPage({
       {/* Team insights */}
       <section className="grid items-stretch gap-4 md:grid-cols-2 xl:grid-cols-3">
         <ActivityFeed tasks={workspaceTasks} onOpenTask={setSelectedId} />
-        <WorkloadPanel members={workloadData} onManage={canManageUsers ? onManageMembers : undefined} />
-        <HeatmapPanel members={workloadData} tasks={filtered} today={today} timezone={orgTimezone} />
+        <WorkloadPanel
+          members={workloadData}
+          selected={assigneeFilter}
+          onSelect={toggleAssignee}
+          emptyText={hasRoster ? "No team members match these filters." : "No tasks are assigned yet."}
+          onManage={canManageUsers ? onManageMembers : undefined}
+          note={partialView ? "Your team. Counts include only tasks you can see: your projects and tasks outside projects." : undefined}
+        />
+        <HeatmapPanel
+          members={workloadData}
+          selected={assigneeFilter}
+          onSelect={toggleAssignee}
+          emptyText={hasRoster ? "No team members match these filters." : "No assigned tasks in this view."}
+          tasks={filtered}
+          today={today}
+          timezone={orgTimezone}
+        />
       </section>
       <TaskDetailDrawer
         variant={view === "kanban" ? "modal" : "sheet"}
@@ -903,9 +933,21 @@ function TimelineView({ tasks, today, onOpen }: { tasks: TeamTask[]; today: stri
   );
 }
 
-type WorkloadMember = ReturnType<typeof buildWorkload>[number];
+/** Shared by Workload and Heatmap: a person picked there filters the board to them. */
+interface MemberPicker {
+  members: WorkloadMember[];
+  /** The Assignee filter's value; that person is shown as chosen. */
+  selected: string;
+  onSelect: (key: string) => void;
+  emptyText: string;
+}
 
-function WorkloadPanel({ members, onManage }: { members: WorkloadMember[]; onManage?: () => void }) {
+const pickerTitle = (m: WorkloadMember, chosen: boolean) =>
+  chosen ? `Showing ${m.name}'s tasks. Choose again to show everyone's.` : `Show ${m.name}'s tasks`;
+
+function WorkloadPanel({
+  members, selected, onSelect, emptyText, onManage, note,
+}: MemberPicker & { onManage?: () => void; note?: string }) {
   return (
     <div className="rounded-xl border border-border bg-card p-4 shadow-[var(--shadow-soft)]">
       <div className="flex items-center justify-between">
@@ -914,8 +956,10 @@ function WorkloadPanel({ members, onManage }: { members: WorkloadMember[]; onMan
           <button onClick={onManage} className="text-[11px] text-primary hover:underline">Manage</button>
         )}
       </div>
-      <div className="mt-3 space-y-3">
-        {members.length === 0 && <p className="text-xs text-muted-foreground">No tasks are assigned yet.</p>}
+      {note && <p className="mt-1 text-[11px] text-muted-foreground">{note}</p>}
+      {/* Scrolls rather than stretching the row: a whole team is 30–40 people. */}
+      <div className="-mx-2 mt-2 max-h-96 space-y-1 overflow-y-auto">
+        {members.length === 0 && <p className="px-2 text-xs text-muted-foreground">{emptyText}</p>}
         {members.map((m) => {
           const color = m.pct > 80 ? "bg-destructive" : m.pct > 50 ? "bg-status-progress" : "bg-status-done";
           const availColor =
@@ -924,37 +968,50 @@ function WorkloadPanel({ members, onManage }: { members: WorkloadMember[]; onMan
               : m.availability === "Available"
                 ? "bg-status-progress/15 text-status-progress"
                 : "bg-status-done/15 text-status-done";
+          const chosen = selected === m.key;
+          // A button, so a manager can open each person's tasks (QA bug 6: "unable to view from members").
           return (
-            <div key={m.key} className="space-y-1.5">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex min-w-0 items-center gap-2">
-                  <div
+            <button
+              key={m.key}
+              type="button"
+              onClick={() => onSelect(m.key)}
+              aria-pressed={chosen}
+              title={pickerTitle(m, chosen)}
+              className={cn(
+                // Inset rings: the scrolling list would clip one drawn outside.
+                "block w-full space-y-1.5 rounded-lg px-2 py-1.5 text-left transition hover:bg-accent/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+                chosen && "bg-primary/10 ring-1 ring-inset ring-primary/30",
+              )}
+            >
+              <span className="flex items-center justify-between gap-2">
+                <span className="flex min-w-0 items-center gap-2">
+                  <span
                     className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold text-white"
                     style={{ background: m.color }}
                   >
                     {m.initials}
-                  </div>
-                  <div className="min-w-0 leading-tight">
-                    <div className="truncate text-xs font-medium">{m.name}</div>
-                    <div className="text-[10px] text-muted-foreground">
+                  </span>
+                  <span className="block min-w-0 leading-tight">
+                    <span className="block truncate text-xs font-medium">{m.name}</span>
+                    <span className="block text-[10px] text-muted-foreground">
                       {m.active} open · {m.done} done
-                    </div>
-                  </div>
-                </div>
+                    </span>
+                  </span>
+                </span>
                 <span className={cn("rounded px-1.5 py-0.5 text-[10px] font-medium", availColor)}>{m.availability}</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <div
-                  className="flex-1 h-1.5 rounded-full bg-secondary overflow-hidden"
+              </span>
+              <span className="flex items-center gap-2">
+                <span
+                  className="block flex-1 h-1.5 rounded-full bg-secondary overflow-hidden"
                   title={`${m.active} of ${CAPACITY} open tasks`}
                 >
-                  <div className={cn("h-full transition-all", color)} style={{ width: `${m.pct}%` }} />
-                </div>
+                  <span className={cn("block h-full transition-all", color)} style={{ width: `${m.pct}%` }} />
+                </span>
                 <span className="text-[10px] text-muted-foreground w-14 text-right whitespace-nowrap" title="Share of their tasks that are completed">
                   {m.productivity}% done
                 </span>
-              </div>
-            </div>
+              </span>
+            </button>
           );
         })}
       </div>
@@ -964,11 +1021,13 @@ function WorkloadPanel({ members, onManage }: { members: WorkloadMember[]; onMan
 
 function HeatmapPanel({
   members,
+  selected,
+  onSelect,
+  emptyText,
   tasks,
   today,
   timezone,
-}: {
-  members: WorkloadMember[];
+}: MemberPicker & {
   tasks: TeamTask[];
   today: string;
   timezone?: string;
@@ -997,33 +1056,47 @@ function HeatmapPanel({
       <h3 className="text-sm font-semibold">Productivity Heatmap</h3>
       <p className="text-[11px] text-muted-foreground mt-0.5">Tasks completed per member · last 5 days</p>
       {members.length === 0 ? (
-        <p className="mt-3 text-xs text-muted-foreground">No assigned tasks in this view.</p>
+        <p className="mt-3 text-xs text-muted-foreground">{emptyText}</p>
       ) : (
-        <div className="mt-3 grid gap-1.5" style={{ gridTemplateColumns: "70px repeat(5, 1fr)" }}>
+        <div className="mt-3 grid max-h-96 gap-1.5 overflow-y-auto" style={{ gridTemplateColumns: "70px repeat(5, 1fr)" }}>
           <div />
           {dayNumbers.map((day) => (
             <div key={day} className="text-[10px] text-center text-muted-foreground">
               {dayLabel(day, { weekday: "short" })}
             </div>
           ))}
-          {members.map((m, r) => (
-            <Fragment key={m.key}>
-              <div className="text-[11px] text-muted-foreground truncate" title={m.name}>{m.name.split(" ")[0]}</div>
-              {dayKeys.map((key, c) => {
-                const v = intensities[r][c];
-                // Saturate at four completions so one busy day does not flatten the rest.
-                const opacity = v === 0 ? 0.06 : 0.2 + Math.min(v, 4) * 0.19;
-                return (
-                  <div
-                    key={key}
-                    className="h-7 rounded-md"
-                    style={{ background: `color-mix(in oklab, var(--primary) ${opacity * 100}%, transparent)` }}
-                    title={`${m.name}: ${v} task${v === 1 ? "" : "s"} completed`}
-                  />
-                );
-              })}
-            </Fragment>
-          ))}
+          {members.map((m, r) => {
+            const chosen = selected === m.key;
+            return (
+              <Fragment key={m.key}>
+                <button
+                  type="button"
+                  onClick={() => onSelect(m.key)}
+                  aria-pressed={chosen}
+                  title={pickerTitle(m, chosen)}
+                  className={cn(
+                    "w-full truncate rounded text-left text-[11px] text-muted-foreground hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+                    chosen && "font-medium text-primary",
+                  )}
+                >
+                  {m.name.split(" ")[0]}
+                </button>
+                {dayKeys.map((key, c) => {
+                  const v = intensities[r][c];
+                  // Saturate at four completions so one busy day does not flatten the rest.
+                  const opacity = v === 0 ? 0.06 : 0.2 + Math.min(v, 4) * 0.19;
+                  return (
+                    <div
+                      key={key}
+                      className="h-7 rounded-md"
+                      style={{ background: `color-mix(in oklab, var(--primary) ${opacity * 100}%, transparent)` }}
+                      title={`${m.name}: ${v} task${v === 1 ? "" : "s"} completed`}
+                    />
+                  );
+                })}
+              </Fragment>
+            );
+          })}
         </div>
       )}
     </div>

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Search,
   Filter,
@@ -18,6 +18,8 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import {
+  RESTRICTED_PROJECT,
+  useLinkedTask,
   useWorkspace,
   type Priority,
   type Status,
@@ -61,11 +63,19 @@ interface MyTasksPageProps {
   dashboardFilter?: string;
   /** Clears the filter the dashboard applied (FD-030). */
   onClearFilter?: () => void;
-  /** ?task=<id> from an email: the task to open once the list has loaded. */
+  /** ?task=<id> from an email or notification: the task to open once the list has loaded. */
   linkedTaskId?: string;
   /** Called when that task's drawer closes, to drop the id from the URL. */
   onLinkedTaskClosed?: () => void;
 }
+
+/**
+ * What the Project filter groups a task by. Projects this person cannot open
+ * all read "Restricted project", so they share one choice instead of listing
+ * the same name once per hidden project.
+ */
+const projectKey = (task: WorkspaceTask) =>
+  task.projectRestricted ? RESTRICTED_PROJECT : (task.projectId ?? task.project);
 
 /**
  * Short, human-quotable references for task ids, unique within the loaded list.
@@ -257,7 +267,7 @@ export function MyTasksPage({
   // mock-data, whose names matched none of the real tasks.
   const projectOptions = useMemo(() => {
     const byKey = new Map<string, string>();
-    for (const task of items) byKey.set(task.projectId ?? task.project, task.project);
+    for (const task of items) byKey.set(projectKey(task), task.project);
     return [...byKey].sort((a, b) => a[1].localeCompare(b[1]));
   }, [items]);
 
@@ -266,7 +276,7 @@ export function MyTasksPage({
     const list = items.filter((t) => {
       if (!matchesDashboardFilter(t, dashboardFilter, today)) return false;
       if (priorityFilter !== "all" && t.priority !== priorityFilter) return false;
-      if (projectFilter !== "all" && (t.projectId ?? t.project) !== projectFilter) return false;
+      if (projectFilter !== "all" && projectKey(t) !== projectFilter) return false;
       if (
         needle &&
         !`${t.title} ${t.project} ${taskRefs.get(t.id) ?? ""} ${(t.tags ?? []).join(" ")}`
@@ -334,27 +344,24 @@ export function MyTasksPage({
     setScrollToId(linkedTaskId);
   }, [linkedTaskId]);
 
-  // ?task=<id> (email links): open it once, after the tasks load. A task this
-  // person cannot see (RLS), or one archived since, is not in the list.
-  const openedEmailTask = useRef<string | undefined>(undefined);
-  useEffect(() => {
-    if (!emailTaskId) {
-      openedEmailTask.current = undefined;
-      return;
-    }
-    if (pageStatus !== "ready" || openedEmailTask.current === emailTaskId) return;
-    openedEmailTask.current = emailTaskId;
-    if (allTasks.some((task) => task.id === emailTaskId)) {
-      setSelectedId(emailTaskId);
+  // ?task=<id> (emails, notifications): open it once, after the tasks load. A
+  // task this person cannot see (RLS), or one archived since, is not in the
+  // list; one created after the list loaded is, after the one re-read.
+  useLinkedTask(
+    emailTaskId,
+    pageStatus === "ready",
+    (id) => {
+      setSelectedId(id);
       setDetailOpen(true);
-      setScrollToId(emailTaskId);
-      return;
-    }
-    toast.error("That task isn't available to you.", {
-      description: "It may have been archived, or you may no longer have access to it.",
-    });
-    onLinkedTaskClosed?.();
-  }, [emailTaskId, pageStatus, allTasks, onLinkedTaskClosed]);
+      setScrollToId(id);
+    },
+    () => {
+      toast.error("That task isn't available to you.", {
+        description: "It may have been archived, or you may no longer have access to it.",
+      });
+      onLinkedTaskClosed?.();
+    },
+  );
 
   const changeDetailOpen = (open: boolean) => {
     setDetailOpen(open);

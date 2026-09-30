@@ -30,7 +30,26 @@ const PASSWORD_MIN_LENGTH = 8;
 // GoTrue hashes with bcrypt, which ignores everything past 72 bytes.
 const PASSWORD_MAX_LENGTH = 72;
 
-/** The roles that receive the management summaries (they can see every task in the organization). */
+/**
+ * GoTrue answers a wrong current password with the same words as a missing
+ * one ("Current password required when setting new password."), so its code
+ * decides. Its other messages are written for people ("New password should be
+ * different from the old password.") and are shown as they are.
+ */
+function passwordErrorMessage(error: { code?: string; message?: string }): string {
+  // _invalid in GoTrue 2.188, _mismatch in later versions.
+  if (error.code === "current_password_invalid" || error.code === "current_password_mismatch") {
+    return "Your current password isn't right.";
+  }
+  if (error.code === "current_password_required") return "Enter your current password.";
+  return error.message || "We couldn't update your password. Please try again.";
+}
+
+/**
+ * The roles that receive the management summaries. They cover what the person can see in the
+ * app: admins and managers every project, team leads the projects they are part of (and tasks
+ * with no project).
+ */
 const SUMMARY_ROLES: readonly AppRole[] = ["admin", "manager", "team_lead"];
 const isManagementKind = (kind: PreferenceKind) =>
   (MANAGEMENT_KINDS as readonly PreferenceKind[]).includes(kind);
@@ -73,6 +92,7 @@ export function ProfileDialog({
   const [nameError, setNameError] = useState<string | null>(null);
   const [savingName, setSavingName] = useState(false);
 
+  const [currentPassword, setCurrentPassword] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [passwordError, setPasswordError] = useState<string | null>(null);
@@ -83,6 +103,7 @@ export function ProfileDialog({
     if (!open) return;
     setDraftName(name);
     setNameError(null);
+    setCurrentPassword("");
     setPassword("");
     setConfirmPassword("");
     setPasswordError(null);
@@ -127,6 +148,10 @@ export function ProfileDialog({
 
   const savePassword = async (event: FormEvent) => {
     event.preventDefault();
+    if (!currentPassword) {
+      setPasswordError("Enter your current password.");
+      return;
+    }
     if (password.length < PASSWORD_MIN_LENGTH) {
       setPasswordError(`Use at least ${PASSWORD_MIN_LENGTH} characters for your new password.`);
       return;
@@ -142,17 +167,22 @@ export function ProfileDialog({
     setPasswordError(null);
     setSavingPassword(true);
     try {
-      const { error } = await supabase.auth.updateUser({ password });
+      // Sign-in asks for the current password before changing it ("Current
+      // password required when setting new password." without it). A reset
+      // from a Forgot password link is exempt and goes through /auth instead.
+      const { error } = await supabase.auth.updateUser({
+        password,
+        current_password: currentPassword,
+      });
       if (error) {
-        // GoTrue's messages are written for people ("New password should be
-        // different from the old password."), so show them as they are.
-        setPasswordError(error.message || "We couldn't update your password. Please try again.");
+        setPasswordError(passwordErrorMessage(error));
         return;
       }
       // A changed password should also lock out any other device still signed in.
       const { error: othersError } = await supabase.auth.signOut({ scope: "others" });
       if (othersError)
         console.error("[profile] Could not end sessions on other devices", othersError);
+      setCurrentPassword("");
       setPassword("");
       setConfirmPassword("");
       toast.success(
@@ -227,6 +257,21 @@ export function ProfileDialog({
         <form className="space-y-3" onSubmit={savePassword} noValidate>
           <p className="text-sm font-medium">Change password</p>
           <div className="space-y-1.5">
+            <Label htmlFor="profile-current-password">Current password</Label>
+            <Input
+              id="profile-current-password"
+              type="password"
+              value={currentPassword}
+              onChange={(event) => setCurrentPassword(event.target.value)}
+              autoComplete="current-password"
+              aria-invalid={Boolean(passwordError)}
+              aria-describedby="profile-current-password-hint"
+            />
+            <p id="profile-current-password-hint" className="text-[11px] text-muted-foreground">
+              Forgot it? Sign out and choose Forgot password on the sign-in page.
+            </p>
+          </div>
+          <div className="space-y-1.5">
             <Label htmlFor="profile-new-password">New password</Label>
             <Input
               id="profile-new-password"
@@ -265,7 +310,7 @@ export function ProfileDialog({
             <Button
               type="submit"
               size="sm"
-              disabled={savingPassword || !password || !confirmPassword}
+              disabled={savingPassword || !currentPassword || !password || !confirmPassword}
             >
               {savingPassword && <Loader2 className="animate-spin" aria-hidden="true" />}
               Update password

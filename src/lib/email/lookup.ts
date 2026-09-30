@@ -14,6 +14,8 @@ import { localParts } from "./time";
 // Lookups over one worker snapshot, shared by the planner and the composer.
 
 export const MANAGEMENT_ROLES: ReadonlySet<string> = new Set(["admin", "manager", "team_lead"]);
+/** Every project in the organization is open to them (private.has_project_oversight). */
+export const OVERSIGHT_ROLES: ReadonlySet<string> = new Set(["admin", "manager"]);
 
 export const isOpenTask = (task: Pick<SnapshotTask, "status">) =>
   task.status !== "done" && task.status !== "cancelled";
@@ -35,8 +37,16 @@ export type SnapshotIndex = {
   primaryOrgByUser: ReadonlyMap<string, string>;
   /** Every membership (any status) of organizations in the snapshot. */
   memberOrgsByUser: ReadonlyMap<string, string[]>;
-  /** Organizations where the person is admin, manager or team_lead AND an active member: exactly where RLS shows them every task. */
+  /**
+   * Organizations where the person is admin, manager or team_lead AND an active member: they get
+   * the management summaries there, and RLS shows them every task with no project.
+   */
   managedOrgsByUser: ReadonlyMap<string, string[]>;
+  /**
+   * Organizations where the person is admin or manager AND an active member: every project there
+   * is open to them.
+   */
+  oversightOrgsByUser: ReadonlyMap<string, string[]>;
   projectRoleLabels: ReadonlyMap<string, string | null>;
   projectCountById: ReadonlyMap<string, SnapshotProjectCount>;
   priorityLabels: ReadonlyMap<string, string>;
@@ -75,15 +85,19 @@ function membershipMaps(snapshot: EmailSnapshot, orgIds: ReadonlySet<string>) {
       return [userId, primary?.organizationId ?? orgs[0]];
     }),
   );
-  const managed = snapshot.roles.filter(
-    (r) =>
-      MANAGEMENT_ROLES.has(r.role) && activeOrgsByUser.get(r.userId)?.includes(r.organizationId),
-  );
+  // A role counts only where the membership is active, as in the database's helpers.
+  const holding = (roles: ReadonlySet<string>) =>
+    orgIdsByUser(
+      snapshot.roles.filter(
+        (r) => roles.has(r.role) && activeOrgsByUser.get(r.userId)?.includes(r.organizationId),
+      ),
+    );
   return {
     activeOrgsByUser,
     primaryOrgByUser,
     memberOrgsByUser: orgIdsByUser(known),
-    managedOrgsByUser: orgIdsByUser(managed),
+    managedOrgsByUser: holding(MANAGEMENT_ROLES),
+    oversightOrgsByUser: holding(OVERSIGHT_ROLES),
   };
 }
 
@@ -125,6 +139,58 @@ export function indexSnapshot(snapshot: EmailSnapshot): SnapshotIndex {
 
 export const isActiveMember = (index: SnapshotIndex, userId: string, orgId: string) =>
   index.activeOrgsByUser.get(userId)?.includes(orgId) ?? false;
+
+const hasOversight = (index: SnapshotIndex, userId: string, orgId: string) =>
+  index.oversightOrgsByUser.get(userId)?.includes(orgId) ?? false;
+
+// The snapshot is read through a SECURITY DEFINER function, so row-level security never narrows
+// it. The two checks below are the database's own rule for projects and tasks
+// (20260930000100_project_access.sql), applied here so a summary lists only what the app would
+// show its recipient. Anything the snapshot cannot settle is left out.
+
+/**
+ * private.can_access_project: an admin or manager of the project's organization, or its owner,
+ * its Project Manager or someone on its team, with an active membership there. Team leads get in
+ * only those three ways. Archived projects are not in the snapshot, so they are closed here; a
+ * project from a snapshot RPC without ownerId is open to admins and managers only.
+ */
+export function canSeeProject(index: SnapshotIndex, userId: string, projectId: string): boolean {
+  const project = index.projectById.get(projectId);
+  if (!project || !isActiveMember(index, userId, project.organizationId)) return false;
+  if (hasOversight(index, userId, project.organizationId)) return true;
+  if (typeof project.ownerId !== "string") return false;
+  return (
+    project.ownerId === userId ||
+    project.managerId === userId ||
+    index.projectRoleLabels.has(`${projectId}:${userId}`)
+  );
+}
+
+/**
+ * The work_tasks SELECT policy. A task with no project keeps the older rule: its creator,
+ * assignee or reviewer, or an admin, manager or team lead of its organization. A project's task
+ * is open to whoever may open the project, and its creator, assignee and reviewer keep it even
+ * off the team. A task whose project is not in the snapshot (archived) is shown to admins and
+ * managers only.
+ */
+export function canSeeTask(
+  index: SnapshotIndex,
+  userId: string,
+  task: Pick<
+    SnapshotTask,
+    "organizationId" | "projectId" | "createdBy" | "assigneeId" | "reviewerId"
+  >,
+): boolean {
+  const own = task.createdBy === userId || task.assigneeId === userId || task.reviewerId === userId;
+  if (!task.projectId) {
+    return own || (index.managedOrgsByUser.get(userId)?.includes(task.organizationId) ?? false);
+  }
+  if (own && isActiveMember(index, userId, task.organizationId)) return true;
+  if (!index.projectById.has(task.projectId)) {
+    return hasOversight(index, userId, task.organizationId);
+  }
+  return canSeeProject(index, userId, task.projectId);
+}
 
 export const kindEnabledForOrg = (org: SnapshotOrganization | undefined, kind: PreferenceKind) =>
   Boolean(org && org.settings.enabled && org.settings[kind] !== false);

@@ -108,6 +108,9 @@ export const project = (overrides: Partial<SnapshotProject> = {}): SnapshotProje
   startDate: "2026-09-01",
   dueDate: "2026-10-31",
   archivedAt: null,
+  // Created by the admin, who is its Project Manager too (the form's default).
+  ownerId: ADMIN,
+  managerId: ADMIN,
   ...overrides,
 });
 

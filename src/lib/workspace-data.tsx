@@ -14,6 +14,12 @@ export interface Subtask {
 
 export type WorkspaceTask = Task & {
   projectId?: string;
+  /**
+   * The task has a project this person cannot open (they created, are assigned
+   * or review the task but are not on the project's team). `project` then reads
+   * RESTRICTED_PROJECT rather than "No project", which was untrue.
+   */
+  projectRestricted?: boolean;
   /** Real start date when one was set, otherwise the creation time. */
   startDate: string;
   /** True only when a start date was actually saved (FD-032). */
@@ -91,6 +97,10 @@ const TASK_SELECT =
 
 const today = () => new Date().toISOString().slice(0, 10);
 
+export const NO_PROJECT = "No project";
+/** A project the task belongs to but row-level security hides from this person. */
+export const RESTRICTED_PROJECT = "Restricted project";
+
 /** Progress is the subtask ratio when there are subtasks (mirrors the database trigger). */
 function derivedProgress(task: Pick<WorkspaceTask, "status" | "progress" | "subtasks">): number {
   if (task.status === "done") return 100;
@@ -112,12 +122,16 @@ function mapRow(row: TaskRow, personFor: (id: string | null | undefined) => Pers
       }
     : undefined;
   const assignee = personFor(row.assignee_id);
+  // project_id set but no embedded project: the project exists and is hidden
+  // from this person (projects are open to their team only), not missing.
+  const projectRestricted = Boolean(row.project_id) && !row.work_projects;
   return {
     id: row.id,
     title: row.title,
     description: row.description ?? undefined,
-    project: row.work_projects?.name ?? "No project",
+    project: row.work_projects?.name ?? (projectRestricted ? RESTRICTED_PROJECT : NO_PROJECT),
     projectId: row.project_id ?? undefined,
+    projectRestricted,
     organizationId: row.organization_id,
     assignee: { name: assignee.name, initials: assignee.initials, color: assignee.color },
     assigneeId: row.assignee_id,
@@ -241,27 +255,49 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     // A task belongs to its project's organization. Using the creator's primary
     // organization would file a task for another organization's project in the
     // wrong place (RLS would then hide it from that project's members).
+    // A project that was asked for but does not resolve is an error: falling
+    // through used to create the task with no project at all.
     let organizationId = membership.organization_id;
+    let projectId: string | null = null;
+    const projectName = input.project?.trim() ?? "";
     if (input.projectId) {
-      const { data: owner } = await supabase
+      const { data: owner, error: ownerError } = await supabase
         .from("work_projects")
-        .select("organization_id")
+        .select("id, organization_id")
         .eq("id", input.projectId)
         .maybeSingle();
-      if (owner) organizationId = owner.organization_id;
+      if (ownerError) {
+        console.error("[flowdesk] project lookup failed", ownerError);
+        return { ok: false, error: "The project could not be checked. Please try again." };
+      }
+      // Deleted, or no longer open to this person (projects are open to their team only).
+      if (!owner) {
+        return { ok: false, error: "That project is no longer available to you. Choose another project." };
+      }
+      organizationId = owner.organization_id;
+      projectId = owner.id;
+    } else if (projectName && projectName !== NO_PROJECT) {
+      const { data: named, error: namedError } = await supabase
+        .from("work_projects")
+        .select("id")
+        .eq("organization_id", organizationId)
+        .eq("name", projectName)
+        .limit(2);
+      if (namedError) {
+        console.error("[flowdesk] project lookup failed", namedError);
+        return { ok: false, error: "The project could not be checked. Please try again." };
+      }
+      // Two projects can share a name; guessing between them would file the task in the wrong one.
+      if (named?.length !== 1) {
+        return {
+          ok: false,
+          error: named?.length
+            ? `More than one project is called "${projectName}". Choose the project from the list.`
+            : `No project called "${projectName}" is available to you. Choose another project.`,
+        };
+      }
+      projectId = named[0].id;
     }
-
-    const projectId =
-      input.projectId ??
-      (
-        await supabase
-          .from("work_projects")
-          .select("id")
-          .eq("organization_id", organizationId)
-          .eq("name", input.project)
-          .maybeSingle()
-      ).data?.id ??
-      null;
 
     // The person picked in the form. This used to be auth.user.id unconditionally,
     // so every task was silently assigned to its creator (FD-001).
@@ -508,6 +544,59 @@ export function useWorkspace() {
   const context = useContext(WorkspaceContext);
   if (!context) throw new Error("useWorkspace must be used inside WorkspaceProvider");
   return context;
+}
+
+/**
+ * Opens the task a link names (?task=<id>) once the tasks have loaded, or says
+ * it can't be opened — once per link.
+ *
+ * A task missing from the list is not necessarily unavailable: it can simply be
+ * newer than the list, like a task created after this page loaded that a
+ * notification now points at. So the list is re-read once before `onMissing`.
+ */
+export function useLinkedTask(
+  taskId: string | undefined,
+  ready: boolean,
+  onFound: (id: string) => void,
+  onMissing: () => void,
+): void {
+  const { tasks, refresh } = useWorkspace();
+  // Latest callbacks, so a parent re-render does not re-run the lookup.
+  const handlers = useRef({ onFound, onMissing });
+  handlers.current = { onFound, onMissing };
+  // The link already dealt with, so a later reload does not reopen it.
+  const handled = useRef<string | undefined>(undefined);
+  // The link a re-read was started for, and the one it has finished for.
+  const reloading = useRef<string | undefined>(undefined);
+  const [reloaded, setReloaded] = useState<string | undefined>(undefined);
+
+  useEffect(() => {
+    if (!taskId) {
+      handled.current = undefined;
+      reloading.current = undefined;
+      setReloaded(undefined);
+      return;
+    }
+    if (!ready || handled.current === taskId) return;
+    if (tasks.some((task) => task.id === taskId)) {
+      handled.current = taskId;
+      handlers.current.onFound(taskId);
+      return;
+    }
+    if (reloaded !== taskId) {
+      if (reloading.current === taskId) return;
+      reloading.current = taskId;
+      void refresh()
+        .catch((error: unknown) => console.error("[flowdesk] reloading tasks for a linked task failed", error))
+        .then(() => {
+          // Only if this link is still the one being opened.
+          if (reloading.current === taskId) setReloaded(taskId);
+        });
+      return;
+    }
+    handled.current = taskId;
+    handlers.current.onMissing();
+  }, [taskId, ready, tasks, refresh, reloaded]);
 }
 
 export type { Priority, Status };

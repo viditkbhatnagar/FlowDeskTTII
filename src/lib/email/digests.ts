@@ -7,6 +7,8 @@ import {
 } from "../project-metrics";
 import {
   appUrls,
+  canSeeProject,
+  canSeeTask,
   colleagueName,
   contentOrgs,
   firstNameOf,
@@ -356,9 +358,19 @@ function managementRow(
   };
 }
 
+/**
+ * The organization's tasks the recipient can see in the app. Not all of them: a team lead sees
+ * only the projects they own, manage or are on the team of (canSeeTask), and the snapshot
+ * itself is not narrowed by row-level security.
+ */
+const visibleOrgTasks = (args: DigestArgs, org: SnapshotOrganization) =>
+  (args.index.tasksByOrg.get(org.id) ?? []).filter((task) =>
+    canSeeTask(args.index, args.userId, task),
+  );
+
 function dailyManagementBuckets(args: DigestArgs, org: SnapshotOrganization) {
   const day = orgDay(org, args.now);
-  const tasks = args.index.tasksByOrg.get(org.id) ?? [];
+  const tasks = visibleOrgTasks(args, org);
   const open = tasks.filter(isOpenTask);
   const since = startOfLocalDay(prevWorkingDay(day.today, org.settings.workingDays), org.timezone);
   const rank = (task: SnapshotTask) => ATTENTION_ORDER.indexOf(attentionFlags(day, task)[0]);
@@ -486,6 +498,7 @@ function projectHealthRows(args: DigestArgs, day: OrgDay, tasks: SnapshotTask[])
   return args.index.snapshot.projects
     .filter((project) => project.organizationId === day.org.id)
     .filter((project) => !CLOSED_PROJECT_STATUSES.has(project.status))
+    .filter((project) => canSeeProject(args.index, args.userId, project.id))
     .map((project) => {
       const progress = progressOf(args.index.projectCountById.get(project.id));
       const dueDate = toYmd(project.dueDate);
@@ -494,7 +507,8 @@ function projectHealthRows(args: DigestArgs, day: OrgDay, tasks: SnapshotTask[])
         dueDate,
         today: day.today,
         lifecycle: project.status,
-        // Every open task is in the snapshot, so this count is complete.
+        // Every open task is in the snapshot, and whoever may see a project sees all of its
+        // tasks, so this count is complete.
         overdueTasks: tasks.filter((task) => task.projectId === project.id && isOverdue(day, task))
           .length,
       });
@@ -538,7 +552,7 @@ function workloadItems(args: DigestArgs, day: OrgDay, open: SnapshotTask[]): Det
 function weeklyManagementBuckets(args: DigestArgs, org: SnapshotOrganization) {
   const day = orgDay(org, args.now);
   const period = periodOf(day);
-  const tasks = args.index.tasksByOrg.get(org.id) ?? [];
+  const tasks = visibleOrgTasks(args, org);
   const open = tasks.filter(isOpenTask).sort(byDue(day));
   const projects = projectHealthRows(args, day, tasks);
   const attentionOf = (task: SnapshotTask) =>

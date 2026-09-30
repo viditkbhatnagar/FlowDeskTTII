@@ -52,6 +52,7 @@ import {
   type PersonRef,
 } from "@/lib/task-api";
 import { useOrganizations } from "@/lib/organizations-data";
+import { canCreateProjects } from "@/lib/project-permissions";
 import { useTaskSettings } from "@/lib/task-settings-data";
 import { useWorkspace } from "@/lib/workspace-data";
 import { ProjectWorkspace, type WorkspaceProject } from "./ProjectWorkspace";
@@ -243,11 +244,20 @@ const EditingProjectContext = createContext<EditingProject | null>(null);
  * The organization a new project goes into: the one selected in the switcher,
  * else the user's own. With "All organizations" selected (the default) every
  * create used to fail with "Could not tell which organization".
+ *
+ * Creating a project takes admin, manager or team lead there, so with every
+ * organization shown it goes to the user's own only when they may create one
+ * in it, and otherwise to the first organization where they may.
  */
 function useDefaultOrgId(): string | undefined {
-  const { activeOrgId, organizations, accessibleOrganizations, currentUser } = useOrganizations();
+  const { activeOrgId, organizations, accessibleOrganizations, currentUser, ownPrivilegesIn } =
+    useOrganizations();
   if (activeOrgId !== "all") return activeOrgId;
-  return currentUser?.primaryOrgId || accessibleOrganizations[0]?.id || organizations[0]?.id;
+  const own = currentUser?.primaryOrgId || accessibleOrganizations[0]?.id || organizations[0]?.id;
+  if (canCreateProjects(ownPrivilegesIn(own))) return own;
+  return (
+    accessibleOrganizations.find((org) => canCreateProjects(ownPrivilegesIn(org.id)))?.id ?? own
+  );
 }
 
 export function ProjectsPage({
@@ -285,6 +295,21 @@ export function ProjectsPage({
     });
   }, [refreshProjects]);
 
+  // A notification (say, being added to a project) or work done elsewhere in
+  // the app: reload quietly, once things settle, so the new project is here.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onWorkChanged = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => void refreshProjects(), 1000);
+    };
+    window.addEventListener("flowdesk-work-changed", onWorkChanged);
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener("flowdesk-work-changed", onWorkChanged);
+    };
+  }, [refreshProjects]);
+
   useEffect(() => {
     retryLoad();
   }, [retryLoad]);
@@ -298,8 +323,10 @@ export function ProjectsPage({
   // so the archived project does not reappear.
   const pendingArchive = useRef<Promise<unknown>>(Promise.resolve());
 
-  const { activeOrgId } = useOrganizations();
+  const { activeOrgId, ownPrivilegesIn } = useOrganizations();
   const defaultOrgId = useDefaultOrgId();
+  // New Project is offered only where it can be saved.
+  const canCreate = canCreateProjects(ownPrivilegesIn(defaultOrgId));
 
   // The dashboard filter stays visible and clearable (FD-030). Clearing also
   // works before the route wires onClearFilter, so the chip can never get stuck.
@@ -326,23 +353,43 @@ export function ProjectsPage({
   // ?project=<id> (email links), likewise once. An archived project, or one this
   // person cannot see (RLS), is not in the list.
   const openedEmailProject = useRef<string | undefined>(undefined);
+  // The list is read when the page opens, so a project someone was added to
+  // since (the link in "You've been added to a project") is not in it yet. It
+  // is read again once, for that link, before the project is called unavailable.
+  const linkRefreshStarted = useRef<string | undefined>(undefined);
+  const [linkRefreshedFor, setLinkRefreshedFor] = useState<string>();
   useEffect(() => {
     if (!linkedProjectId) {
       openedEmailProject.current = undefined;
       return;
     }
     if (projectsStatus !== "ready" || openedEmailProject.current === linkedProjectId) return;
-    openedEmailProject.current = linkedProjectId;
     const match = projectItems.find((project) => project.id === linkedProjectId);
     if (match) {
+      openedEmailProject.current = linkedProjectId;
       setSelected(match);
       return;
     }
+    if (linkRefreshedFor !== linkedProjectId) {
+      if (linkRefreshStarted.current !== linkedProjectId) {
+        linkRefreshStarted.current = linkedProjectId;
+        void refreshProjects().finally(() => setLinkRefreshedFor(linkedProjectId));
+      }
+      return;
+    }
+    openedEmailProject.current = linkedProjectId;
     toast.error("That project isn't available to you.", {
       description: "It may have been archived, or you may no longer be on its team.",
     });
     onLinkedProjectClosed?.();
-  }, [linkedProjectId, projectsStatus, projectItems, onLinkedProjectClosed]);
+  }, [
+    linkedProjectId,
+    projectsStatus,
+    projectItems,
+    onLinkedProjectClosed,
+    linkRefreshedFor,
+    refreshProjects,
+  ]);
 
   // Scoped by each project's own organization. This used to look projects up in
   // a hardcoded list of five sample projects ("P-1".."P-5", Operations in a
@@ -660,9 +707,11 @@ export function ProjectsPage({
                 </button>
               ))}
             </div>
-            <Button size="sm" className="h-9" onClick={() => setCreateOpen(true)}>
-              <Plus className="h-3.5 w-3.5" /> New Project
-            </Button>
+            {canCreate && (
+              <Button size="sm" className="h-9" onClick={() => setCreateOpen(true)}>
+                <Plus className="h-3.5 w-3.5" /> New Project
+              </Button>
+            )}
           </div>
         </div>
 
@@ -732,9 +781,13 @@ export function ProjectsPage({
             ) : (
               <>
                 <p>No projects yet.</p>
-                <Button size="sm" className="mt-3" onClick={() => setCreateOpen(true)}>
-                  <Plus className="h-3.5 w-3.5" /> New Project
-                </Button>
+                {canCreate ? (
+                  <Button size="sm" className="mt-3" onClick={() => setCreateOpen(true)}>
+                    <Plus className="h-3.5 w-3.5" /> New Project
+                  </Button>
+                ) : (
+                  <p className="mt-1">Projects you are added to will show here.</p>
+                )}
               </>
             )}
           </StatePanel>

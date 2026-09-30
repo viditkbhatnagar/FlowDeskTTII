@@ -26,7 +26,12 @@ import {
   task,
 } from "./fixtures";
 import { indexSnapshot } from "./lookup";
-import type { EmailSnapshot } from "./snapshot";
+import type {
+  EmailSnapshot,
+  SnapshotProject,
+  SnapshotProjectMember,
+  SnapshotTask,
+} from "./snapshot";
 
 const args = (snapshot: EmailSnapshot, userId: string, now = FRIDAY_0830_DUBAI) => ({
   index: indexSnapshot(snapshot),
@@ -570,5 +575,177 @@ describe("project health", () => {
     } as unknown as EmailSnapshot;
     const weekly = weeklyManagementContent(args(snapshot, ADMIN))!;
     expect(weekly.organizations[0].sections.map((s) => s.label)).not.toContain("Project Health");
+  });
+});
+
+describe("projects in management summaries", () => {
+  // The snapshot bypasses row-level security, so a summary must show a team lead only the
+  // projects they are part of, as the app does (20260930000100_project_access.sql). The lead is
+  // team lead in TTI; Priya owns and runs a TTI project the lead is not on.
+  const TTI_PROJECT = "p0000000-0000-4000-8000-000000000002";
+  const ttiSnapshot = (
+    options: {
+      project?: Partial<SnapshotProject>;
+      members?: SnapshotProjectMember[];
+      tasks?: SnapshotTask[];
+    } = {},
+  ) => {
+    const base = baseSnapshot();
+    const inTti = (overrides: Partial<SnapshotTask>) =>
+      task({ organizationId: KOLKATA, assigneeId: PRIYA, createdBy: PRIYA, ...overrides });
+    return baseSnapshot({
+      people: [...base.people, person(PRIYA, "Priya Sharma", "priya@tti.test")],
+      memberships: [
+        ...base.memberships,
+        membership(PRIYA, KOLKATA),
+        membership(DAN, KOLKATA, false),
+      ],
+      roles: [...base.roles, role(PRIYA, KOLKATA, "employee"), role(DAN, KOLKATA, "manager")],
+      projects: [
+        project({
+          id: TTI_PROJECT,
+          organizationId: KOLKATA,
+          name: "Batch 12 Onboarding",
+          ownerId: PRIYA,
+          managerId: PRIYA,
+          ...options.project,
+        }),
+      ],
+      projectMembers: options.members ?? [
+        { projectId: TTI_PROJECT, userId: PRIYA, roleLabel: null },
+      ],
+      tasks: [
+        inTti({ title: "project late", projectId: TTI_PROJECT, dueDate: "2026-09-24" }),
+        inTti({
+          title: "project shipped",
+          projectId: TTI_PROJECT,
+          status: "done",
+          completedAt: "2026-09-22T10:00:00Z",
+        }),
+        inTti({ title: "loose late", dueDate: "2026-09-24" }),
+        ...(options.tasks ?? []),
+      ],
+    });
+  };
+
+  const dailyTitles = (snapshot: EmailSnapshot, userId: string) =>
+    (dailyManagementContent(args(snapshot, userId))?.organizations ?? [])
+      .flatMap((o) => o.groups.flatMap((g) => g.tasks.map((t) => t.title)))
+      .sort();
+  const weeklySections = (snapshot: EmailSnapshot, userId: string) =>
+    weeklyManagementContent(args(snapshot, userId))?.organizations.find((o) =>
+      o.name.startsWith("Teachers"),
+    )?.sections ?? [];
+  const weeklyTitles = (snapshot: EmailSnapshot, userId: string) =>
+    weeklySections(snapshot, userId)
+      .filter((s) => s.label !== "Team Workload" && s.label !== "Project Health")
+      .flatMap((s) => s.items.map((i) => i.title))
+      .sort();
+  const healthOf = (snapshot: EmailSnapshot, userId: string) =>
+    titles(weeklySections(snapshot, userId), "Project Health");
+
+  test("a team lead who is not on the project sees none of its tasks and not its health", () => {
+    const snapshot = ttiSnapshot();
+    expect(dailyTitles(snapshot, LEAD)).toEqual(["loose late"]);
+    expect(dailyManagementContent(args(snapshot, LEAD))).toMatchObject({
+      overdueCount: "1",
+      completedCount: "0",
+    });
+    expect(weeklyTitles(snapshot, LEAD)).toEqual(["loose late"]);
+    expect(healthOf(snapshot, LEAD)).toEqual([]);
+    const weekly = weeklyManagementContent(args(snapshot, LEAD))!;
+    expect(weekly.organizations[0].summary).toBe(
+      "1 open task · 0 projects need attention · 0 completed",
+    );
+    const everything = JSON.stringify([dailyManagementContent(args(snapshot, LEAD)), weekly]);
+    expect(everything).not.toContain("Batch 12");
+    expect(everything).not.toContain("project late");
+    expect(everything).not.toContain("project shipped");
+  });
+
+  test("on the team, as owner or as Project Manager, a team lead sees its tasks and health", () => {
+    const ways = [
+      ttiSnapshot({
+        members: [
+          { projectId: TTI_PROJECT, userId: PRIYA, roleLabel: null },
+          { projectId: TTI_PROJECT, userId: LEAD, roleLabel: "Coordinator" },
+        ],
+      }),
+      ttiSnapshot({ project: { ownerId: LEAD } }),
+      ttiSnapshot({ project: { managerId: LEAD } }),
+    ];
+    for (const snapshot of ways) {
+      // Daily lists what is completed since yesterday's start, so "project shipped" is weekly only.
+      expect(dailyTitles(snapshot, LEAD)).toEqual(["loose late", "project late"]);
+      expect(weeklyTitles(snapshot, LEAD)).toEqual([
+        "loose late",
+        "project late",
+        "project shipped",
+      ]);
+      expect(healthOf(snapshot, LEAD)).toEqual(["Batch 12 Onboarding"]);
+    }
+  });
+
+  test("a manager sees every project in the organization without being on it", () => {
+    const snapshot = ttiSnapshot();
+    expect(dailyTitles(snapshot, DAN)).toEqual(["loose late", "project late"]);
+    expect(weeklyTitles(snapshot, DAN)).toEqual(["loose late", "project late", "project shipped"]);
+    expect(healthOf(snapshot, DAN)).toEqual(["Batch 12 Onboarding"]);
+  });
+
+  test("tasks with no project reach every team lead of the organization, as before", () => {
+    const snapshot = ttiSnapshot({
+      tasks: [task({ title: "loose unassigned", organizationId: KOLKATA, assigneeId: null })],
+    });
+    expect(dailyTitles(snapshot, LEAD)).toEqual(["loose late", "loose unassigned"]);
+  });
+
+  test("a team lead keeps their own task in a project they are not on, without its health", () => {
+    const snapshot = ttiSnapshot({
+      tasks: [
+        task({
+          title: "lead's own",
+          organizationId: KOLKATA,
+          projectId: TTI_PROJECT,
+          assigneeId: LEAD,
+          dueDate: "2026-09-24",
+        }),
+      ],
+    });
+    expect(dailyTitles(snapshot, LEAD)).toEqual(["lead's own", "loose late"]);
+    expect(healthOf(snapshot, LEAD)).toEqual([]);
+  });
+
+  test("what the snapshot cannot settle is left out for everyone but admins and managers", () => {
+    // A snapshot RPC from before ownerId was added: the lead is on the team, but it can't be told.
+    const legacy = ttiSnapshot({
+      members: [{ projectId: TTI_PROJECT, userId: LEAD, roleLabel: null }],
+    });
+    const stripped = {
+      ...legacy,
+      projects: legacy.projects.map(({ ownerId: _o, managerId: _m, ...rest }) => rest),
+    } as unknown as EmailSnapshot;
+    expect(dailyTitles(stripped, LEAD)).toEqual(["loose late"]);
+    expect(healthOf(stripped, LEAD)).toEqual([]);
+    expect(dailyTitles(stripped, DAN)).toEqual(["loose late", "project late"]);
+    // An archived project is not in the snapshot, though its open tasks are.
+    const archived = ttiSnapshot({
+      members: [{ projectId: "p-archived", userId: LEAD, roleLabel: null }],
+      tasks: [
+        task({
+          title: "archived project's",
+          organizationId: KOLKATA,
+          projectId: "p-archived",
+          assigneeId: PRIYA,
+          dueDate: "2026-09-24",
+        }),
+      ],
+    });
+    expect(dailyTitles(archived, LEAD)).toEqual(["loose late"]);
+    expect(dailyTitles(archived, DAN)).toEqual([
+      "archived project's",
+      "loose late",
+      "project late",
+    ]);
   });
 });

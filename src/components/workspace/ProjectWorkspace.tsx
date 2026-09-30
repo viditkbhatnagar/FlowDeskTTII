@@ -85,6 +85,7 @@ import type { Database } from "@/integrations/supabase/types";
 import type { Priority, Status } from "@/lib/mock-data";
 import { updateProjectRow } from "@/lib/admin-api";
 import { useOrganizations } from "@/lib/organizations-data";
+import { canCreateProjects, canDeleteProjects, canManageProject } from "@/lib/project-permissions";
 import {
   healthLabel,
   projectHealth,
@@ -172,15 +173,6 @@ type DirectoryPerson = PersonRef & {
 
 type ActivityCategory = "tasks" | "documents" | "project";
 
-const permissions = {
-  createTasks: true,
-  assignTasks: true,
-  manageProjects: true,
-  manageTeam: true,
-  manageMilestones: true,
-  manageDocuments: true,
-  deleteProjects: true,
-};
 const statusLabels: Record<Lifecycle, string> = {
   planning: "Planning",
   active: "Active",
@@ -268,6 +260,8 @@ type MilestoneRow = Database["public"]["Tables"]["project_milestones"]["Row"];
 
 interface ProjectRecords {
   organizationId: string | null;
+  /** Who created it: they may manage it whatever their role. */
+  ownerId: string | null;
   managerId: string | null;
   lifecycle: Lifecycle | null;
   memberIds: string[];
@@ -312,6 +306,7 @@ async function loadProjectRecords(projectId: string): Promise<ProjectRecords | n
   const row = projectRow.data;
   return {
     organizationId: row?.organization_id ?? null,
+    ownerId: row?.owner_id ?? null,
     managerId: row?.manager_id ?? row?.owner_id ?? null,
     // Re-read rather than trusted from the list, which can be minutes old: a
     // project marked Completed must be labelled Completed here (FD-056).
@@ -431,7 +426,7 @@ export function ProjectWorkspace({
   onUpdated?: (project: WorkspaceProject) => void;
 }) {
   const { tasks, people, updateTask, deleteTask } = useWorkspace();
-  const { organizations, users, departments } = useOrganizations();
+  const { organizations, users, departments, currentUserId, ownPrivilegesIn } = useOrganizations();
   const [project, setProject] = useState(initialProject);
   const [sourceId, setSourceId] = useState(initialProject.id);
   const [tab, setTab] = useState<Tab>("overview");
@@ -569,6 +564,21 @@ export function ProjectWorkspace({
   );
   const teamCount = records ? team.length : project.team.length;
   const milestones = records?.milestones ?? [];
+
+  // Anyone who can open the project works its tasks, adds tasks, comments and
+  // uploads. Changing the project itself is for the people the database lets
+  // (project-permissions.ts), so everyone else is not shown controls that
+  // would only fail. The owner and team come with the records; until they
+  // load, only an admin or manager is known to manage it.
+  const privileges = ownPrivilegesIn(organizationId);
+  const canManage = canManageProject(currentUserId, privileges, {
+    ownerId: records?.ownerId ?? null,
+    managerId: records?.managerId ?? null,
+    memberIds: records?.memberIds ?? [],
+  });
+  // A copy is a new project, which takes admin, manager or team lead.
+  const canDuplicate = canCreateProjects(privileges);
+  const canDelete = canDeleteProjects(privileges);
 
   // Every real user, with their department and title. The picker listed six
   // demo people (FD-034). Only active members of the project's organization
@@ -879,21 +889,28 @@ export function ProjectWorkspace({
               </div>
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              <Select
-                value={project.creationStatus ?? "active"}
-                onValueChange={(value) => void changeStatus(value as Lifecycle)}
-              >
-                <SelectTrigger className="h-9 w-[120px] text-xs" aria-label="Project status">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {Object.entries(statusLabels).map(([value, label]) => (
-                    <SelectItem key={value} value={value}>
-                      {label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              {canManage ? (
+                <Select
+                  value={project.creationStatus ?? "active"}
+                  onValueChange={(value) => void changeStatus(value as Lifecycle)}
+                >
+                  <SelectTrigger className="h-9 w-[120px] text-xs" aria-label="Project status">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {Object.entries(statusLabels).map(([value, label]) => (
+                      <SelectItem key={value} value={value}>
+                        {label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <span className="inline-flex h-9 items-center whitespace-nowrap rounded-md border border-input px-3 text-xs">
+                  <span className="sr-only">Project status: </span>
+                  {statusLabels[project.creationStatus ?? "active"]}
+                </span>
+              )}
               <Tooltip>
                 <TooltipTrigger asChild>
                   <span
@@ -908,70 +925,83 @@ export function ProjectWorkspace({
                 </TooltipTrigger>
                 <TooltipContent className="max-w-xs">{healthReason[health]}</TooltipContent>
               </Tooltip>
-              {permissions.createTasks && (
-                <Button size="sm" onClick={() => setTaskOpen(true)}>
-                  <Plus className="h-4 w-4" />
-                  Add Task
+              <Button size="sm" onClick={() => setTaskOpen(true)}>
+                <Plus className="h-4 w-4" />
+                Add Task
+              </Button>
+              {canManage && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => ensureSaved() && setEditOpen(true)}
+                >
+                  <Edit3 className="h-4 w-4" />
+                  Edit Project
                 </Button>
               )}
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => ensureSaved() && setEditOpen(true)}
-              >
-                <Edit3 className="h-4 w-4" />
-                Edit Project
-              </Button>
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button variant="outline" size="icon" aria-label="Project actions">
-                    <MoreHorizontal className="h-4 w-4" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end">
-                  {/* "Change Status" silently put the project On Hold whatever
-                      its status; it now offers the statuses to pick from. */}
-                  <DropdownMenuSub>
-                    <DropdownMenuSubTrigger>
-                      <ChevronDown />
-                      Change Status
-                    </DropdownMenuSubTrigger>
-                    <DropdownMenuPortal>
-                      <DropdownMenuSubContent>
-                        <DropdownMenuRadioGroup
-                          value={project.creationStatus ?? "active"}
-                          onValueChange={(value) => void changeStatus(value as Lifecycle)}
-                        >
-                          {Object.entries(statusLabels).map(([value, label]) => (
-                            <DropdownMenuRadioItem key={value} value={value}>
-                              {label}
-                            </DropdownMenuRadioItem>
-                          ))}
-                        </DropdownMenuRadioGroup>
-                      </DropdownMenuSubContent>
-                    </DropdownMenuPortal>
-                  </DropdownMenuSub>
-                  {/* No toast here: the copy is created asynchronously by the
-                      Projects page, which opens it when it exists and reports a
-                      failure. "Project duplicated" used to show even when it failed. */}
-                  <DropdownMenuItem onSelect={() => onDuplicate?.(project)}>
-                    <Copy />
-                    Duplicate Project
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem onSelect={() => setConfirmAction("archive")}>
-                    <Archive />
-                    Archive Project
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    className="text-destructive focus:text-destructive"
-                    onSelect={() => setConfirmAction("delete")}
-                  >
-                    <Trash2 />
-                    Delete Project
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
+              {(canManage || canDuplicate) && (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="outline" size="icon" aria-label="Project actions">
+                      <MoreHorizontal className="h-4 w-4" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    {/* "Change Status" silently put the project On Hold whatever
+                        its status; it now offers the statuses to pick from. */}
+                    {canManage && (
+                      <DropdownMenuSub>
+                        <DropdownMenuSubTrigger>
+                          <ChevronDown />
+                          Change Status
+                        </DropdownMenuSubTrigger>
+                        <DropdownMenuPortal>
+                          <DropdownMenuSubContent>
+                            <DropdownMenuRadioGroup
+                              value={project.creationStatus ?? "active"}
+                              onValueChange={(value) => void changeStatus(value as Lifecycle)}
+                            >
+                              {Object.entries(statusLabels).map(([value, label]) => (
+                                <DropdownMenuRadioItem key={value} value={value}>
+                                  {label}
+                                </DropdownMenuRadioItem>
+                              ))}
+                            </DropdownMenuRadioGroup>
+                          </DropdownMenuSubContent>
+                        </DropdownMenuPortal>
+                      </DropdownMenuSub>
+                    )}
+                    {/* No toast here: the copy is created asynchronously by the
+                        Projects page, which opens it when it exists and reports a
+                        failure. "Project duplicated" used to show even when it failed. */}
+                    {canDuplicate && (
+                      <DropdownMenuItem onSelect={() => onDuplicate?.(project)}>
+                        <Copy />
+                        Duplicate Project
+                      </DropdownMenuItem>
+                    )}
+                    {canManage && (
+                      <>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem onSelect={() => setConfirmAction("archive")}>
+                          <Archive />
+                          Archive Project
+                        </DropdownMenuItem>
+                      </>
+                    )}
+                    {/* The database lets only an admin delete a project. */}
+                    {canDelete && (
+                      <DropdownMenuItem
+                        className="text-destructive focus:text-destructive"
+                        onSelect={() => setConfirmAction("delete")}
+                      >
+                        <Trash2 />
+                        Delete Project
+                      </DropdownMenuItem>
+                    )}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
             </div>
           </div>
           <nav
@@ -1022,7 +1052,9 @@ export function ProjectWorkspace({
               inProgress={inProgress}
               overdue={overdue}
               health={health}
-              showSetup={showSetup && setupComplete < 5}
+              canManage={canManage}
+              // Setting a project up (milestones, team) is its managers' job.
+              showSetup={canManage && showSetup && setupComplete < 5}
               setupItems={setupItems}
               onDismiss={() => setShowSetup(false)}
               onNavigate={setTab}
@@ -1049,6 +1081,7 @@ export function ProjectWorkspace({
           {tab === "team" && (
             <TeamTab
               orgId={organizationId}
+              canManage={canManage}
               project={project}
               manager={manager}
               team={team}
@@ -1066,6 +1099,7 @@ export function ProjectWorkspace({
           {tab === "timeline" && (
             <TimelineTab
               project={project}
+              canManage={canManage}
               tasks={projectTasks}
               milestones={milestones}
               state={isSaved ? recordsState : "loading"}
@@ -1079,6 +1113,7 @@ export function ProjectWorkspace({
           {tab === "documents" && (
             <DocumentsTab
               documents={documents}
+              canManage={canManage}
               state={isSaved ? documentsState : "loading"}
               uploading={uploading}
               onUpload={uploadDocuments}
@@ -1223,6 +1258,7 @@ function StateMessage({
 
 function OverviewTab({
   orgId,
+  canManage,
   project,
   manager,
   teamCount,
@@ -1248,6 +1284,8 @@ function OverviewTab({
 }: {
   /** The project's organization: its tasks read in that organization's status names. */
   orgId: string | null;
+  /** May change the project itself (see canManageProject). */
+  canManage: boolean;
   project: WorkspaceProject;
   manager: PersonRef;
   teamCount: number;
@@ -1349,7 +1387,7 @@ function OverviewTab({
       <section className="border-b border-border px-1 pb-5">
         <div className="mb-2 flex items-center justify-between">
           <h3 className="text-sm font-semibold">About this Project</h3>
-          {permissions.manageProjects && (
+          {canManage && (
             <Button variant="ghost" size="sm" onClick={onEdit}>
               <Edit3 className="h-3.5 w-3.5" />
               Edit
@@ -1614,12 +1652,10 @@ function TasksTab({
             Tasks <span className="text-muted-foreground">({tasks.length})</span>
           </h3>
         </div>
-        {permissions.createTasks && (
-          <Button size="sm" onClick={onAdd}>
-            <Plus className="h-4 w-4" />
-            Add Task
-          </Button>
-        )}
+        <Button size="sm" onClick={onAdd}>
+          <Plus className="h-4 w-4" />
+          Add Task
+        </Button>
       </div>
       <div className="flex gap-1 overflow-x-auto border-b border-border">
         {(
@@ -1915,6 +1951,7 @@ function TasksTab({
 
 function TeamTab({
   orgId,
+  canManage,
   project,
   manager,
   team,
@@ -1930,6 +1967,8 @@ function TeamTab({
 }: {
   /** The project's organization: its tasks read in that organization's status names. */
   orgId: string | null;
+  /** May add people to the team and take them off it. */
+  canManage: boolean;
   project: WorkspaceProject;
   manager: PersonRef;
   team: PersonRef[];
@@ -1970,7 +2009,7 @@ function TeamTab({
           Project Team{" "}
           <span className="text-muted-foreground">({plural(team.length, "Member")})</span>
         </h3>
-        {permissions.manageTeam && (
+        {canManage && (
           <Button size="sm" onClick={() => setMemberPickerOpen(true)} disabled={state !== "ready"}>
             <UserPlus className="h-4 w-4" />
             Add Member
@@ -2011,7 +2050,7 @@ function TeamTab({
                   "Completed",
                   "Overdue",
                   "Workload",
-                  "Actions",
+                  ...(canManage ? ["Actions"] : []),
                 ].map((item) => (
                   <th key={item} className="whitespace-nowrap px-4 py-3 text-left font-medium">
                     {item}
@@ -2059,21 +2098,23 @@ function TeamTab({
                         {state}
                       </span>
                     </td>
-                    <td className="px-4 py-3">
-                      {permissions.manageTeam && person.id !== manager.id && (
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          aria-label={`Remove ${person.name} from the project`}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            setRemoveId(person.id);
-                          }}
-                        >
-                          <UserMinus className="h-4 w-4" />
-                        </Button>
-                      )}
-                    </td>
+                    {canManage && (
+                      <td className="px-4 py-3">
+                        {person.id !== manager.id && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            aria-label={`Remove ${person.name} from the project`}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setRemoveId(person.id);
+                            }}
+                          >
+                            <UserMinus className="h-4 w-4" />
+                          </Button>
+                        )}
+                      </td>
+                    )}
                   </tr>
                 );
               })}
@@ -2084,8 +2125,12 @@ function TeamTab({
         <EmptyState
           icon={UserPlus}
           title="No team members yet"
-          description="Add the people who will work on this project."
-          action="Add Member"
+          description={
+            canManage
+              ? "Add the people who will work on this project."
+              : "The project's managers add the people who work on it."
+          }
+          action={canManage ? "Add Member" : undefined}
           onAction={() => setMemberPickerOpen(true)}
         />
       )}
@@ -2192,6 +2237,7 @@ function TeamTab({
 
 function TimelineTab({
   project,
+  canManage,
   tasks,
   milestones,
   state,
@@ -2202,6 +2248,8 @@ function TimelineTab({
   onDelete,
 }: {
   project: WorkspaceProject;
+  /** May add, complete, reopen and delete milestones. */
+  canManage: boolean;
   tasks: WorkspaceTask[];
   milestones: Milestone[];
   state: LoadState;
@@ -2294,7 +2342,7 @@ function TimelineTab({
             Milestones
           </Button>
         </div>
-        {mode === "milestones" && permissions.manageMilestones && (
+        {mode === "milestones" && canManage && (
           <Button size="sm" onClick={onOpenCreate} disabled={state !== "ready"}>
             <Plus className="h-4 w-4" />
             Add Milestone
@@ -2477,13 +2525,18 @@ function TimelineTab({
           <table className="w-full min-w-[760px] text-sm">
             <thead className="bg-muted/30 text-[10px] uppercase text-muted-foreground">
               <tr>
-                {["Milestone", "Owner", "Target Date", "Status", "Progress", "Actions"].map(
-                  (item) => (
-                    <th key={item} className="whitespace-nowrap px-4 py-3 text-left font-medium">
-                      {item}
-                    </th>
-                  ),
-                )}
+                {[
+                  "Milestone",
+                  "Owner",
+                  "Target Date",
+                  "Status",
+                  "Progress",
+                  ...(canManage ? ["Actions"] : []),
+                ].map((item) => (
+                  <th key={item} className="whitespace-nowrap px-4 py-3 text-left font-medium">
+                    {item}
+                  </th>
+                ))}
               </tr>
             </thead>
             <tbody>
@@ -2526,40 +2579,42 @@ function TimelineTab({
                         <span className="text-xs">{percent}%</span>
                       </div>
                     </td>
-                    <td className="px-4 py-3">
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            aria-label={`Actions for ${item.name}`}
-                          >
-                            <MoreHorizontal className="h-4 w-4" />
-                          </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent align="end">
-                          {item.completedAt ? (
-                            <DropdownMenuItem onSelect={() => void onComplete(item, false)}>
-                              <RotateCcw />
-                              Reopen
+                    {canManage && (
+                      <td className="px-4 py-3">
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              aria-label={`Actions for ${item.name}`}
+                            >
+                              <MoreHorizontal className="h-4 w-4" />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            {item.completedAt ? (
+                              <DropdownMenuItem onSelect={() => void onComplete(item, false)}>
+                                <RotateCcw />
+                                Reopen
+                              </DropdownMenuItem>
+                            ) : (
+                              <DropdownMenuItem onSelect={() => void onComplete(item, true)}>
+                                <CheckCircle2 />
+                                Mark as Completed
+                              </DropdownMenuItem>
+                            )}
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              className="text-destructive focus:text-destructive"
+                              onSelect={() => setDeleteTarget(item)}
+                            >
+                              <Trash2 />
+                              Delete
                             </DropdownMenuItem>
-                          ) : (
-                            <DropdownMenuItem onSelect={() => void onComplete(item, true)}>
-                              <CheckCircle2 />
-                              Mark as Completed
-                            </DropdownMenuItem>
-                          )}
-                          <DropdownMenuSeparator />
-                          <DropdownMenuItem
-                            className="text-destructive focus:text-destructive"
-                            onSelect={() => setDeleteTarget(item)}
-                          >
-                            <Trash2 />
-                            Delete
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    </td>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </td>
+                    )}
                   </tr>
                 );
               })}
@@ -2570,8 +2625,12 @@ function TimelineTab({
         <EmptyState
           icon={Flag}
           title="No milestones yet"
-          description="Mark the key dates this project is working towards."
-          action="Add Milestone"
+          description={
+            canManage
+              ? "Mark the key dates this project is working towards."
+              : "The key dates this project is working towards will show here."
+          }
+          action={canManage ? "Add Milestone" : undefined}
           onAction={onOpenCreate}
         />
       )}
@@ -2650,6 +2709,7 @@ function TimelineTab({
 
 function DocumentsTab({
   documents,
+  canManage,
   state,
   uploading,
   onUpload,
@@ -2657,6 +2717,8 @@ function DocumentsTab({
   onRetry,
 }: {
   documents: StoredFile[];
+  /** May delete other people's files; anyone deletes their own. */
+  canManage: boolean;
   state: LoadState;
   uploading: boolean;
   onUpload: (files: File[]) => Promise<void>;
@@ -2695,28 +2757,24 @@ function DocumentsTab({
           </h3>
           <p className="text-xs text-muted-foreground">{FILE_RULES.label}</p>
         </div>
-        {permissions.manageDocuments && (
-          <>
-            <input
-              ref={inputRef}
-              type="file"
-              multiple
-              accept={FILE_RULES.accept}
-              className="hidden"
-              aria-label="Upload project documents"
-              onChange={(event) => {
-                const files = Array.from(event.target.files ?? []);
-                // Cleared so choosing the same file again still fires onChange.
-                event.target.value = "";
-                void onUpload(files);
-              }}
-            />
-            <Button size="sm" onClick={pick} disabled={uploading || state !== "ready"}>
-              <Upload className="h-4 w-4" />
-              {uploading ? "Uploading..." : "Upload"}
-            </Button>
-          </>
-        )}
+        <input
+          ref={inputRef}
+          type="file"
+          multiple
+          accept={FILE_RULES.accept}
+          className="hidden"
+          aria-label="Upload project documents"
+          onChange={(event) => {
+            const files = Array.from(event.target.files ?? []);
+            // Cleared so choosing the same file again still fires onChange.
+            event.target.value = "";
+            void onUpload(files);
+          }}
+        />
+        <Button size="sm" onClick={pick} disabled={uploading || state !== "ready"}>
+          <Upload className="h-4 w-4" />
+          {uploading ? "Uploading..." : "Upload"}
+        </Button>
       </div>
       {state !== "ready" ? (
         <div className="rounded-xl border border-border bg-card">
@@ -2801,7 +2859,7 @@ function DocumentsTab({
                             <Download />
                             Download
                           </DropdownMenuItem>
-                          {file.isMine && (
+                          {(file.isMine || canManage) && (
                             <>
                               <DropdownMenuSeparator />
                               <DropdownMenuItem
@@ -3109,18 +3167,21 @@ function EmptyState({
   icon: React.ComponentType<{ className?: string }>;
   title: string;
   description: string;
-  action: string;
-  onAction: () => void;
+  /** Left out for someone who may not do it. */
+  action?: string;
+  onAction?: () => void;
 }) {
   return (
     <div className="rounded-xl border border-border bg-card px-6 py-14 text-center">
       <Icon className="mx-auto h-8 w-8 text-muted-foreground" />
       <h3 className="mt-3 text-sm font-semibold">{title}</h3>
       <p className="mx-auto mt-1 max-w-md text-sm text-muted-foreground">{description}</p>
-      <Button size="sm" className="mt-4" onClick={onAction}>
-        <Plus className="h-4 w-4" />
-        {action}
-      </Button>
+      {action && onAction && (
+        <Button size="sm" className="mt-4" onClick={onAction}>
+          <Plus className="h-4 w-4" />
+          {action}
+        </Button>
+      )}
     </div>
   );
 }

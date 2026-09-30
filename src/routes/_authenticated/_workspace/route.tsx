@@ -9,6 +9,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Sidebar } from "@/components/workspace/Sidebar";
 import { Header } from "@/components/workspace/Header";
 import { NewTaskDialog } from "@/components/workspace/NewTaskDialog";
+import { NotificationsProvider } from "@/components/workspace/notifications/NotificationsProvider";
 import { WorkspaceProvider } from "@/lib/workspace-data";
 import { OrganizationsProvider, useOrganizations } from "@/lib/organizations-data";
 import { TaskSettingsProvider } from "@/lib/task-settings-data";
@@ -57,11 +58,15 @@ export const Route = createFileRoute("/_authenticated/_workspace")({
 });
 
 function WorkspaceLayout() {
+  const userId = Route.useRouteContext({ select: (context) => context.user.id });
   return (
     <OrganizationsProvider>
       <TaskSettingsProvider>
         <WorkspaceProvider>
-          <WorkspaceFrame />
+          {/* Inside the workspace data: opening a notification reloads the task list first. */}
+          <NotificationsProvider userId={userId}>
+            <WorkspaceFrame />
+          </NotificationsProvider>
         </WorkspaceProvider>
       </TaskSettingsProvider>
     </OrganizationsProvider>

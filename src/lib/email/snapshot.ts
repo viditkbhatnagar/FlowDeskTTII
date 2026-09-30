@@ -52,6 +52,13 @@ export type SnapshotProject = {
   startDate: string | null;
   dueDate: string | null;
   archivedAt: string | null;
+  /**
+   * Who may open it besides the organization's admins and managers and its team
+   * (20260930000100_project_access.sql). Absent from a snapshot RPC older than that.
+   */
+  ownerId: string;
+  /** The Project Manager. */
+  managerId: string | null;
 };
 
 export type SnapshotProjectMember = { projectId: string; userId: string; roleLabel: string | null };
