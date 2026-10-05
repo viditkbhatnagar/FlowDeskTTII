@@ -13,6 +13,7 @@ import {
 } from "./templates/daily-task-digest";
 import { buildDueDateReminderEmail, type DueDateReminderVariables } from "./templates/due-reminder";
 import { buildOverdueAlertEmail, type OverdueAlertVariables } from "./templates/overdue-alert";
+import { buildPasswordResetEmail, type PasswordResetVariables } from "./templates/password-reset";
 import {
   buildProjectInvitationEmail,
   type ProjectInvitationVariables,
@@ -34,6 +35,7 @@ import {
 
 export type { RenderContext, RenderedEmail } from "./templates/shared";
 export type { AccountAccessVariables } from "./templates/account-access";
+export type { PasswordResetVariables } from "./templates/password-reset";
 export type { ProjectInvitationVariables } from "./templates/project-invitation";
 export type { TaskAssignedVariables } from "./templates/task-assigned";
 export type { DueDateReminderVariables } from "./templates/due-reminder";
@@ -85,6 +87,10 @@ export type WeeklyManagementInput = WithOrganizations<
 
 export function renderAccountAccess(v: AccountAccessVariables, ctx: RenderContext): RenderedEmail {
   return buildAccountAccessEmail(v, ctx);
+}
+
+export function renderPasswordReset(v: PasswordResetVariables, ctx: RenderContext): RenderedEmail {
+  return buildPasswordResetEmail(v, ctx);
 }
 
 export function renderProjectInvitation(

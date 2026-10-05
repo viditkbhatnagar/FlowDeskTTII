@@ -35,6 +35,15 @@ const CASES: Case[] = [
     },
   },
   {
+    name: "password_reset",
+    render: render.renderPasswordReset,
+    sample: {
+      firstName: "Maya",
+      emailAddress: "maya@upcarrera.com",
+      resetUrl: `${APP}/reset-password#token=${"ab12".repeat(16)}`,
+    },
+  },
+  {
     name: "project_invitation",
     render: render.renderProjectInvitation,
     sample: {
@@ -307,6 +316,7 @@ describe("links", () => {
 describe("subjects", () => {
   const expected: Record<string, string> = {
     account_access: "Your Flowdesk account is ready",
+    password_reset: "Reset your Flowdesk password",
     project_invitation: "You've been invited to October Admissions Drive on Flowdesk",
     task_assigned: "Task assigned to you: Call back webinar leads",
     due_reminder: "Due soon: Send offer letters",
@@ -370,6 +380,51 @@ describe("account_access", () => {
     for (const variant of [html, oneTime]) {
       expect(variant).not.toMatch(/6-digit|verification code/i);
     }
+  });
+});
+
+describe("password_reset", () => {
+  const c = byName("password_reset");
+  const TOKEN = "ab12".repeat(16);
+  const { html, subject } = run(c);
+
+  test("one button, to the one-time link, and the token nowhere else", () => {
+    expect(hrefs(html)).toEqual([`${APP}/reset-password#token=${TOKEN}`]);
+    expect(html).toContain(">Choose a new password</a>");
+    expect(html.split(TOKEN).length - 1).toBe(1);
+    expect(subject).not.toContain(TOKEN);
+    const outsideLinks = html.replace(/href="[^"]*"/g, "");
+    expect(outsideLinks).not.toContain(TOKEN);
+    expect(outsideLinks).not.toContain("/reset-password");
+  });
+
+  test("names the account, and says the link works once and expires in 1 hour", () => {
+    expect(html).toContain(
+      "We received a request to reset the Flowdesk password for maya@upcarrera.com.",
+    );
+    expect(html).toContain(
+      "Choose a new password with the button below. The link works once and expires in 1 hour.",
+    );
+    expect(html).toContain(
+      ">Choose a new Flowdesk password. The link works once and expires in 1 hour.</div>",
+    );
+  });
+
+  test("tells someone who did not ask to ignore it, and that their password is unchanged", () => {
+    expect(html).toContain(
+      "If you didn’t request a password reset, ignore this email. Your password will remain unchanged.",
+    );
+    expect(html).toContain("Do not share this link with anyone.");
+  });
+
+  test("never carries a password or promises a code", () => {
+    expect(html.toLowerCase()).not.toContain("password:");
+    expect(html).not.toMatch(/6-digit|verification code|\{\{/i);
+  });
+
+  test("the button stretches on a phone like the other emails' buttons", () => {
+    expect(html).toContain(".button { display: block !important; text-align: center !important; }");
+    expect(html).toContain('<a class="button" href=');
   });
 });
 

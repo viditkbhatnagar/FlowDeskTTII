@@ -27,6 +27,7 @@ import {
   renderDailyManagement,
   renderDueReminder,
   renderOverdueAlert,
+  renderPasswordReset,
   renderProjectInvitation,
   renderTaskAssigned,
   renderWeeklyDigest,
@@ -137,32 +138,42 @@ function taskDetails(env: Env, task: SnapshotTask, org: SnapshotOrganization) {
 }
 
 /**
- * The one-time setup token that admin_create_user / admin_resend_welcome put on the row: 32 random
- * bytes as lowercase hex (encode(…, 'hex')). The database keeps only its sha256 and strips it from
- * the payload once the row is settled. It is a password-equivalent secret: it goes into the link
- * and nowhere else (never a log line, a subject or an error).
+ * The one-time token that admin_create_user / admin_resend_welcome (a welcome) or
+ * request_password_reset (a reset) put on the row: 32 random bytes as lowercase hex
+ * (encode(…, 'hex')). The database keeps only its sha256 and strips it from the payload once the
+ * row is settled. It is a password-equivalent secret: it goes into the link and nowhere else
+ * (never a log line, a subject or an error).
  */
 const SETUP_TOKEN = /^[0-9a-f]{64}$/;
 
+/** The row's one-time token, or null when it has none or it is malformed. */
+function setupTokenOf(row: ClaimedEmail): string | null {
+  const token = row.payload.setupToken;
+  return typeof token === "string" && SETUP_TOKEN.test(token) ? token : null;
+}
+
 /**
  * The one-time /welcome link when the row carries a setup token, else the reset-password flow.
- * The token rides in the fragment (#token=…), never the query: a browser does not send the
+ * A token rides in the fragment (#token=…), never the query: a browser does not send the
  * fragment to any server or in a Referer, so it stays out of the nginx access log. The page reads
  * it in the browser and removes it from the address bar straight away.
  */
 function setPasswordLink(env: Env): { url: string; singleUse: boolean } {
-  const token = env.row.payload.setupToken;
-  if (typeof token === "string" && SETUP_TOKEN.test(token)) {
-    return { url: `${env.ctx.appUrl}/welcome#token=${token}`, singleUse: true };
-  }
+  const token = setupTokenOf(env.row);
+  if (token) return { url: `${env.ctx.appUrl}/welcome#token=${token}`, singleUse: true };
   const email = encodeURIComponent(env.recipient.email);
   return { url: `${env.ctx.appUrl}/auth?mode=reset&email=${email}`, singleUse: false };
 }
 
-function composeAccountAccess(env: Env): RenderedEmail {
-  // Queued by a first membership; an admin who removes it again before the send withdraws it.
+/** Without an active organization nobody can use Flowdesk, so a way in is withdrawn. */
+function requireAnyOrganization(env: Env) {
   if (!env.index.activeOrgsByUser.get(env.recipient.person.userId)?.length)
     suppress("recipient no longer belongs to any organization");
+}
+
+function composeAccountAccess(env: Env): RenderedEmail {
+  // Queued by a first membership; an admin who removes it again before the send withdraws it.
+  requireAnyOrganization(env);
   const link = setPasswordLink(env);
   return renderAccountAccess(
     {
@@ -171,6 +182,29 @@ function composeAccountAccess(env: Env): RenderedEmail {
       setPasswordUrl: link.url,
       singleUseLink: link.singleUse,
       signInUrl: `${env.ctx.appUrl}/auth`,
+    },
+    env.render,
+  );
+}
+
+/**
+ * Forgot password: request_password_reset queues it with a fresh token, which works once and
+ * expires in an hour. A security email, so no preference or organization switch can stop it.
+ * There is no fallback link: without a valid token the row has nothing to send.
+ */
+function composePasswordReset(env: Env): RenderedEmail {
+  requireAnyOrganization(env);
+  const token = setupTokenOf(env.row) ?? suppress("no valid reset token");
+  // Asked for one address. An admin who has since moved the login to another also burned every
+  // link (changing a sign-in email does), so this one would only reach the new owner dead.
+  const asked = env.row.recipientEmail?.trim().toLowerCase();
+  if (asked && asked !== env.recipient.email.toLowerCase())
+    suppress("sign-in email changed since the reset was requested");
+  return renderPasswordReset(
+    {
+      firstName: env.recipient.firstName,
+      emailAddress: env.recipient.email,
+      resetUrl: `${env.ctx.appUrl}/reset-password#token=${token}`,
     },
     env.render,
   );
@@ -282,6 +316,7 @@ function composeSummary(env: Env, kind: SummaryKind): RenderedEmail {
 
 const COMPOSERS: Record<EmailKind, (env: Env) => RenderedEmail> = {
   account_access: composeAccountAccess,
+  password_reset: composePasswordReset,
   project_invitation: composeProjectInvitation,
   task_assigned: composeTaskAssigned,
   due_reminder: composeDueReminder,

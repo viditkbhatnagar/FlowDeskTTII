@@ -12,41 +12,46 @@ import {
 } from "@/components/auth/password-fields";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
-import { cn } from "@/lib/utils";
 
 /**
- * /welcome#token=… — where the welcome email's "Set your password" button
- * lands. An admin created the account from Settings → Users; the token is the
- * one-time secret complete_account_setup exchanges for a password.
+ * /reset-password#token=… — where the "Reset your password" email's button
+ * lands. Someone who forgot their password asked for it on /auth;
+ * request_password_reset queued the email with a one-time token, which
+ * complete_password_reset exchanges here for the new password.
  *
- * Public on purpose (outside _authenticated): the person has no password yet.
- * The token travels in the fragment, which the browser never sends to a server
- * (so it is not in the nginx access log) nor in a Referer. The page reads it
- * once and removes it from the address bar straight away. It is never logged.
+ * Flowdesk sends this email itself, like the welcome email: the hosted
+ * project's own reset email comes from Lovable's auth email hook, which we
+ * cannot change, and it opened the old prototype site.
+ *
+ * Public on purpose (outside _authenticated): the person cannot sign in. As on
+ * /welcome, the token travels in the fragment, which the browser never sends
+ * to a server (so it is not in the nginx access log) nor in a Referer, and the
+ * page removes it from the address bar as soon as it has read it. It is never
+ * logged.
  */
 
-export const Route = createFileRoute("/welcome")({
-  // Browser-only, like /auth: the page talks to the auth server directly, and
-  // the token lives in the fragment, which only the browser can read.
+export const Route = createFileRoute("/reset-password")({
+  // Browser-only, like /welcome: the token lives in the fragment, which only
+  // the browser can read.
   ssr: false,
   head: () => ({
     meta: [
-      { title: "Choose your password — Flowdesk" },
-      { name: "description", content: "Finish setting up your Flowdesk account." },
+      { title: "Choose a new password — Flowdesk" },
+      { name: "description", content: "Choose a new password for your Flowdesk account." },
       // Belt and braces: the token is already out of the address by the time
       // anything else loads, but never send this page's address as a Referer.
       { name: "referrer", content: "no-referrer" },
       { name: "robots", content: "noindex, nofollow" },
     ],
   }),
-  component: WelcomePage,
+  component: ResetPasswordPage,
 });
 
-type Stage = "reading" | "form" | "invalid" | "password-set";
+type Stage = "reading" | "form" | "invalid" | "password-changed";
 
-function WelcomePage() {
+function ResetPasswordPage() {
   const navigate = useNavigate();
-  const token = useFragmentToken("/welcome");
+  const token = useFragmentToken("/reset-password");
   const [stage, setStage] = useState<Stage>("reading");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -85,20 +90,27 @@ function WelcomePage() {
     setLoading(true);
     setError(null);
     try {
-      const { data: email, error: setupError } = await supabase.rpc("complete_account_setup", {
+      const { data: email, error: resetError } = await supabase.rpc("complete_password_reset", {
         p_token: token,
         p_password: password,
       });
-      if (setupError || !email) {
-        // P0001: expired, already used, or never issued. The function says
-        // which rule failed only in the message; the page treats them alike.
-        if (setupError?.code === "P0001" || /link|token/i.test(setupError?.message ?? "")) {
+      if (resetError) {
+        // P0001: expired, already used, replaced by a newer link, or never
+        // issued. The function words them all alike; so does the page.
+        if (resetError.code === "P0001" || /link|token/i.test(resetError.message ?? "")) {
           setStage("invalid");
-        } else if (setupError?.code === "22023" && setupError.message) {
-          setError(setupError.message);
+        } else if (resetError.code === "22023" && resetError.message) {
+          setError(resetError.message);
         } else {
-          setError("We couldn't set your password just now. Check your connection and try again.");
+          setError(
+            "We couldn't change your password just now. Check your connection and try again.",
+          );
         }
+        return;
+      }
+      // The password has changed, so the link is spent whatever happens next.
+      if (!email) {
+        setStage("password-changed");
         return;
       }
 
@@ -106,7 +118,7 @@ function WelcomePage() {
       if (otherAccount) await supabase.auth.signOut({ scope: "local" });
       const { error: signInError } = await supabase.auth.signInWithPassword({ email, password });
       if (signInError) {
-        setStage("password-set");
+        setStage("password-changed");
         return;
       }
       // replace: Back must not return to a link that no longer works.
@@ -118,17 +130,18 @@ function WelcomePage() {
 
   return (
     <main className="min-h-screen overflow-x-hidden bg-background lg:grid lg:grid-cols-[minmax(0,1fr)_minmax(440px,1fr)]">
-      <WelcomePanel />
+      <ResetPanel />
       <section className="flex min-h-[calc(100vh-76px)] items-center justify-center px-5 py-10 sm:px-10 lg:min-h-screen lg:px-14">
         <div className="w-full max-w-[400px]">
           {stage === "form" && (
             <div>
               <p className="text-xs font-medium uppercase tracking-[0.14em] text-primary">
-                Account setup
+                Password reset
               </p>
-              <h1 className="mt-2 text-2xl font-semibold">Choose your password</h1>
+              <h1 className="mt-2 text-2xl font-semibold">Choose a new password</h1>
               <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                You'll use it with your work email to sign in to Flowdesk.
+                You'll use it with your work email to sign in to Flowdesk. Changing it signs you out
+                on your other devices.
               </p>
 
               {otherAccount && (
@@ -136,17 +149,17 @@ function WelcomePage() {
                   <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
                   <p>
                     This browser is signed in as{" "}
-                    <span className="font-medium text-foreground">{otherAccount}</span>. Setting
-                    this password signs that account out here.
+                    <span className="font-medium text-foreground">{otherAccount}</span>. Changing
+                    the password signs that account out here.
                   </p>
                 </div>
               )}
 
               <form className="mt-8 space-y-5" onSubmit={submit} noValidate>
                 <div className="space-y-2">
-                  <Label htmlFor="welcome-password">New password</Label>
+                  <Label htmlFor="reset-password">New password</Label>
                   <PasswordInput
-                    id="welcome-password"
+                    id="reset-password"
                     value={password}
                     onChange={(value) => {
                       setPassword(value);
@@ -154,13 +167,13 @@ function WelcomePage() {
                     }}
                     visible={showPassword}
                     onToggle={() => setShowPassword((value) => !value)}
-                    describedBy="welcome-password-rules"
+                    describedBy="reset-password-rules"
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="welcome-confirm">Confirm password</Label>
+                  <Label htmlFor="reset-confirm">Confirm new password</Label>
                   <PasswordInput
-                    id="welcome-confirm"
+                    id="reset-confirm"
                     value={confirm}
                     onChange={(value) => {
                       setConfirm(value);
@@ -171,7 +184,7 @@ function WelcomePage() {
                   />
                 </div>
 
-                <ul id="welcome-password-rules" className="space-y-1.5 text-xs" aria-live="polite">
+                <ul id="reset-password-rules" className="space-y-1.5 text-xs" aria-live="polite">
                   <Rule met={longEnough && shortEnough}>
                     {shortEnough
                       ? `At least ${PASSWORD_MIN} characters`
@@ -195,7 +208,7 @@ function WelcomePage() {
                   disabled={loading || !password || !confirm}
                 >
                   {loading && <Loader2 className="animate-spin" />}
-                  {loading ? "Setting up your account…" : "Set password and sign in"}
+                  {loading ? "Changing your password…" : "Change password and sign in"}
                 </Button>
               </form>
             </div>
@@ -210,14 +223,14 @@ function WelcomePage() {
                 This link has expired or was already used
               </h1>
               <p className="mt-3 text-sm leading-6 text-muted-foreground">
-                Welcome links work once and expire after 7 days. If you've already chosen a
-                password, sign in. Otherwise reset it with your work email, or ask your
-                administrator to resend the welcome email.
+                Reset links work once and expire after 1 hour, and asking for a new one stops the
+                earlier ones working. Send yourself a fresh link, or sign in if you've already
+                changed your password.
               </p>
               <div className="mt-8 grid gap-3">
                 <Button asChild className="h-11 w-full">
                   <Link to="/auth" search={{ mode: "reset" }}>
-                    <KeyRound /> Reset your password
+                    <KeyRound /> Send a new link
                   </Link>
                 </Button>
                 <Button asChild variant="outline" className="h-11 w-full">
@@ -227,15 +240,15 @@ function WelcomePage() {
             </div>
           )}
 
-          {stage === "password-set" && (
+          {stage === "password-changed" && (
             <div className="text-center lg:text-left" aria-live="polite">
               <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-primary/10 text-primary lg:mx-0">
                 <CheckCircle2 className="h-6 w-6" aria-hidden="true" />
               </div>
-              <h1 className="mt-5 text-2xl font-semibold">Your password is set</h1>
+              <h1 className="mt-5 text-2xl font-semibold">Your password has been changed</h1>
               <p className="mt-3 text-sm leading-6 text-muted-foreground">
-                We couldn't sign you in automatically. Sign in with your work email and the password
-                you just chose.
+                We couldn't sign you in automatically. Sign in with your work email and your new
+                password.
               </p>
               <Button asChild className="mt-8 h-11 w-full">
                 <Link to="/auth">Go to sign in</Link>
@@ -248,8 +261,8 @@ function WelcomePage() {
   );
 }
 
-/** The auth page's blue brand panel, speaking to someone who is new here. */
-function WelcomePanel() {
+/** The auth page's blue brand panel, speaking to someone who can't get in. */
+function ResetPanel() {
   return (
     <section className="relative overflow-hidden bg-primary px-5 py-5 text-primary-foreground sm:px-8 lg:flex lg:min-h-screen lg:flex-col lg:px-14 lg:py-10">
       <div className="auth-shape auth-shape-one" aria-hidden="true" />
@@ -267,50 +280,15 @@ function WelcomePanel() {
 
       <div className="relative z-10 mx-auto hidden w-full max-w-xl flex-1 flex-col justify-center py-12 lg:flex">
         <h2 className="max-w-lg text-4xl font-semibold leading-tight xl:text-5xl">
-          Welcome to Flowdesk.
+          Back to work in a minute.
         </h2>
         <p className="mt-5 max-w-md text-base leading-7 text-primary-foreground/75">
-          Your administrator has set up your account. One step and you're in.
+          Choose a new password and you're signed straight in, with your tasks and projects just as
+          you left them.
         </p>
-        <ol className="mt-10 max-w-md space-y-5">
-          <Step index={1} title="Choose your password" text="Right here, once." current />
-          <Step index={2} title="You're signed in" text="Straight into your workspace." />
-          <Step index={3} title="Pick up your work" text="Tasks and projects assigned to you." />
-        </ol>
       </div>
-      {/* Balances the logo row, so the welcome sits in the visual middle. */}
+      {/* Balances the logo row, so the message sits in the visual middle. */}
       <div className="hidden h-9 lg:block" aria-hidden="true" />
     </section>
-  );
-}
-
-function Step({
-  index,
-  title,
-  text,
-  current = false,
-}: {
-  index: number;
-  title: string;
-  text: string;
-  current?: boolean;
-}) {
-  return (
-    <li className="flex items-start gap-3.5" aria-current={current ? "step" : undefined}>
-      <span
-        className={cn(
-          "mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-sm font-semibold ring-1",
-          current
-            ? "bg-primary-foreground text-primary ring-primary-foreground"
-            : "bg-primary-foreground/10 text-primary-foreground ring-primary-foreground/20",
-        )}
-      >
-        {index}
-      </span>
-      <span>
-        <span className="block text-sm font-medium">{title}</span>
-        <span className="mt-0.5 block text-sm text-primary-foreground/65">{text}</span>
-      </span>
-    </li>
   );
 }

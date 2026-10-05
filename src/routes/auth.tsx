@@ -1,22 +1,25 @@
 import { createFileRoute, redirect, useNavigate } from "@tanstack/react-router";
+import { useServerFn } from "@tanstack/react-start";
 import { useEffect, useState, type FormEvent } from "react";
 import {
   ArrowLeft,
   Check,
   CheckCircle2,
-  Eye,
-  EyeOff,
   FolderKanban,
   Loader2,
   RefreshCw,
   Users,
 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
+import { PasswordInput } from "@/components/auth/password-fields";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
 import { hasLiveSession } from "@/components/workspace/account/session";
+import {
+  requestPasswordReset,
+  type PasswordResetRequestError,
+} from "@/lib/password-reset.functions";
 
 type AuthSearch = { redirect?: string; mode?: "reset"; email?: string };
 
@@ -42,10 +45,6 @@ function safeRedirect(value: unknown): string | undefined {
   return value;
 }
 
-/** A password-recovery link signs the user in; they still have to set the new password here. */
-const isRecoveryLink = () =>
-  typeof window !== "undefined" && window.location.hash.includes("type=recovery");
-
 export const Route = createFileRoute("/auth")({
   // Rendered in the browser so the session check below runs on every visit,
   // including a reload or a typed URL; on the server there is no session to see.
@@ -64,7 +63,6 @@ export const Route = createFileRoute("/auth")({
   // Browser Back from the workspace used to land on this form with the session
   // still active (FD-039). Someone already signed in goes straight back in.
   beforeLoad: async ({ search }) => {
-    if (isRecoveryLink()) return;
     if (await hasLiveSession()) throw redirect({ href: search.redirect ?? "/", replace: true });
   },
   head: () => ({
@@ -86,26 +84,39 @@ export const Route = createFileRoute("/auth")({
   component: AuthPage,
 });
 
-type AuthStep = "sign-in" | "request" | "verify" | "password" | "success";
-const OTP_LENGTH = 6;
+/**
+ * The reset flow asks for an address and says a link is on its way; the link opens
+ * /reset-password. Flowdesk sends that email itself (src/lib/password-reset.functions.ts):
+ * Supabase Auth's own reset email cannot be used on the hosted project.
+ */
+type AuthStep = "sign-in" | "request" | "sent";
 const RESEND_SECONDS = 60;
+
+// None of these says whether the address has an account. The limits behind rate_limited run
+// up to an hour (5 an hour per address), hence "later" rather than a number of minutes.
+const RESET_ERRORS: Record<PasswordResetRequestError | "unreachable", string> = {
+  invalid_email: "Enter your full work email address, like name@company.com.",
+  rate_limited:
+    "Too many reset requests for now. Use the link in your newest reset email, or try again later.",
+  unavailable: "We couldn't send a reset link just now. Please try again in a few minutes.",
+  unreachable: "We couldn't reach Flowdesk. Check your connection and try again.",
+};
 
 function AuthPage() {
   const navigate = useNavigate();
+  const sendResetLink = useServerFn(requestPasswordReset);
   const { redirect: returnTo, mode, email: linkedEmail } = Route.useSearch();
-  // Nothing is sent automatically: the person still presses "Send verification code".
+  // Nothing is sent automatically: the person still presses "Email me a reset link".
   const [step, setStep] = useState<AuthStep>(mode === "reset" ? "request" : "sign-in");
   const [email, setEmail] = useState(linkedEmail ?? "");
   const [password, setPassword] = useState("");
-  const [newPassword, setNewPassword] = useState("");
-  const [confirmPassword, setConfirmPassword] = useState("");
-  const [otp, setOtp] = useState("");
   const [showPassword, setShowPassword] = useState(false);
-  const [showNewPassword, setShowNewPassword] = useState(false);
-  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [countdown, setCountdown] = useState(0);
+  /** Where the latest link went: shown on "Check your email", and where "Send it again" sends. */
+  const [sentTo, setSentTo] = useState("");
+  const [sentAgain, setSentAgain] = useState(false);
 
   useEffect(() => {
     if (countdown <= 0) return;
@@ -146,79 +157,42 @@ function AuthPage() {
     });
   };
 
-  const sendCode = (event?: FormEvent) => {
-    event?.preventDefault();
-    void run(async () => {
-      const { error: resetError } = await supabase.auth.resetPasswordForEmail(email.trim(), {
-        redirectTo: `${window.location.origin}/auth`,
-      });
-      if (resetError?.status === 429) {
-        setError("Please wait before requesting another verification code.");
+  const requestResetLink = (address: string, again: boolean) =>
+    run(async () => {
+      if (address.length > EMAIL_MAX_LENGTH || !EMAIL_PATTERN.test(address)) {
+        setError(RESET_ERRORS.invalid_email);
         return;
       }
-      if (resetError) {
-        setError("We couldn't send a verification code right now. Please try again later.");
+      // Offline, or the server restarting: the call itself failed.
+      const result = await sendResetLink({ data: { email: address } }).catch(() => null);
+      if (!result) {
+        setError(RESET_ERRORS.unreachable);
         return;
       }
-      setOtp("");
+      if (!result.ok) {
+        setError(RESET_ERRORS[result.error]);
+        return;
+      }
+      setSentTo(address);
+      setSentAgain(again);
       setCountdown(RESEND_SECONDS);
-      setStep("verify");
+      setStep("sent");
     });
+
+  const sendLink = (event: FormEvent) => {
+    event.preventDefault();
+    void requestResetLink(email.trim(), false);
   };
 
-  const verifyCode = (event: FormEvent) => {
-    event.preventDefault();
-    if (otp.length !== OTP_LENGTH) {
-      setError(`Enter the ${OTP_LENGTH}-digit verification code.`);
-      return;
-    }
-    void run(async () => {
-      const { error: verifyError } = await supabase.auth.verifyOtp({
-        email: email.trim(),
-        token: otp,
-        type: "recovery",
-      });
-      if (verifyError) {
-        setError("That code is incorrect or has expired. Request a new code and try again.");
-        return;
-      }
-      setStep("password");
-    });
-  };
-
-  const updatePassword = (event: FormEvent) => {
-    event.preventDefault();
-    if (newPassword.length < 8) {
-      setError("Use at least 8 characters for your new password.");
-      return;
-    }
-    if (newPassword !== confirmPassword) {
-      setError("The passwords do not match.");
-      return;
-    }
-    void run(async () => {
-      const { data } = await supabase.auth.getUser();
-      if (!data.user) {
-        setError("Your verification has expired. Request a new code to continue.");
-        return;
-      }
-      const { error: updateError } = await supabase.auth.updateUser({ password: newPassword });
-      if (updateError) {
-        setError(updateError.message || "We couldn't update your password. Please try again.");
-        return;
-      }
-      await supabase.auth.signOut();
-      setPassword("");
-      setNewPassword("");
-      setConfirmPassword("");
-      setOtp("");
-      setStep("success");
-    });
+  const changeEmail = () => {
+    setError(null);
+    setSentAgain(false);
+    setStep("request");
   };
 
   const goToSignIn = () => {
     setError(null);
-    setOtp("");
+    setSentAgain(false);
     setStep("sign-in");
   };
 
@@ -281,9 +255,9 @@ function AuthPage() {
           {step === "request" && (
             <AuthFrame
               title="Reset your password"
-              subtitle="Enter your registered work email to receive a verification code."
+              subtitle="Enter your work email and we'll email you a link to choose a new password."
             >
-              <form className="mt-8 space-y-5" onSubmit={sendCode}>
+              <form className="mt-8 space-y-5" onSubmit={sendLink} noValidate>
                 <Field label="Work email" htmlFor="recovery-email">
                   <Input
                     id="recovery-email"
@@ -298,116 +272,66 @@ function AuthPage() {
                   />
                 </Field>
                 <FormError message={error} />
-                <Button className="h-11 w-full" type="submit" disabled={loading || !email}>
+                <Button className="h-11 w-full" type="submit" disabled={loading || !email.trim()}>
                   {loading && <Loader2 className="animate-spin" />}
-                  Send verification code
+                  Email me a reset link
                 </Button>
                 <BackButton onClick={goToSignIn}>Back to sign in</BackButton>
               </form>
             </AuthFrame>
           )}
 
-          {step === "verify" && (
+          {step === "sent" && (
             <AuthFrame
               title="Check your email"
-              subtitle="If this email is eligible, a verification code has been sent."
+              subtitle={
+                <>
+                  If <span className="break-words font-medium text-foreground">{sentTo}</span> has a
+                  Flowdesk account, a link to choose a new password is on its way.
+                </>
+              }
             >
-              <form className="mt-8 space-y-5" onSubmit={verifyCode}>
-                <Field label="Verification code" htmlFor="recovery-code">
-                  <InputOTP
-                    id="recovery-code"
-                    maxLength={OTP_LENGTH}
-                    value={otp}
-                    onChange={setOtp}
-                    inputMode="numeric"
-                    autoComplete="one-time-code"
-                    containerClassName="w-full"
+              <div className="mt-8 space-y-5">
+                <ul className="list-disc space-y-1.5 pl-5 text-sm leading-6 text-muted-foreground">
+                  <li>The link works once and expires in 1 hour.</li>
+                  <li>Not there in a minute or two? Check your spam or junk folder.</li>
+                </ul>
+                {sentAgain && (
+                  <p
+                    role="status"
+                    className="rounded-md bg-primary/10 px-3 py-2.5 text-xs text-primary"
                   >
-                    <InputOTPGroup className="grid w-full grid-cols-6 gap-2">
-                      {Array.from({ length: OTP_LENGTH }, (_, index) => (
-                        <InputOTPSlot key={index} index={index} className="h-11 w-full rounded-md border-l" />
-                      ))}
-                    </InputOTPGroup>
-                  </InputOTP>
-                </Field>
+                    Another link is on its way. Only the newest one works, so use the latest email.
+                  </p>
+                )}
                 <FormError message={error} />
-                <Button className="h-11 w-full" type="submit" disabled={loading || otp.length !== OTP_LENGTH}>
-                  {loading && <Loader2 className="animate-spin" />}
-                  Verify code
-                </Button>
                 <div className="flex items-center justify-between gap-4 text-xs">
                   <Button
                     type="button"
                     variant="link"
                     className="h-auto px-0 py-0 text-xs"
-                    onClick={() => {
-                      setError(null);
-                      setStep("request");
-                    }}
+                    onClick={changeEmail}
                   >
-                    Change email
+                    Use a different email
                   </Button>
                   <Button
                     type="button"
                     variant="link"
                     className="h-auto px-0 py-0 text-xs"
                     disabled={countdown > 0 || loading}
-                    onClick={() => sendCode()}
+                    onClick={() => void requestResetLink(sentTo, true)}
                   >
-                    <RefreshCw className="h-3.5 w-3.5" />
-                    {countdown > 0 ? `Resend in ${countdown}s` : "Resend code"}
+                    {loading ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-3.5 w-3.5" />
+                    )}
+                    {countdown > 0 ? `Send it again in ${countdown}s` : "Send it again"}
                   </Button>
                 </div>
-              </form>
-            </AuthFrame>
-          )}
-
-          {step === "password" && (
-            <AuthFrame title="Set a new password" subtitle="Choose a secure password for your Flowdesk account.">
-              <form className="mt-8 space-y-5" onSubmit={updatePassword}>
-                <Field label="New password" htmlFor="new-password">
-                  <PasswordInput
-                    id="new-password"
-                    value={newPassword}
-                    onChange={setNewPassword}
-                    visible={showNewPassword}
-                    onToggle={() => setShowNewPassword((value) => !value)}
-                    autoComplete="new-password"
-                  />
-                </Field>
-                <Field label="Confirm new password" htmlFor="confirm-password">
-                  <PasswordInput
-                    id="confirm-password"
-                    value={confirmPassword}
-                    onChange={setConfirmPassword}
-                    visible={showConfirmPassword}
-                    onToggle={() => setShowConfirmPassword((value) => !value)}
-                    autoComplete="new-password"
-                  />
-                </Field>
-                <p className="text-xs text-muted-foreground">
-                  Use at least 8 characters. Commonly compromised passwords are not accepted.
-                </p>
-                <FormError message={error} />
-                <Button className="h-11 w-full" type="submit" disabled={loading || !newPassword || !confirmPassword}>
-                  {loading && <Loader2 className="animate-spin" />}
-                  Update password
-                </Button>
-              </form>
-            </AuthFrame>
-          )}
-
-          {step === "success" && (
-            <div className="text-center" aria-live="polite">
-              <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-primary/10 text-primary">
-                <CheckCircle2 className="h-6 w-6" />
+                <BackButton onClick={goToSignIn}>Back to sign in</BackButton>
               </div>
-              <h1 className="mt-5 text-2xl font-semibold">Your password has been updated.</h1>
-              <p className="mt-2 text-sm text-muted-foreground">Sign in again with your new password.</p>
-              <Button className="mt-8 h-11 w-full" onClick={goToSignIn}>
-                Back to sign in
-              </Button>
-            </div>
+            </AuthFrame>
           )}
         </div>
       </section>
@@ -509,7 +433,15 @@ function TaskFlowIllustration() {
   );
 }
 
-function AuthFrame({ title, subtitle, children }: { title: string; subtitle: string; children: React.ReactNode }) {
+function AuthFrame({
+  title,
+  subtitle,
+  children,
+}: {
+  title: string;
+  subtitle: React.ReactNode;
+  children: React.ReactNode;
+}) {
   return (
     <div>
       <h1 className="text-2xl font-semibold">{title}</h1>
@@ -524,47 +456,6 @@ function Field({ label, htmlFor, children }: { label: string; htmlFor: string; c
     <div className="space-y-2">
       <Label htmlFor={htmlFor}>{label}</Label>
       {children}
-    </div>
-  );
-}
-
-function PasswordInput({
-  id,
-  value,
-  onChange,
-  visible,
-  onToggle,
-  autoComplete,
-}: {
-  id: string;
-  value: string;
-  onChange: (value: string) => void;
-  visible: boolean;
-  onToggle: () => void;
-  autoComplete: string;
-}) {
-  return (
-    <div className="relative">
-      <Input
-        id={id}
-        type={visible ? "text" : "password"}
-        required
-        minLength={8}
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        autoComplete={autoComplete}
-        className="h-11 pr-11"
-      />
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon"
-        onClick={onToggle}
-        className="absolute right-1 top-1 h-9 w-9 text-muted-foreground"
-        aria-label={visible ? "Hide password" : "Show password"}
-      >
-        {visible ? <EyeOff /> : <Eye />}
-      </Button>
     </div>
   );
 }

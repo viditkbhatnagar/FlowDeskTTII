@@ -49,6 +49,12 @@ export type TickResult = {
 export const FIRST_TICK_DELAY_MS = 30_000;
 /** At most ~24 a minute: under Exchange Online's 30 messages a minute per sending mailbox. */
 export const SEND_GAP_MS = 2_500;
+/**
+ * A woken tick starts at least this long after the previous tick ended. A burst of wakes (many
+ * password resets at once) then costs one tick rather than one each, and sends stay at least
+ * SEND_GAP_MS apart across ticks as well as within one.
+ */
+export const WAKE_GAP_MS = 3_000;
 /** About a minute of paced sending per tick; a morning burst drains over the next ticks. */
 export const CLAIM_LIMIT = 20;
 /** Throttled or unreachable, and Graph did not say for how long. */
@@ -463,7 +469,101 @@ export function createTransport(config: EmailWorkerConfig, log: EmailLog): Email
   return createGraphTransport(config.transport);
 }
 
-type WorkerState = { stop: () => Promise<void> };
+/** What the tick loop schedules with: the real timers, or a fake in tests. */
+export type LoopTimers = {
+  setTimeout(run: () => void, ms: number): unknown;
+  clearTimeout(handle: unknown): void;
+  /** Milliseconds on a clock that never goes back. */
+  now(): number;
+};
+
+const realTimers: LoopTimers = {
+  setTimeout: (run, ms) => {
+    const handle: ReturnType<typeof setTimeout> = setTimeout(run, ms);
+    // The loop on its own must never keep the process alive.
+    handle.unref?.();
+    return handle;
+  },
+  clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+  now: () => performance.now(),
+};
+
+export type TickLoop = {
+  /** Asks for a tick sooner than the schedule; see createTickLoop for when it runs. */
+  wake(): void;
+  /** No tick starts after this. Resolves once the tick in flight, if any, has finished. */
+  stop(): Promise<void>;
+};
+
+export type TickLoopOptions = {
+  /** One pass. It logs its own failures and never rejects. */
+  tick: () => Promise<void>;
+  intervalMs: number;
+  firstTickDelayMs: number;
+  timers?: LoopTimers;
+};
+
+/**
+ * Runs `tick` firstTickDelayMs after the start, then intervalMs after each tick ends. Chained
+ * rather than setInterval, so a slow tick can never overlap the next one.
+ *
+ * wake() brings the next tick forward: right away when the loop is idle, or as soon as the tick
+ * in flight has ended (whose claim may have run before the email was queued), but never sooner
+ * than WAKE_GAP_MS after the previous tick ended. Every wake until that tick starts is answered
+ * by it. Before the first tick a wake changes nothing, so the start-up delay holds: that tick is
+ * at most firstTickDelayMs away and sends whatever was queued.
+ */
+export function createTickLoop(options: TickLoopOptions): TickLoop {
+  const { tick, intervalMs, timers = realTimers } = options;
+  let timer: unknown;
+  /** When the pending timer fires, on the timers' clock. */
+  let dueAt = Number.POSITIVE_INFINITY;
+  let inFlight: Promise<void> | undefined;
+  /** When the last tick ended; undefined until the first one has. */
+  let lastEnd: number | undefined;
+  let wokenInFlight = false;
+  let stopped = false;
+
+  const schedule = (ms: number) => {
+    if (timer !== undefined) timers.clearTimeout(timer);
+    dueAt = timers.now() + ms;
+    timer = timers.setTimeout(run, ms);
+  };
+  const run = () => {
+    timer = undefined;
+    dueAt = Number.POSITIVE_INFINITY;
+    wokenInFlight = false;
+    inFlight = tick().finally(() => {
+      inFlight = undefined;
+      lastEnd = timers.now();
+      if (!stopped) schedule(wokenInFlight ? Math.min(WAKE_GAP_MS, intervalMs) : intervalMs);
+    });
+  };
+
+  schedule(options.firstTickDelayMs);
+  return {
+    wake: () => {
+      if (stopped) return;
+      if (inFlight) {
+        wokenInFlight = true;
+        return;
+      }
+      if (lastEnd === undefined) return;
+      const now = timers.now();
+      const at = Math.max(now, lastEnd + WAKE_GAP_MS);
+      // A tick already due sooner (an earlier wake, or the schedule) answers this wake as well.
+      if (at < dueAt) schedule(at - now);
+    },
+    stop: () => {
+      stopped = true;
+      if (timer !== undefined) timers.clearTimeout(timer);
+      timer = undefined;
+      return inFlight ?? Promise.resolve();
+    },
+  };
+}
+
+type WorkerState = TickLoop;
 
 const WORKER_KEY = Symbol.for("flowdesk.emailWorker");
 type WorkerGlobal = typeof globalThis & { [WORKER_KEY]?: WorkerState | "disabled" };
@@ -476,11 +576,12 @@ export type StartOptions = {
   now?: () => Date;
 };
 
-function scheduleLoop(config: EmailWorkerConfig, options: Required<Omit<StartOptions, "env">>) {
+function scheduleLoop(
+  config: EmailWorkerConfig,
+  options: Required<Omit<StartOptions, "env">>,
+): WorkerState {
   const { log } = options;
-  let timer: ReturnType<typeof setTimeout> | undefined;
   let stopped = false;
-  let inFlight: Promise<void> | undefined;
   let ticks = 0;
   const deps = {
     rpc: createEmailRpc({
@@ -504,25 +605,18 @@ function scheduleLoop(config: EmailWorkerConfig, options: Required<Omit<StartOpt
       if (busy || ticks === 1) log.info(`[email] tick ${ticks}: ${summarize(result)}`);
     } catch (error) {
       log.error(`[email] tick ${ticks} failed: ${errorText(error)}`);
-    } finally {
-      // Chained rather than setInterval, so a slow tick can never overlap the next one.
-      if (!stopped) timer = setTimeout(run, config.intervalMs);
-      timer?.unref?.();
     }
   };
-  const run = () => {
-    inFlight = tick().finally(() => {
-      inFlight = undefined;
-    });
-  };
-
-  timer = setTimeout(run, options.firstTickDelayMs);
-  timer.unref?.();
+  const loop = createTickLoop({
+    tick,
+    intervalMs: config.intervalMs,
+    firstTickDelayMs: options.firstTickDelayMs,
+  });
   return {
+    wake: loop.wake,
     stop: () => {
       stopped = true;
-      if (timer) clearTimeout(timer);
-      return inFlight ?? Promise.resolve();
+      return loop.stop();
     },
   };
 }
@@ -571,4 +665,28 @@ export function stopEmailWorker(): Promise<void> {
   const state = scope[WORKER_KEY];
   delete scope[WORKER_KEY];
   return state && state !== "disabled" ? state.stop() : Promise.resolve();
+}
+
+/**
+ * Whether a worker runs in this process to send what gets queued. A password reset is refused
+ * rather than queued without one: queuing it burns the person's earlier links, and nothing would
+ * send the new one. Reached through globalThis, like wakeEmailWorker.
+ */
+export function isEmailWorkerRunning(): boolean {
+  const state = (globalThis as WorkerGlobal)[WORKER_KEY];
+  return Boolean(state) && state !== "disabled";
+}
+
+/**
+ * Ask the worker running in this process for a tick as soon as it may (an email someone is
+ * waiting for, such as a password reset, was just queued); createTickLoop says when that is.
+ * Returns false when no worker runs here (email switched off or misconfigured). Never throws.
+ * Reached through globalThis because the worker may belong to another copy of this module.
+ */
+export function wakeEmailWorker(): boolean {
+  const state = (globalThis as WorkerGlobal)[WORKER_KEY];
+  // A worker from a copy of this module older than wake (vite dev keeps it across hot reloads).
+  if (!state || state === "disabled" || typeof state.wake !== "function") return false;
+  state.wake();
+  return true;
 }

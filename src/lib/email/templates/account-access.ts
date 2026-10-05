@@ -14,7 +14,7 @@ import {
 
 // Redesigned from Naji's credentials email: a password is never sent. The person chooses their
 // own, through a one-time /welcome link when an admin added them in Flowdesk, or else through
-// the reset-password flow (whose page explains the verification code it sends).
+// the reset-password flow (Forgot password on /auth, which emails a one-time /reset-password link).
 export type AccountAccessVariables = {
   firstName: string;
   emailAddress: string;

@@ -422,11 +422,12 @@ build from the previous one.
 
 # Email notifications
 
-FlowDesk sends nine kinds of email: account access, added to a project, task assigned,
-due-date reminder, overdue alert, and the daily/weekly task digests and management
-summaries. The database queues them in `email_outbox`, and a worker inside the SSR process
-sends them through Microsoft Graph. Supabase Auth sends the password-reset code itself,
-using the template in `deploy/email/`. Rehearsed end to end against local Supabase,
+FlowDesk sends ten kinds of email: account access, password reset, added to a project,
+task assigned, due-date reminder, overdue alert, and the daily/weekly task digests and
+management summaries. The database queues them in `email_outbox`, and a worker inside the
+SSR process sends them through Microsoft Graph. Password reset is one of them since 5 Oct
+2026 (see "Forgot password"); Supabase Auth's own reset email is no longer used. Rehearsed
+end to end against local Supabase,
 including the built server (`node .output/server/index.mjs`) with the log transport.
 
 **Nothing is sent until `EMAIL_WORKER_ENABLED=true` and every Microsoft Graph credential
@@ -455,8 +456,8 @@ Rules the system enforces, so nobody is surprised by them:
   **Onboarding a new colleague:** once the onboarding migration is applied, use
   **Settings → Users → Add User**. Their welcome email carries a one-time link to choose a
   password. The SQL route below is the **fallback**, for when the browser route is not
-  available. Its welcome email links to the reset-password page instead, which sends a
-  6-digit code. A brand-new login has no organization yet, so it does not appear in
+  available. Its welcome email links to Forgot password on the sign-in page instead, which
+  emails a one-time link. A brand-new login has no organization yet, so it does not appear in
   FlowDesk → Settings → Users until step 2:
   1. Lovable Cloud → Users → add the user with their email (and a temporary password if
      asked; they will set their own through the welcome email).
@@ -725,11 +726,56 @@ restart, so a deleted key keeps its previous value. The triggers keep queuing. U
 event rows expire on their own after 48 hours (7 days for account access), and scheduled
 ones at the end of their send window.
 
-## Step 5 — the password-reset template (Lovable Cloud)
+## Step 5 — nothing to do in Lovable Cloud → Emails
 
-Paste `deploy/email/supabase-reset-password.html` into **Lovable Cloud → Emails → Reset
-password**, with the subject `Your Flowdesk password reset code`. `deploy/email/README.md`
-has the details. Do this after Step 4, so the logo URL already resolves.
+This step used to paste a code template into Lovable Cloud's reset-password email. Since
+5 Oct 2026 Forgot password is Flowdesk's own (see "Forgot password"), so Lovable's auth
+emails are not part of the app any more. Leave them as they are.
+
+---
+
+# Forgot password
+
+Reported 5 Oct 2026: Forgot password sent an email from `no-reply@md.lovable-app.email`
+whose button opened the old Lovable prototype, and no code for the sign-in page to take.
+That email belonged to Supabase Auth, which Lovable Cloud runs with its own email hook,
+templates and site URL; nobody here can change them. So Forgot password is now Flowdesk's
+own, built like the welcome email. Migration:
+`supabase/migrations/20261005000000_password_reset.sql`.
+
+- **Sign-in page → Forgot / change password? → Email me a reset link.** The web server
+  (`src/lib/password-reset.functions.ts`) asks the database (`request_password_reset`,
+  gated by the email worker's secret, so only this server can call it) to queue the email,
+  and wakes the email worker, which sends it within seconds as **Flowdesk
+  &lt;flowdesk@upcarrera.com&gt;**.
+- **The email's button opens `https://flowdesk.upcarrera.com/reset-password#token=…`.**
+  The person chooses a new password there (`complete_password_reset`) and is signed
+  straight in. Their other sign-ins end; a copied access token stops working when it
+  expires, within the hour.
+- **The page never says whether an address has an account:** every valid address gets
+  "Check your email". Only an active account with an active organization gets an email.
+
+Rules, so nobody is surprised by them:
+
+- **A reset link works once and expires after 1 hour.** A newer request, a resent welcome,
+  Deactivate, a changed sign-in email or a finished reset or welcome kills it, and a reset
+  email still waiting to go out with a dead link is withdrawn.
+- **Asking for a reset replaces the person's welcome link.** Someone who never signed in
+  can use Forgot password instead of waiting for a resend.
+- **Limits:** 5 requests per address per hour (counted whether or not it has an account),
+  and 20 per network address every 15 minutes, from this site's own pages only (a POST from
+  another site is refused). There is no cap across all addresses: requests for unknown
+  addresses would fill it, and anyone could then switch reset off for everyone.
+- **Reset and welcome emails jump the queue** ahead of digests and reminders.
+- **If the email worker is not running** (`EMAIL_WORKER_ENABLED` not `true`, or a setting
+  missing), Forgot password answers that it can't send the email right now, and nobody's
+  link is touched.
+- **Supabase Auth's own reset can still be triggered from outside the app** (the old Lovable
+  prototype, or its API). That email still comes from Lovable; its link opens the prototype.
+  Tell people to use only flowdesk.upcarrera.com.
+
+To check it on production, use the QA account `QA Reset` (see the QA fixture in
+`flowdesk-wip`), whose address is a plus-alias of an inbox the team can read.
 
 ---
 

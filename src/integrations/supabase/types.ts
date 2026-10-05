@@ -1489,6 +1489,14 @@ export type Database = {
         Args: { p_password: string; p_token: string }
         Returns: string
       }
+      complete_password_reset: {
+        Args: { p_password: string; p_token: string }
+        Returns: string
+      }
+      request_password_reset: {
+        Args: { p_email: string; p_secret: string }
+        Returns: string
+      }
       email_worker_claim: {
         Args: { p_limit?: number; p_secret: string }
         Returns: Json

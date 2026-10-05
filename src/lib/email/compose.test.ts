@@ -195,6 +195,142 @@ describe("account_access", () => {
   });
 });
 
+describe("password_reset", () => {
+  const TOKEN = "fedcba9876543210".repeat(4);
+  // As request_password_reset queues it: no actor, the sign-in address it was asked for.
+  const row = claimed({
+    kind: "password_reset",
+    actorId: null,
+    recipientEmail: "maya@upcarrera.test",
+    payload: { fullName: "Maya Chen", setupToken: TOKEN },
+  });
+  const withToken = (setupToken: unknown) => ({
+    ...row,
+    payload: { fullName: "Maya Chen", setupToken },
+  });
+  const resetHref = (html: string) => /href="([^"]*\/reset-password[^"]*)"/.exec(html)?.[1] ?? "";
+
+  test("sends the one-time /reset-password link to the sign-in address", () => {
+    const email = sent(compose(row, baseSnapshot()));
+    expect(email.to).toBe("maya@upcarrera.test");
+    expect(email.toName).toBe("Maya Chen");
+    expect(email.subject).toBe("Reset your Flowdesk password");
+    expect(email.html).toContain(`href="${APP}/reset-password#token=${TOKEN}"`);
+    expect(email.html).toContain(">Choose a new password</a>");
+    expect(email.html).toContain("The link works once and expires in 1 hour.");
+    expect(email.html).toContain("Hi Maya,");
+    expect(email.html).not.toContain("/welcome");
+    expect(email.html).not.toContain("/auth");
+  });
+
+  test("the token rides in the fragment, never the query, so no server or Referer sees it", () => {
+    const url = new URL(resetHref(sent(compose(row, baseSnapshot())).html));
+    expect(url.origin).toBe(APP);
+    expect(url.pathname).toBe("/reset-password");
+    expect(url.search).toBe("");
+    expect(url.hash).toBe(`#token=${TOKEN}`);
+  });
+
+  test("the token appears only in the link: not in the subject, the name or anywhere else", () => {
+    const email = sent(compose(row, baseSnapshot()));
+    expect(email.subject).not.toContain(TOKEN);
+    expect(email.toName).not.toContain(TOKEN);
+    expect(email.html.split(TOKEN).length - 1).toBe(1);
+  });
+
+  test.each([
+    ["missing", undefined],
+    ["too short", TOKEN.slice(1)],
+    ["too long", `${TOKEN}0`],
+    ["upper case", TOKEN.toUpperCase()],
+    ["not hex", `${TOKEN.slice(1)}g`],
+    ["padded", ` ${TOKEN}`],
+    ["a path", `../${TOKEN.slice(3)}`],
+    ["a fragment break", `${TOKEN.slice(4)}&x=1`],
+    ["empty", ""],
+    ["a number", 12345],
+    ["null", null],
+    ["an object", { token: TOKEN }],
+  ])(
+    "without a valid token (%s) it is suppressed: no other link is sent",
+    (_: string, bad: unknown) => {
+      expect(reason(compose(withToken(bad), baseSnapshot()))).toBe("no valid reset token");
+    },
+  );
+
+  test("a row that lost its payload is suppressed too", () => {
+    expect(reason(compose({ ...row, payload: {} }, baseSnapshot()))).toBe("no valid reset token");
+  });
+
+  test("cannot be switched off by preferences or organization settings", () => {
+    const snapshot = baseSnapshot({
+      preferences: [{ userId: MAYA, ...allKinds(false) }],
+      organizations: [
+        org(DUBAI, "upCarrera", "Asia/Dubai", { ...allKinds(false), enabled: false }),
+        org(KOLKATA, "TTI", "Asia/Kolkata", { enabled: false }),
+      ],
+    });
+    expect(sent(compose(row, snapshot)).subject).toBe("Reset your Flowdesk password");
+  });
+
+  test("needs no organization on the row", () => {
+    expect(compose({ ...row, organizationId: null }, baseSnapshot()).outcome).toBe("send");
+  });
+
+  test("is withdrawn when the person is inactive", () => {
+    const snapshot = baseSnapshot({
+      people: [person(MAYA, "Maya Chen", "maya@upcarrera.test", "inactive")],
+    });
+    expect(reason(compose(row, snapshot))).toBe("recipient is inactive");
+  });
+
+  test("is withdrawn when the person no longer belongs to any organization", () => {
+    expect(reason(compose(row, baseSnapshot({ memberships: [] })))).toBe(
+      "recipient no longer belongs to any organization",
+    );
+    const base = baseSnapshot();
+    const inactive = base.memberships.map((m) =>
+      m.userId === MAYA ? { ...m, status: "inactive" } : m,
+    );
+    expect(reason(compose(row, { ...base, memberships: inactive }))).toBe(
+      "recipient no longer belongs to any organization",
+    );
+  });
+
+  test("an active membership in any organization is enough", () => {
+    const snapshot = baseSnapshot({ memberships: [membership(MAYA, KOLKATA, false)] });
+    expect(compose(row, snapshot).outcome).toBe("send");
+  });
+
+  test("is withdrawn when the sign-in email changed after the reset was asked for", () => {
+    const moved = baseSnapshot({ people: [person(MAYA, "Maya Chen", "maya.chen@upcarrera.test")] });
+    expect(reason(compose(row, moved))).toBe("sign-in email changed since the reset was requested");
+  });
+
+  test("case and spaces in the asked-for address are not a change; no address at all is fine", () => {
+    const shouted = { ...row, recipientEmail: "  Maya@UpCarrera.TEST " };
+    expect(sent(compose(shouted, baseSnapshot())).to).toBe("maya@upcarrera.test");
+    expect(sent(compose({ ...row, recipientEmail: null }, baseSnapshot())).to).toBe(
+      "maya@upcarrera.test",
+    );
+  });
+
+  test("is not tied to a planned day like the scheduled kinds", () => {
+    const stale = { ...row, payload: { ...row.payload, localDate: "2026-09-01" } };
+    expect(compose(stale, baseSnapshot()).outcome).toBe("send");
+  });
+
+  test("a hostile name is escaped and the link is untouched", () => {
+    const snapshot = baseSnapshot({
+      people: [person(MAYA, `<img src=x onerror=alert(1)>`, "maya@upcarrera.test")],
+    });
+    const email = sent(compose(row, snapshot));
+    expect(email.html).not.toContain("<img src=x");
+    expect(email.html).toContain("Hi &lt;img,");
+    expect(resetHref(email.html)).toBe(`${APP}/reset-password#token=${TOKEN}`);
+  });
+});
+
 describe("task_assigned", () => {
   const t = task({
     title: "Upload fee reconciliation",

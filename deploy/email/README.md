@@ -1,8 +1,10 @@
-# Email templates for Supabase Auth
+# Email templates for Supabase Auth (no longer used)
 
-Supabase Auth sends the password-reset code itself (`resetPasswordForEmail` in
-`src/routes/auth.tsx`, verified with `verifyOtp({ type: "recovery" })`). Flowdesk only
-supplies the template; every other Flowdesk email is rendered by `src/lib/email/render.ts`.
+**Not used since 5 Oct 2026.** Forgot password is now Flowdesk's own: the email worker sends
+a one-time `/reset-password` link (see `docs/06-deployment.md` → "Forgot password"). On the
+hosted project Supabase Auth's emails come from Lovable Cloud's email hook, which ignored
+this template anyway. It is kept, with its generator and test, only in case Supabase Auth
+is ever used again. Every Flowdesk email is rendered by `src/lib/email/render.ts`.
 
 Those other emails go out through Microsoft Graph from the shared mailbox
 `flowdesk@upcarrera.com` ("Flowdesk"), with Reply-To `hello@upcarrera.com`. The setup is

@@ -5,6 +5,7 @@ import type { AddressInfo } from "node:net";
 import {
   ADMIN,
   APP,
+  DAN,
   FRIDAY_0830_DUBAI,
   MAYA,
   baseSnapshot,
@@ -117,6 +118,35 @@ describe("runEmailTick", () => {
     const result = await runEmailTick(deps(rpc, fakeTransport()));
     expect(result).toMatchObject({ planned: 0, sent: 1 });
     expect(rpc.snapshots).toBe(2);
+  });
+
+  test("a password reset goes out with its link; its token reaches no result or log line", async () => {
+    const TOKEN = "0a1b2c3d4e5f6789".repeat(4);
+    const reset = claimed({
+      id: "e6",
+      kind: "password_reset",
+      actorId: null,
+      recipientEmail: "maya@upcarrera.test",
+      payload: { fullName: "Maya Chen", setupToken: TOKEN },
+    });
+    const tokenless = claimed({ id: "e7", kind: "password_reset", recipientUserId: DAN });
+    const rpc = fakeRpc({ snapshots: [baseSnapshot()], claim: [reset, tokenless] });
+    const transport = fakeTransport();
+    const log = memoryLog();
+    const result = await runEmailTick(deps(rpc, transport, log));
+    expect(result).toMatchObject({ claimed: 2, sent: 1, suppressed: 1, failed: 0 });
+    expect(transport.sent).toHaveLength(1);
+    expect(transport.sent[0]).toMatchObject({
+      to: "maya@upcarrera.test",
+      subject: "Reset your Flowdesk password",
+    });
+    expect(transport.sent[0].html).toContain(`href="${APP}/reset-password#token=${TOKEN}"`);
+    expect(rpc.completed).toEqual([
+      [{ id: "e6", outcome: "sent" }],
+      [{ id: "e7", outcome: "suppressed", error: "no valid reset token" }],
+    ]);
+    expect(JSON.stringify(rpc.completed)).not.toContain(TOKEN);
+    expect(log.lines.join("\n")).not.toContain(TOKEN);
   });
 
   test("no claimed rows: one snapshot, nothing completed", async () => {

@@ -1,5 +1,6 @@
 export const EMAIL_KINDS = [
   "account_access",
+  "password_reset",
   "project_invitation",
   "task_assigned",
   "due_reminder",
@@ -12,8 +13,9 @@ export const EMAIL_KINDS = [
 
 export type EmailKind = (typeof EMAIL_KINDS)[number];
 
-// account_access is transactional (it is how a new person gets in), so it can
-// never be switched off by an organization or opted out of by the recipient.
+// account_access and password_reset are transactional (how a new person gets in,
+// and how anyone gets back in), so neither can ever be switched off by an
+// organization or opted out of by the recipient.
 export const PREFERENCE_KINDS = [
   "project_invitation",
   "task_assigned",
