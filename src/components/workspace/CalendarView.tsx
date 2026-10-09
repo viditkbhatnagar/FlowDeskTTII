@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useWorkspace } from "@/lib/workspace-data";
+import { foldGroups } from "@/lib/task-groups";
 import {
   startOfMonth,
   endOfMonth,
@@ -23,7 +24,9 @@ const priorityDot: Record<string, string> = {
 };
 
 export function CalendarView() {
-  const { tasks } = useWorkspace();
+  const { tasks: visible } = useWorkspace();
+  // A group task is one entry, not one per person (spec of 9 Oct, section E).
+  const tasks = foldGroups(visible);
   const [cursor, setCursor] = useState(new Date());
   const monthStart = startOfMonth(cursor);
   const gridStart = startOfWeek(monthStart, { weekStartsOn: 1 });

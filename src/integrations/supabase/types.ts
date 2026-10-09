@@ -521,34 +521,37 @@ export type Database = {
         Row: {
           created_at: string
           file_name: string
-          file_size: number
+          file_size: number | null
           id: string
-          mime_type: string
+          link_url: string | null
+          mime_type: string | null
           organization_id: string
           project_id: string
-          storage_path: string
+          storage_path: string | null
           uploaded_by: string
         }
         Insert: {
           created_at?: string
           file_name: string
-          file_size: number
+          file_size?: number | null
           id?: string
-          mime_type: string
+          link_url?: string | null
+          mime_type?: string | null
           organization_id: string
           project_id: string
-          storage_path: string
+          storage_path?: string | null
           uploaded_by?: string
         }
         Update: {
           created_at?: string
           file_name?: string
-          file_size?: number
+          file_size?: number | null
           id?: string
-          mime_type?: string
+          link_url?: string | null
+          mime_type?: string | null
           organization_id?: string
           project_id?: string
-          storage_path?: string
+          storage_path?: string | null
           uploaded_by?: string
         }
         Relationships: [
@@ -755,30 +758,33 @@ export type Database = {
         Row: {
           created_at: string
           file_name: string
-          file_size: number
+          file_size: number | null
           id: string
-          mime_type: string
-          storage_path: string
+          link_url: string | null
+          mime_type: string | null
+          storage_path: string | null
           task_id: string
           uploaded_by: string
         }
         Insert: {
           created_at?: string
           file_name: string
-          file_size: number
+          file_size?: number | null
           id?: string
-          mime_type: string
-          storage_path: string
+          link_url?: string | null
+          mime_type?: string | null
+          storage_path?: string | null
           task_id: string
           uploaded_by?: string
         }
         Update: {
           created_at?: string
           file_name?: string
-          file_size?: number
+          file_size?: number | null
           id?: string
-          mime_type?: string
-          storage_path?: string
+          link_url?: string | null
+          mime_type?: string | null
+          storage_path?: string | null
           task_id?: string
           uploaded_by?: string
         }
@@ -1368,6 +1374,7 @@ export type Database = {
           id: string
           occurrence_number: number | null
           organization_id: string
+          parent_task_id: string | null
           priority: Database["public"]["Enums"]["work_priority"]
           progress: number
           project_id: string | null
@@ -1394,6 +1401,7 @@ export type Database = {
           id?: string
           occurrence_number?: number | null
           organization_id: string
+          parent_task_id?: string | null
           priority?: Database["public"]["Enums"]["work_priority"]
           progress?: number
           project_id?: string | null
@@ -1420,6 +1428,7 @@ export type Database = {
           id?: string
           occurrence_number?: number | null
           organization_id?: string
+          parent_task_id?: string | null
           priority?: Database["public"]["Enums"]["work_priority"]
           progress?: number
           project_id?: string | null
@@ -1485,6 +1494,10 @@ export type Database = {
         Returns: string
       }
       admin_resend_welcome: { Args: { p_user_id: string }; Returns: undefined }
+      create_group_task: {
+        Args: { p_assignee_ids: string[]; p_subtasks?: string[]; p_task: Json }
+        Returns: string
+      }
       complete_account_setup: {
         Args: { p_password: string; p_token: string }
         Returns: string
@@ -1511,6 +1524,15 @@ export type Database = {
       }
       email_worker_snapshot: { Args: { p_secret: string }; Returns: Json }
       process_scheduled_task_recurrences: { Args: never; Returns: number }
+      project_task_units: {
+        Args: { p_project_id?: string }
+        Returns: {
+          project_id: string
+          status: Database["public"]["Enums"]["work_task_status"]
+          due_date: string | null
+          due_at: string | null
+        }[]
+      }
     }
     Enums: {
       activity_event_type:

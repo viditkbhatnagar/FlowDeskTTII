@@ -40,7 +40,18 @@ export type SnapshotMembership = {
   organizationId: string;
   isPrimary: boolean;
   status: "active" | "inactive" | string;
+  // Reporting lines (9 Oct 2026, group tasks): who manages the person here, for who may see a
+  // task. Absent from a snapshot RPC older than that, which lookup.ts treats as managing no one.
+  departmentId?: string | null;
+  teamId?: string | null;
+  reportingManagerId?: string | null;
 };
+
+/** A department's head manages everyone in it (private.manages_person). */
+export type SnapshotDepartment = { id: string; organizationId: string; headUserId: string | null };
+
+/** A team's lead manages everyone on it (private.manages_person). */
+export type SnapshotTeam = { id: string; organizationId: string; leadUserId: string | null };
 
 export type SnapshotRole = { userId: string; organizationId: string; role: AppRole };
 
@@ -70,9 +81,15 @@ export type SnapshotTask = {
   title: string;
   status: TaskStatus;
   priority: TaskPriority;
+  /** NULL on a group task's parent (each person's part is a child); see parentTaskId. */
   assigneeId: string | null;
   reviewerId: string | null;
   createdBy: string;
+  /**
+   * Set on a group task's child: one per person, pointing at the group (the parent). Absent from
+   * a snapshot RPC older than 9 Oct 2026, where there are no groups.
+   */
+  parentTaskId?: string | null;
   dueDate: string | null;
   dueAt: string | null;
   blocked: boolean;
@@ -82,7 +99,10 @@ export type SnapshotTask = {
   createdAt: string;
 };
 
-/** total excludes cancelled tasks; done counts status = 'done' (see project-metrics.ts). */
+/**
+ * total excludes cancelled tasks; done counts status = 'done' (see project-metrics.ts). A group
+ * task counts once, as its parent: rows with a parentTaskId are left out.
+ */
 export type SnapshotProjectCount = { projectId: string; total: number; done: number };
 
 export type SnapshotLabel = { organizationId: string; value: string; label: string };
@@ -95,6 +115,12 @@ export type EmailSnapshot = {
   /** Only users who have saved preferences; everyone else has every kind on. */
   preferences: SnapshotPreferences[];
   memberships: SnapshotMembership[];
+  /**
+   * Every department and team, for their heads and leads. Absent from a snapshot RPC older than
+   * 9 Oct 2026: then nobody manages anybody (lookup.ts fails closed).
+   */
+  departments?: SnapshotDepartment[];
+  teams?: SnapshotTeam[];
   roles: SnapshotRole[];
   projects: SnapshotProject[];
   projectMembers: SnapshotProjectMember[];

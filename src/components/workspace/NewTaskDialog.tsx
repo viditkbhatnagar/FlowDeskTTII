@@ -16,10 +16,12 @@ import { supabase } from "@/integrations/supabase/client";
 import { useWorkspace, type Priority, type Status } from "@/lib/workspace-data";
 import { useOrganizations } from "@/lib/organizations-data";
 import { useTaskSettings, type TagConfig, type TaskStatusType } from "@/lib/task-settings-data";
-import { FILE_RULES, formatBytes, personRef, validateFile, type PersonRef } from "@/lib/task-api";
+import { FILE_RULES, formatBytes, personRef, validateFile } from "@/lib/task-api";
 import { TASK_LIMITS, normalizeTags, parseTags, validateTaskFields } from "@/lib/task-validation";
 import { cn } from "@/lib/utils";
 import { recurrenceSummary, type RecurrenceCreationMode, type RecurrenceEndMode, type RecurrenceFrequency, type RecurrenceRule } from "@/lib/recurrence";
+import { AssigneesPicker, type AssigneeOption } from "./AssigneesPicker";
+import { AddLinkButton, PendingLinkList, usePendingLinks } from "./files";
 
 
 /** Dependencies have no table yet; see the note where the section is rendered. */
@@ -202,14 +204,22 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
   const fieldId = (name: string) => `${uid}-${name}`;
   const { addTask, tasks, people } = useWorkspace();
   const { priorities: priorityOptions, tagsFor, statusesFor, statusLabelFor } = useTaskSettings();
-  const { currentUser, accessibleOrganizations, managedOrganizations } = useOrganizations();
+  const {
+    currentUser,
+    accessibleOrganizations,
+    managedOrganizations,
+    users,
+    departments,
+    status: orgDataStatus,
+  } = useOrganizations();
   const signedInUserId = useSignedInUserId();
   const { options: projectOptions, state: projectsState } = useProjectOptions(projectName);
 
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [projectKey, setProjectKey] = useState(NO_PROJECT);
-  const [assigneeId, setAssigneeId] = useState("");
+  // Null until the person changes it: then it is "me" (FD-001).
+  const [assigneeIds, setAssigneeIds] = useState<string[] | null>(null);
   const [statusChoice, setStatusChoice] = useState<Status | null>(null);
   const [priority, setPriority] = useState<Priority>("medium");
   const [startDate, setStartDate] = useState("");
@@ -222,6 +232,7 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
   const [subtaskDraft, setSubtaskDraft] = useState("");
   const [dependencies, setDependencies] = useState<string[]>([]);
   const [files, setFiles] = useState<File[]>([]);
+  const pendingLinks = usePendingLinks();
   const [recurring, setRecurring] = useState(false);
   const [recurrenceDraft, setRecurrenceDraft] = useState<RecurrenceDraft>(newRecurrenceDraft);
   const [touched, setTouched] = useState<ReadonlySet<string>>(new Set());
@@ -264,11 +275,34 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
 
   // Real users. This listed five demo people and defaulted to one of them, and the
   // pick was then ignored: every task was saved against its creator (FD-001).
-  const assigneeOptions = useMemo<PersonRef[]>(() => {
-    if (!signedInUserId || people.some((person) => person.id === signedInUserId)) return people;
-    return [personRef(signedInUserId, "Me"), ...people];
-  }, [people, signedInUserId]);
-  const effectiveAssigneeId = assigneeId || signedInUserId || "";
+  // Only active members of the organization the task is filed in: a group task
+  // refuses anyone else, and a task for someone outside it would be filed where
+  // they can't open it. Until the people list loads, everyone visible is offered.
+  const assigneeOptions = useMemo<AssigneeOption[]>(() => {
+    const departmentNames = new Map(departments.map((d) => [d.id, d.name]));
+    const userById = new Map(users.map((user) => [user.id, user]));
+    const known = orgDataStatus === "ready" && users.length > 0 && Boolean(taskOrgId);
+    const list: AssigneeOption[] = [];
+    for (const person of people) {
+      const user = userById.get(person.id);
+      const membership = user?.memberships.find((m) => m.orgId === taskOrgId && m.status === "active");
+      if (known && (!user || user.status !== "active" || !membership)) continue;
+      const department = membership?.departmentId ? departmentNames.get(membership.departmentId) : undefined;
+      list.push({ ...person, detail: department || user?.designation || undefined });
+    }
+    if (signedInUserId && !list.some((person) => person.id === signedInUserId)) {
+      list.unshift({ ...personRef(signedInUserId, currentUser?.name ?? "Me") });
+    }
+    return list;
+  }, [people, users, departments, orgDataStatus, taskOrgId, signedInUserId, currentUser?.name]);
+  const assigneeOptionIds = useMemo(() => new Set(assigneeOptions.map((person) => person.id)), [assigneeOptions]);
+  const chosenAssignees = assigneeIds ?? (signedInUserId ? [signedInUserId] : []);
+  // Someone chosen for another organization's project drops out when the project changes.
+  const selectedAssignees = chosenAssignees.filter((id) => assigneeOptionIds.has(id));
+  const leftOut = chosenAssignees.length - selectedAssignees.length;
+  const isGroupTask = selectedAssignees.length >= 2;
+  // A schedule spawns one task, not a group, so a task for several people doesn't repeat.
+  const repeats = recurring && !isGroupTask;
 
   // Names come from Settings, never hardcoded (FD-018): the statuses, names and
   // default of the organization the task is filed in, not the settings page's.
@@ -307,10 +341,14 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
     title, description, startDate, dueDate, estimatedHours, tags: allTags, requireDueDate: true,
     requireProject: true, projectId: selectedProject?.id ?? null,
   });
-  const recurrenceErrors = recurring ? validateRecurrence(recurrenceDraft, dueDate) : {};
+  const recurrenceErrors = repeats ? validateRecurrence(recurrenceDraft, dueDate) : {};
+  // Emptied on purpose; untouched it is "me", which the data layer also falls back to.
+  const assigneeError =
+    assigneeIds !== null && selectedAssignees.length === 0 ? "Choose who this task is for." : undefined;
   // Why Create is disabled. It was disabled with no word of explanation (FD-017).
   const blockingReason =
-    projectBlock ?? [...Object.values(fieldErrors), ...Object.values(recurrenceErrors)][0];
+    projectBlock ??
+    [...Object.values(fieldErrors), assigneeError, ...Object.values(recurrenceErrors)].find(Boolean);
   // Required-field errors wait until the field is touched; range errors show at once.
   const titleError = touched.has("title") ? fieldErrors.title : undefined;
   const projectError = touched.has("project") ? fieldErrors.project : undefined;
@@ -347,9 +385,9 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
 
   const submit = async () => {
     if (blockingReason || saving) return;
-    const person = assigneeOptions.find((item) => item.id === effectiveAssigneeId);
+    const person = assigneeOptions.find((item) => item.id === selectedAssignees[0]);
     const shown = person ?? personRef(null, "Me");
-    const rule = recurring ? toRecurrenceRule(recurrenceDraft) : undefined;
+    const rule = repeats ? toRecurrenceRule(recurrenceDraft) : undefined;
     const projectTaskIds = new Set(projectTasks.map((task) => task.id));
     setSaving(true);
     try {
@@ -361,7 +399,9 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
         assignee: { name: shown.name, initials: shown.initials, color: shown.color },
         // Undefined only while the session is resolving; the data layer then
         // assigns the creator, which is also this form's default.
-        assigneeId: person?.id,
+        assigneeId: isGroupTask ? undefined : person?.id,
+        // Two or more: a group task, a part for each person (create_group_task).
+        assigneeIds: isGroupTask ? selectedAssignees : undefined,
         status,
         priority,
         // Empty when no start date was chosen, not today (FD-032).
@@ -373,6 +413,7 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
         dependencies: dependencies.filter((id) => projectTaskIds.has(id)),
         // Uploaded by the data layer once the task exists; dropped on create before (FD-058).
         files,
+        links: pendingLinks.links,
         recurrence: rule,
         recurrenceSummary: rule ? recurrenceSummary(rule, dueDate) : undefined,
       });
@@ -380,10 +421,12 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
         toast.error(result.error);
         return;
       }
-      toast.success("Task created successfully");
+      toast.success(
+        isGroupTask ? `Task created for ${selectedAssignees.length} people` : "Task created successfully",
+      );
       if (result.rejectedFiles.length) {
         const count = result.rejectedFiles.length;
-        toast.error(count === 1 ? "1 file was not attached" : `${count} files were not attached`, {
+        toast.error(count === 1 ? "1 attachment was not added" : `${count} attachments were not added`, {
           description: result.rejectedFiles.map((file) => `${file.name}: ${file.reason}`).join("; "),
         });
       }
@@ -421,6 +464,7 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
         </Field>
         <div className="grid gap-4 sm:grid-cols-2">
           <SelectField
+            className="sm:col-span-2"
             label="Project*" id={fieldId("project")} value={selectedProjectKey === NO_PROJECT ? "" : selectedProjectKey}
             onChange={(value) => { setProjectKey(value); touch("project"); }} disabled={Boolean(fixedProject)}
             placeholder={
@@ -432,13 +476,21 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
             ) : "No projects yet. Ask a manager or admin to create one in Projects."}
             options={projectOptions.map((item) => ({ value: item.key, label: item.name }))}
           />
-          <SelectField
-            label="Assignee" id={fieldId("assignee")} value={effectiveAssigneeId} onChange={setAssigneeId} placeholder="Choose a person"
-            options={assigneeOptions.map((person) => ({
-              value: person.id,
-              label: person.id === signedInUserId && person.name !== "Me" ? `${person.name} (you)` : person.name,
-            }))}
-          />
+          <Field
+            label="Assignees" htmlFor={fieldId("assignees")} error={assigneeError} className="sm:col-span-2"
+          >
+            <AssigneesPicker
+              id={fieldId("assignees")} options={assigneeOptions} selected={selectedAssignees}
+              onChange={setAssigneeIds} meId={signedInUserId} invalid={Boolean(assigneeError)}
+              describedBy={assigneeError ? `${fieldId("assignees")}-error ${fieldId("assignees-hint")}` : fieldId("assignees-hint")}
+            />
+            <p id={fieldId("assignees-hint")} className="text-[11px] text-muted-foreground">
+              {isGroupTask
+                ? `A group task: each of the ${selectedAssignees.length} people gets their own part to move, and the task moves on when everyone has moved theirs.`
+                : "Add more people to give each of them their own part of this task."}
+              {leftOut > 0 && ` ${leftOut === 1 ? "1 person isn't" : `${leftOut} people aren't`} in this project's organization and ${leftOut === 1 ? "was" : "were"} left out.`}
+            </p>
+          </Field>
           <SelectField label="Status" id={fieldId("status")} value={status} onChange={(value) => setStatusChoice(value as Status)} options={statusOptions} />
           <SelectField
             label="Priority" id={fieldId("priority")} value={priority} onChange={(value) => setPriority(value as Priority)}
@@ -476,12 +528,17 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
               </span>
               <div>
                 <Label htmlFor={fieldId("recurring")}>Recurring task</Label>
-                <p className="text-xs text-muted-foreground">Repeat this task automatically.</p>
+                <p id={fieldId("recurring-hint")} className="text-xs text-muted-foreground">
+                  {isGroupTask ? "Off when a task is for several people." : "Repeat this task automatically."}
+                </p>
               </div>
             </div>
-            <Switch id={fieldId("recurring")} checked={recurring} onCheckedChange={setRecurring} />
+            <Switch
+              id={fieldId("recurring")} checked={repeats} onCheckedChange={setRecurring} disabled={isGroupTask}
+              aria-describedby={fieldId("recurring-hint")}
+            />
           </div>
-          {recurring && (
+          {repeats && (
             <RecurrenceFields
               idPrefix={uid} draft={recurrenceDraft} errors={recurrenceErrors} dueDate={dueDate}
               onChange={(patch) => setRecurrenceDraft((current) => ({ ...current, ...patch }))}
@@ -555,7 +612,9 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
             files={files}
             onAdd={addFiles}
             onRemove={(key) => setFiles((current) => current.filter((file) => fileKey(file) !== key))}
+            addLink={<AddLinkButton onAdd={pendingLinks.add} align="start" className="h-auto border-dashed px-3 py-2 text-xs" />}
           />
+          <PendingLinkList links={pendingLinks.links} onRemove={pendingLinks.remove} className="mt-2" />
         </Field>
       </div>
       <DialogFooter className="gap-2 border-t border-border bg-card px-6 py-4 sm:space-x-0">
@@ -753,9 +812,10 @@ function RecurrenceFields({ idPrefix, draft, onChange, errors, dueDate }: {
 }
 
 /** Name, size and a remove button per file; only the names were listed (FD-070). */
-function AttachmentsField({ id, files, onAdd, onRemove }: { id: string; files: File[]; onAdd: (files: File[]) => void; onRemove: (key: string) => void }) {
+function AttachmentsField({ id, files, onAdd, onRemove, addLink }: { id: string; files: File[]; onAdd: (files: File[]) => void; onRemove: (key: string) => void; addLink?: ReactNode }) {
   return (
     <div>
+      <div className="flex flex-wrap items-center gap-2">
       {/* sr-only rather than hidden: a display:none file input cannot be reached by keyboard. */}
       <label className="relative inline-flex cursor-pointer items-center gap-2 rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground hover:text-foreground focus-within:ring-1 focus-within:ring-ring">
         <Paperclip className="h-4 w-4" aria-hidden="true" />
@@ -773,6 +833,8 @@ function AttachmentsField({ id, files, onAdd, onRemove }: { id: string; files: F
           }}
         />
       </label>
+      {addLink}
+      </div>
       <p id={`${id}-rules`} className="mt-1.5 text-[11px] text-muted-foreground">{FILE_RULES.label}.</p>
       {files.length > 0 && (
         <ul aria-labelledby={`${id}-label`} className="mt-2 space-y-1.5">
@@ -793,13 +855,13 @@ function AttachmentsField({ id, files, onAdd, onRemove }: { id: string; files: F
   );
 }
 
-function SelectField({ label, id, value, onChange, options, placeholder, disabled, error, hint }: {
+function SelectField({ label, id, value, onChange, options, placeholder, disabled, error, hint, className }: {
   label: string; id: string; value: string; onChange: (value: string) => void;
   options: { value: string; label: string }[]; placeholder?: string; disabled?: boolean;
-  error?: string; hint?: ReactNode;
+  error?: string; hint?: ReactNode; className?: string;
 }) {
   return (
-    <Field label={label} htmlFor={id} error={error}>
+    <Field label={label} htmlFor={id} error={error} className={className}>
       <Select value={value} onValueChange={onChange} disabled={disabled}>
         <SelectTrigger id={id} {...describedBy(id, error)}><SelectValue placeholder={placeholder} /></SelectTrigger>
         <SelectContent>

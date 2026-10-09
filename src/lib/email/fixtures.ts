@@ -8,6 +8,7 @@ import type {
   KindToggles,
   OrgEmailSettings,
   OutboxInsert,
+  SnapshotDepartment,
   SnapshotMembership,
   SnapshotOrganization,
   SnapshotPerson,
@@ -15,6 +16,8 @@ import type {
   SnapshotProjectCount,
   SnapshotRole,
   SnapshotTask,
+  SnapshotTeam,
+  TaskStatus,
 } from "./snapshot";
 import type { EmailTransport, OutgoingEmail } from "./transport";
 import type { EmailLog } from "./worker";
@@ -61,12 +64,51 @@ export const person = (
   username: string | null = null,
 ): SnapshotPerson => ({ userId, fullName, username, email, status });
 
+export type ReportingLines = Partial<
+  Pick<SnapshotMembership, "departmentId" | "teamId" | "reportingManagerId">
+>;
+
 export const membership = (
   userId: string,
   organizationId: string,
   isPrimary = true,
   status = "active",
-): SnapshotMembership => ({ userId, organizationId, isPrimary, status });
+  lines: ReportingLines = {},
+): SnapshotMembership => ({
+  userId,
+  organizationId,
+  isPrimary,
+  status,
+  departmentId: null,
+  teamId: null,
+  reportingManagerId: null,
+  ...lines,
+});
+
+/** The snapshot with `userId`'s membership in `organizationId` on these reporting lines. */
+export const withLines = (
+  snapshot: EmailSnapshot,
+  userId: string,
+  organizationId: string,
+  lines: ReportingLines,
+): EmailSnapshot => ({
+  ...snapshot,
+  memberships: snapshot.memberships.map((m) =>
+    m.userId === userId && m.organizationId === organizationId ? { ...m, ...lines } : m,
+  ),
+});
+
+export const department = (
+  id: string,
+  organizationId: string,
+  headUserId: string | null,
+): SnapshotDepartment => ({ id, organizationId, headUserId });
+
+export const team = (
+  id: string,
+  organizationId: string,
+  leadUserId: string | null,
+): SnapshotTeam => ({ id, organizationId, leadUserId });
 
 export const role = (
   userId: string,
@@ -89,6 +131,7 @@ export function task(overrides: Partial<SnapshotTask> = {}): SnapshotTask {
     assigneeId: MAYA,
     reviewerId: null,
     createdBy: ADMIN,
+    parentTaskId: null,
     dueDate: null,
     dueAt: null,
     blocked: false,
@@ -98,6 +141,28 @@ export function task(overrides: Partial<SnapshotTask> = {}): SnapshotTask {
     createdAt: "2026-09-01T08:00:00.000Z",
     ...overrides,
   };
+}
+
+const STATUS_ORDER: TaskStatus[] = ["todo", "progress", "review", "done"];
+
+/**
+ * A group task as create_group_task makes it: the parent (no assignee) first, then one child per
+ * part copying the parent's fields. The parent's status is derived as the database does it: the
+ * least advanced of its children that are not cancelled (all cancelled: cancelled).
+ */
+export function groupTask(
+  overrides: Partial<SnapshotTask>,
+  parts: (Partial<SnapshotTask> & { assigneeId: string })[],
+): SnapshotTask[] {
+  const parent = task({ ...overrides, assigneeId: null, parentTaskId: null });
+  const children = parts.map((part) => task({ ...overrides, ...part, parentTaskId: parent.id }));
+  const counted = children.filter((child) => child.status !== "cancelled");
+  const status: TaskStatus = counted.length
+    ? STATUS_ORDER[Math.min(...counted.map((child) => STATUS_ORDER.indexOf(child.status)))]
+    : "cancelled";
+  const lastDone = counted.map((child) => child.completedAt ?? "").sort();
+  const completedAt = status === "done" ? lastDone[lastDone.length - 1] || null : null;
+  return [{ ...parent, status, completedAt }, ...children];
 }
 
 export const project = (overrides: Partial<SnapshotProject> = {}): SnapshotProject => ({
@@ -114,13 +179,16 @@ export const project = (overrides: Partial<SnapshotProject> = {}): SnapshotProje
   ...overrides,
 });
 
-/** What email_worker_snapshot's projectCounts reports for these projects and tasks. */
+/**
+ * What email_worker_snapshot's projectCounts reports for these projects and tasks: a group task
+ * counts once, as its parent.
+ */
 export function projectCountsFor(
   projects: SnapshotProject[],
   tasks: SnapshotTask[],
 ): SnapshotProjectCount[] {
   return projects.map((p) => {
-    const counted = tasks.filter((t) => t.projectId === p.id && !t.archivedAt);
+    const counted = tasks.filter((t) => t.projectId === p.id && !t.archivedAt && !t.parentTaskId);
     return {
       projectId: p.id,
       total: counted.filter((t) => t.status !== "cancelled").length,
@@ -132,8 +200,9 @@ export function projectCountsFor(
 /**
  * Two organizations (upCarrera in Dubai, TTI in Kolkata) and four people. Maya and Dan are
  * Dubai employees; the admin runs Dubai; the lead's primary org is Kolkata, where they are
- * team_lead, and they are also a plain employee in Dubai. projectCounts follows the projects
- * and tasks given, unless it is overridden too.
+ * team_lead, and they are also a plain employee in Dubai. Nobody reports to anybody (withLines,
+ * department and team add reporting lines). projectCounts follows the projects and tasks given,
+ * unless it is overridden too.
  */
 export function baseSnapshot(overrides: Partial<EmailSnapshot> = {}): EmailSnapshot {
   const snapshot = {
@@ -156,6 +225,9 @@ export function baseSnapshot(overrides: Partial<EmailSnapshot> = {}): EmailSnaps
       membership(LEAD, KOLKATA, true),
       membership(LEAD, DUBAI, false),
     ],
+    // Nobody reports to anybody until a test says so.
+    departments: [],
+    teams: [],
     roles: [
       role(ADMIN, DUBAI, "admin"),
       role(MAYA, DUBAI, "employee"),

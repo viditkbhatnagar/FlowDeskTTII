@@ -2,6 +2,7 @@ import {
   healthLabel,
   projectHealth,
   projectProgress,
+  workUnits,
   type ProjectHealth,
   type ProjectProgress,
 } from "../project-metrics";
@@ -12,6 +13,7 @@ import {
   colleagueName,
   contentOrgs,
   firstNameOf,
+  isGroupParent,
   isOpenTask,
   orgToday,
   plural,
@@ -359,13 +361,14 @@ function managementRow(
 }
 
 /**
- * The organization's tasks the recipient can see in the app. Not all of them: a team lead sees
- * only the projects they own, manage or are on the team of (canSeeTask), and the snapshot
- * itself is not narrowed by row-level security.
+ * The people's work in the organization that the recipient can see in the app. Not all of it:
+ * besides admins, a manager or team lead sees only their own tasks and those of the people they
+ * manage (canSeeTask), and the snapshot itself is not narrowed by row-level security. A group's
+ * parent is no one's work, so it is never listed or counted; each member's part (a child) is.
  */
 const visibleOrgTasks = (args: DigestArgs, org: SnapshotOrganization) =>
-  (args.index.tasksByOrg.get(org.id) ?? []).filter((task) =>
-    canSeeTask(args.index, args.userId, task),
+  (args.index.tasksByOrg.get(org.id) ?? []).filter(
+    (task) => !isGroupParent(args.index, task) && canSeeTask(args.index, args.userId, task),
   );
 
 function dailyManagementBuckets(args: DigestArgs, org: SnapshotOrganization) {
@@ -494,7 +497,12 @@ function progressOf(count: SnapshotProjectCount | undefined): ProjectProgress {
   ]);
 }
 
-function projectHealthRows(args: DigestArgs, day: OrgDay, tasks: SnapshotTask[]) {
+/**
+ * `units` is every unit of work in the organization (workUnits: a group once, as its parent),
+ * not only what the recipient can see: a project's health, like its progress from projectCounts,
+ * is the project's own and reads the same to everyone who may open it.
+ */
+function projectHealthRows(args: DigestArgs, day: OrgDay, units: SnapshotTask[]) {
   return args.index.snapshot.projects
     .filter((project) => project.organizationId === day.org.id)
     .filter((project) => !CLOSED_PROJECT_STATUSES.has(project.status))
@@ -507,9 +515,8 @@ function projectHealthRows(args: DigestArgs, day: OrgDay, tasks: SnapshotTask[])
         dueDate,
         today: day.today,
         lifecycle: project.status,
-        // Every open task is in the snapshot, and whoever may see a project sees all of its
-        // tasks, so this count is complete.
-        overdueTasks: tasks.filter((task) => task.projectId === project.id && isOverdue(day, task))
+        // Every open task is in the snapshot, so this count is complete.
+        overdueTasks: units.filter((task) => task.projectId === project.id && isOverdue(day, task))
           .length,
       });
       return { project, progress, health, dueDate };
@@ -554,7 +561,8 @@ function weeklyManagementBuckets(args: DigestArgs, org: SnapshotOrganization) {
   const period = periodOf(day);
   const tasks = visibleOrgTasks(args, org);
   const open = tasks.filter(isOpenTask).sort(byDue(day));
-  const projects = projectHealthRows(args, day, tasks);
+  const units = workUnits(args.index.tasksByOrg.get(org.id) ?? []);
+  const projects = projectHealthRows(args, day, units);
   const attentionOf = (task: SnapshotTask) =>
     isOverdue(day, task)
       ? "Overdue"

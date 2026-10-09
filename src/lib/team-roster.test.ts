@@ -10,11 +10,12 @@ import {
   departmentOptions,
   buildScopedRoster,
   filterRoster,
+  isPartialRoster,
   rosterScopes,
-  teamOrganizationIds,
   type RosterUser,
   type WorkloadTask,
 } from "./team-roster";
+import { indexManagement, type ManagementData } from "./task-permissions";
 
 const ORG = "org-upcarrera";
 const OTHER_ORG = "org-other";
@@ -58,39 +59,6 @@ const task = (
   assigneeId,
   status,
   assignee: { name, initials: name.slice(0, 2).toUpperCase(), color: `c-${assigneeId}` },
-});
-
-describe("teamOrganizationIds", () => {
-  test("admin, manager and team lead manage their organization", () => {
-    for (const privilege of ["admin", "manager", "team_lead"]) {
-      expect(
-        teamOrganizationIds(
-          person("me", "Me", { memberships: [{ orgId: ORG, status: "active", privilege }] }),
-        ),
-      ).toEqual([ORG]);
-    }
-  });
-
-  test("employees, viewers and unknown privileges get no roster", () => {
-    expect(teamOrganizationIds(dan)).toEqual([]);
-    expect(
-      teamOrganizationIds(
-        person("v", "V", { memberships: [{ orgId: ORG, status: "active", privilege: "viewer" }] }),
-      ),
-    ).toEqual([]);
-    expect(teamOrganizationIds(null)).toEqual([]);
-  });
-
-  test("an inactive membership does not count, and only managed organizations are returned", () => {
-    const viewer = person("me", "Me", {
-      memberships: [
-        { orgId: ORG, status: "inactive", privilege: "manager" },
-        { orgId: OTHER_ORG, status: "active", privilege: "team_lead" },
-        { orgId: "org-third", status: "active", privilege: "employee" },
-      ],
-    });
-    expect(teamOrganizationIds(viewer)).toEqual([OTHER_ORG]);
-  });
 });
 
 describe("buildRoster", () => {
@@ -257,50 +225,91 @@ describe("filter options", () => {
   });
 });
 
-describe("team lead scope (projects are open only to their people)", () => {
+
+describe("roster scope (9 Oct: admins see the organization, others the people they manage)", () => {
   const COORDINATORS = "team-coordinators";
+  const sharon = person("sharon", "Sharon Admin", {
+    memberships: [{ orgId: ORG, status: "active", privilege: "admin" }],
+  });
   const karthika = person("karthika", "Karthika Lead", {
     memberships: [{ orgId: ORG, status: "active", privilege: "team_lead", departmentId: SALES, teamId: COORDINATORS }],
   });
-  const onTeam = person("riya", "Riya Coordinator", {
+  const riya = person("riya", "Riya Coordinator", {
     memberships: [{ orgId: ORG, status: "active", departmentId: SALES, teamId: COORDINATORS }],
   });
-  const leadNoTeam = person("lena", "Lena Lead", {
-    memberships: [{ orgId: ORG, status: "active", privilege: "team_lead", departmentId: SALES }],
+  const ravi = person("ravi", "Ravi Reports", {
+    memberships: [{ orgId: ORG, status: "active", departmentId: ADMISSIONS, reportingManagerId: "edwin" }],
   });
-  const everyone = [...users, karthika, onTeam, leadNoTeam];
+  const naji = person("naji", "Naji Head", {
+    memberships: [{ orgId: ORG, status: "active", departmentId: ADMISSIONS }],
+  });
+  const everyone = [...users, sharon, karthika, riya, ravi, naji];
+  const linksOf = (list: RosterUser[]): ManagementData => ({
+    memberships: list.flatMap((user) =>
+      user.memberships.map((m) => ({
+        userId: user.id,
+        orgId: m.orgId,
+        status: m.status,
+        departmentId: m.departmentId,
+        teamId: m.teamId,
+        reportingManagerId: m.reportingManagerId,
+      })),
+    ),
+    departmentHeads: [
+      { id: ADMISSIONS, orgId: ORG, leadId: "naji" },
+      { id: SALES, orgId: ORG, leadId: null },
+    ],
+    teamLeads: [{ id: COORDINATORS, orgId: ORG, leadId: "karthika" }],
+  });
+  const management = indexManagement(linksOf(everyone));
+  const rosterIds = (viewer: RosterUser) =>
+    buildScopedRoster(everyone, rosterScopes(viewer, management), departmentNames, avatarFor).map((m) => m.id);
 
-  test("an admin or manager covers the whole organization", () => {
-    expect(rosterScopes(edwin)).toEqual([{ orgId: ORG, whole: true }]);
-    expect(buildScopedRoster(everyone, rosterScopes(edwin), departmentNames, avatarFor).length).toBe(everyone.length);
+  test("an admin covers the whole organization", () => {
+    expect(rosterScopes(sharon, management)).toEqual([{ orgId: ORG, whole: true }]);
+    expect(rosterIds(sharon)).toHaveLength(everyone.length);
+    expect(isPartialRoster(rosterScopes(sharon, management))).toBe(false);
   });
 
-  test("a team lead covers their own team, not the organization", () => {
-    expect(rosterScopes(karthika)).toEqual([{ orgId: ORG, whole: false, teamId: COORDINATORS }]);
-    expect(buildScopedRoster(everyone, rosterScopes(karthika), departmentNames, avatarFor).map((m) => m.id)).toEqual([
-      "karthika",
-      "riya",
-    ]);
+  test("a manager who is not an admin covers only the people who report to them, and themselves", () => {
+    // Edwin holds the manager permission but no longer sees the whole organization.
+    expect(rosterIds(edwin)).toEqual(["edwin", "ravi"]);
+    expect(isPartialRoster(rosterScopes(edwin, management))).toBe(true);
   });
 
-  test("a team lead without a team covers their department", () => {
-    expect(rosterScopes(leadNoTeam)).toEqual([{ orgId: ORG, whole: false, departmentId: SALES }]);
-    const ids = buildScopedRoster(everyone, rosterScopes(leadNoTeam), departmentNames, avatarFor).map((m) => m.id);
-    expect(ids).toContain("dan");
-    expect(ids).toContain("riya");
-    expect(ids).not.toContain("asha");
-    expect(ids).not.toContain("bea");
+  test("a team lead covers their team", () => {
+    expect(rosterIds(karthika)).toEqual(["karthika", "riya"]);
   });
 
-  test("an employee has no scope", () => {
-    expect(rosterScopes(dan)).toEqual([]);
-    expect(buildScopedRoster(everyone, rosterScopes(dan), departmentNames, avatarFor)).toEqual([]);
+  test("a department head covers their department", () => {
+    expect(rosterIds(naji)).toEqual(["asha", "naji", "ravi"]);
+  });
+
+  test("someone who manages nobody sees only themselves", () => {
+    expect(rosterScopes(dan, management)).toEqual([{ orgId: ORG, whole: false, personIds: ["dan"] }]);
+    expect(rosterIds(dan)).toEqual(["dan"]);
   });
 
   test("an inactive membership gives no scope", () => {
-    const off = person("off", "Off Lead", {
-      memberships: [{ orgId: ORG, status: "inactive", privilege: "manager" }],
+    const off = person("off", "Off Admin", {
+      memberships: [{ orgId: ORG, status: "inactive", privilege: "admin" }],
     });
-    expect(rosterScopes(off)).toEqual([]);
+    expect(rosterScopes(off, management)).toEqual([]);
+    expect(rosterScopes(null, management)).toEqual([]);
+    expect(isPartialRoster([])).toBe(false);
+  });
+
+  test("admin in one organization and not in another: whole there, managed people here", () => {
+    const both = person("both", "Both Orgs", {
+      memberships: [
+        { orgId: OTHER_ORG, status: "active", privilege: "admin" },
+        { orgId: ORG, status: "active", privilege: "employee" },
+      ],
+    });
+    expect(rosterScopes(both, management)).toEqual([
+      { orgId: OTHER_ORG, whole: true },
+      { orgId: ORG, whole: false, personIds: ["both"] },
+    ]);
+    expect(isPartialRoster(rosterScopes(both, management))).toBe(true);
   });
 });

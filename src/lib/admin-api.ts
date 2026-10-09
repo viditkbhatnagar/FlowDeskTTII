@@ -28,7 +28,13 @@ import type {
   Role,
   Team,
 } from "@/lib/organizations-data";
-import { projectHealth, projectProgress, type ProjectHealth } from "@/lib/project-metrics";
+import {
+  projectHealth,
+  projectProgress,
+  unitIsOverdue,
+  type ProjectHealth,
+  type ProjectUnit,
+} from "@/lib/project-metrics";
 import { personRef, type PersonRef } from "@/lib/task-api";
 import { todayIn } from "@/lib/today";
 
@@ -788,10 +794,21 @@ export const riskFor = (health: ProjectHealth): LoadedProject["risk"] =>
   health === "delayed" ? "high" : health === "at-risk" ? "medium" : "low";
 
 /**
+ * A project's units of work (every task, a group task once) for anyone who may
+ * open it, with no titles or people. Null when the read fails.
+ */
+export async function loadProjectUnits(projectId: string): Promise<ProjectUnit[] | null> {
+  const { data, error } = await supabase.rpc("project_task_units", { p_project_id: projectId });
+  return error ? fail("loadProjectUnits", error) : (data ?? []);
+}
+
+/**
  * Load projects with their real progress.
  *
  * Progress, health and pendingTasks are derived from work_tasks rather than
  * stored, so they cannot drift from the board the way a cached column would.
+ * The rows come from project_task_units: the whole project, a group task
+ * counted once, the same for everyone who may open the project.
  * Both go through project-metrics.ts, the same functions every other screen
  * uses, with "today" in the project's organization timezone (FD-014, FD-056).
  */
@@ -799,7 +816,9 @@ export async function loadProjects(): Promise<LoadedProject[] | null> {
   const [projectRows, taskRows, profileRows, categoryRows, memberRows, orgRows, departmentRows, teamRows] =
     await Promise.all([
       supabase.from("work_projects").select("*").is("archived_at", null).order("created_at"),
-      supabase.from("work_tasks").select("id, project_id, status, due_date, due_at").is("archived_at", null),
+      // Every task in the project, a group task once, whoever looks: a member
+      // may read only some of them, and progress must not differ by viewer.
+      supabase.rpc("project_task_units", {}),
       supabase.from("profiles").select("user_id, full_name, username"),
       supabase.from("project_categories").select("id, name"),
       supabase.from("project_members").select("project_id, user_id"),
@@ -832,11 +851,7 @@ export async function loadProjects(): Promise<LoadedProject[] | null> {
     const today = todayFor(row.organization_id);
     const mine = (taskRows.data ?? []).filter((t) => t.project_id === row.id);
     const progress = projectProgress(mine);
-    const overdueTasks = mine.filter((t) => {
-      if (t.status === "done" || t.status === "cancelled") return false;
-      const due = t.due_date ?? t.due_at?.slice(0, 10);
-      return Boolean(due && due < today);
-    }).length;
+    const overdueTasks = mine.filter((t) => unitIsOverdue(t, today)).length;
     const due = row.due_date ?? "";
     const health = projectHealth({
       progress,

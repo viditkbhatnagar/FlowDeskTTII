@@ -1,32 +1,38 @@
 import { useEffect, useRef, useState } from "react";
-import { ExternalLink, Loader2, Paperclip, Trash2, Upload } from "lucide-react";
+import { Loader2, Paperclip, Upload } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import type { LinkInput } from "@/lib/links";
 import {
+  addTaskLink,
   deleteStoredFile,
   FILE_RULES,
-  fileUrl,
-  formatBytes,
   listTaskFiles,
   uploadTaskFiles,
   type StoredFile,
 } from "@/lib/task-api";
 import { useWorkspace, type WorkspaceTask } from "@/lib/workspace-data";
+import { AddLinkButton } from "../files/AddLinkButton";
+import { FileOrLinkItem } from "../files/FileOrLinkItem";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { DrawerSection, SectionState } from "./shared";
-import { fullTime, timeAgo, useTaskResource } from "./utils";
+import { useTaskResource } from "./utils";
 
 /**
- * Files saved on the task, from storage. The old modal listed the same three
- * made-up files everywhere (FD-005), files attached at creation vanished
- * (FD-058), and nothing showed a size or let you remove one (FD-070).
+ * Files saved on the task, from storage, and links to documents kept elsewhere
+ * (SharePoint and the like). The old modal listed the same three made-up files
+ * everywhere (FD-005), files attached at creation vanished (FD-058), and
+ * nothing showed a size or let you remove one (FD-070).
  */
 export function TaskAttachments({
   task,
   onChanged,
+  canManageFiles = false,
 }: {
   task: WorkspaceTask;
   onChanged: () => void;
+  /** May remove other people's files and links, as private.can_manage_task allows. */
+  canManageFiles?: boolean;
 }) {
   const { updateTask } = useWorkspace();
   const files = useTaskResource(() => listTaskFiles(task.id), task.id);
@@ -70,22 +76,17 @@ export function TaskAttachments({
     }
   };
 
-  const open = async (file: StoredFile) => {
-    // Open the tab synchronously so the popup blocker allows it, then point it
-    // at the signed link once we have it.
-    const tab = window.open("", "_blank");
-    const url = await fileUrl(file);
-    if (!url) {
-      tab?.close();
-      toast.error(`${file.name} could not be opened.`);
-      return;
+  const addLink = async (link: LinkInput): Promise<boolean> => {
+    const result = await addTaskLink({ id: task.id }, link);
+    if (!result.ok) {
+      toast.error(result.error);
+      return false;
     }
-    if (tab) {
-      tab.opener = null;
-      tab.location.href = url;
-    } else {
-      window.location.assign(url);
-    }
+    if (files.data) files.update((current) => [...current, result.link]);
+    else files.reload();
+    onChanged();
+    toast.success("Link added");
+    return true;
   };
 
   const remove = async (file: StoredFile): Promise<boolean> => {
@@ -105,7 +106,8 @@ export function TaskAttachments({
       title="Attachments"
       icon={Paperclip}
       action={
-        <>
+        <div className="flex items-center gap-1.5">
+          <AddLinkButton onAdd={addLink} />
           <Button
             type="button"
             variant="outline"
@@ -135,53 +137,17 @@ export function TaskAttachments({
               void upload(picked);
             }}
           />
-        </>
+        </div>
       }
     >
       <div className="space-y-2">
         {files.status === "ready" && files.data?.length ? (
           files.data.map((file) => (
-            <div
+            <FileOrLinkItem
               key={file.id}
-              className="flex items-center gap-2 rounded-md border border-border px-3 py-2 text-sm"
-            >
-              <Paperclip className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-              <div className="min-w-0 flex-1">
-                <div className="truncate font-medium" title={file.name}>
-                  {file.name}
-                </div>
-                <div className="truncate text-[11px] text-muted-foreground">
-                  {formatBytes(file.size)} · {file.uploadedBy.name} ·{" "}
-                  <time dateTime={file.createdAt} title={fullTime(file.createdAt)}>
-                    {timeAgo(file.createdAt)}
-                  </time>
-                </div>
-              </div>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7 shrink-0 text-muted-foreground"
-                aria-label={`Open ${file.name}`}
-                title="Open"
-                onClick={() => void open(file)}
-              >
-                <ExternalLink className="h-3.5 w-3.5" />
-              </Button>
-              {file.isMine && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  className="h-7 w-7 shrink-0 text-muted-foreground hover:text-destructive"
-                  aria-label={`Remove ${file.name}`}
-                  title="Remove"
-                  onClick={() => setRemoving(file)}
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                </Button>
-              )}
-            </div>
+              file={file}
+              onRemove={file.isMine || canManageFiles ? setRemoving : undefined}
+            />
           ))
         ) : (
           <SectionState
@@ -192,16 +158,22 @@ export function TaskAttachments({
             onRetry={files.reload}
           />
         )}
-        <p className="text-[11px] text-muted-foreground">{FILE_RULES.label}.</p>
+        <p className="text-[11px] text-muted-foreground">
+          {FILE_RULES.label}. Or add a link to a document kept elsewhere, like SharePoint.
+        </p>
       </div>
       <ConfirmDialog
         open={Boolean(removing)}
         onOpenChange={(next) => !next && setRemoving(null)}
-        title="Remove this file?"
+        title={removing?.kind === "link" ? "Remove this link?" : "Remove this file?"}
         description={
-          removing ? `${removing.name} will be deleted from this task for everyone.` : ""
+          !removing
+            ? ""
+            : removing.kind === "link"
+              ? `${removing.name} will be removed from this task for everyone. The document it points to is not changed.`
+              : `${removing.name} will be deleted from this task for everyone.`
         }
-        confirmLabel="Remove file"
+        confirmLabel={removing?.kind === "link" ? "Remove link" : "Remove file"}
         onConfirm={() => (removing ? remove(removing) : Promise.resolve(true))}
       />
     </DrawerSection>

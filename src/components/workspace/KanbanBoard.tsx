@@ -1,6 +1,8 @@
 import { useState } from "react";
 import type { Status } from "@/lib/mock-data";
 import { useWorkspace } from "@/lib/workspace-data";
+import { foldGroups } from "@/lib/task-groups";
+import { useTaskAccess } from "@/lib/use-task-access";
 import { TaskCard } from "./TaskCard";
 import { Plus } from "lucide-react";
 
@@ -12,16 +14,21 @@ const columns: { id: Status; label: string; dot: string }[] = [
 ];
 
 export function KanbanBoard() {
-  const { tasks: items, updateTask } = useWorkspace();
+  const { tasks: visible, updateTask } = useWorkspace();
+  const { permissionsFor } = useTaskAccess();
+  // A group task is one card, not one per person (spec of 9 Oct, section E).
+  const items = foldGroups(visible);
   const [dragId, setDragId] = useState<string | null>(null);
 
   const drop = (status: Status) => {
-    if (!dragId) return;
-    updateTask(dragId, {
-      status,
-      progress: status === "done" ? 100 : items.find((task) => task.id === dragId)?.progress,
-    });
+    const dragged = items.find((task) => task.id === dragId);
     setDragId(null);
+    // Only people allowed to move a task can (spec B); a group follows its people.
+    if (!dragged || !permissionsFor(dragged).canMove) return;
+    updateTask(dragged.id, {
+      status,
+      progress: status === "done" ? 100 : dragged.progress,
+    });
   };
 
   return (
@@ -51,9 +58,17 @@ export function KanbanBoard() {
             </div>
 
             <div className="flex flex-col gap-2 flex-1">
-              {colTasks.map((task) => (
-                <TaskCard key={task.id} task={task} onDragStart={() => setDragId(task.id)} />
-              ))}
+              {colTasks.map((task) => {
+                const canMove = permissionsFor(task).canMove;
+                return (
+                  <TaskCard
+                    key={task.id}
+                    task={task}
+                    draggable={canMove}
+                    onDragStart={canMove ? () => setDragId(task.id) : undefined}
+                  />
+                );
+              })}
               {colTasks.length === 0 && (
                 <div className="flex-1 rounded-lg border border-dashed border-border/70 flex items-center justify-center text-[11px] text-muted-foreground py-8">
                   Drop tasks here

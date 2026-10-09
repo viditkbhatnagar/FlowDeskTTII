@@ -11,6 +11,7 @@ import {
   PROJECT,
   allKinds,
   baseSnapshot,
+  groupTask,
   membership,
   org,
   person,
@@ -239,6 +240,32 @@ describe("due-date reminders", () => {
   });
 });
 
+describe("group tasks", () => {
+  test("each member is reminded and alerted about their own part, never about the group", () => {
+    const group = (dueDate: string) =>
+      groupTask({ dueDate, createdBy: ADMIN }, [{ assigneeId: MAYA }, { assigneeId: DAN }]);
+    const [soon, mayasSoon, dansSoon] = group("2026-09-28");
+    const [late, mayasLate, dansLate] = group("2026-09-24");
+    const rows = planScheduledEmails(
+      baseSnapshot({ tasks: [soon, mayasSoon, dansSoon, late, mayasLate, dansLate] }),
+      FRI,
+    );
+    const taskRows = rows.filter(
+      (row) => row.kind === "due_reminder" || row.kind === "overdue_alert",
+    );
+    expect(taskRows.map((row) => [row.kind, row.recipientUserId, row.taskId]).sort()).toEqual(
+      [
+        ["due_reminder", MAYA, mayasSoon.id],
+        ["due_reminder", DAN, dansSoon.id],
+        ["overdue_alert", MAYA, mayasLate.id],
+        ["overdue_alert", DAN, dansLate.id],
+      ].sort(),
+    );
+    expect(rows.map((row) => row.taskId)).not.toContain(soon.id);
+    expect(rows.map((row) => row.taskId)).not.toContain(late.id);
+  });
+});
+
 describe("overdue alerts", () => {
   test("Monday alerts about what fell due Friday, Saturday and Sunday", () => {
     const due = ["2026-09-24", "2026-09-25", "2026-09-26", "2026-09-27", "2026-09-28"];
@@ -420,6 +447,7 @@ describe("management summaries", () => {
     task({
       organizationId: KOLKATA,
       assigneeId: null,
+      createdBy: LEAD,
       dueDate: "2026-09-25",
       title: "TTI unassigned",
     }),

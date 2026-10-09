@@ -12,6 +12,7 @@
  * comment to the wrong person the way the old "Alex Morgan · now" did.
  */
 import { supabase } from "@/integrations/supabase/client";
+import { parseLinkInput, safeHref, type LinkInput } from "@/lib/links";
 
 /* ------------------------------------------------------------------ */
 /* People                                                              */
@@ -131,6 +132,14 @@ const statusWords: Record<string, string> = {
   planning: "Planning", active: "Active", on_hold: "On Hold", completed: "Completed", archived: "Archived",
 };
 
+/** The attachment and document triggers record details.kind = 'link' for a link. */
+const isLinkActivity = (details: Record<string, unknown>) => details.kind === "link";
+
+const addedLink = (details: Record<string, unknown>) => {
+  const name = typeof details.file_name === "string" ? details.file_name.trim() : "";
+  return name ? `added a link: ${name}` : "added a link";
+};
+
 /**
  * One human sentence per activity row, e.g. "moved this task to In Progress".
  *
@@ -161,13 +170,19 @@ export function describeActivity(
       return parts.length ? `edited ${parts.join(", ")}` : "edited this task";
     }
     case "task_commented": return "commented";
-    case "task_file_attached": return `attached ${(d as { file_name?: string }).file_name ?? "a file"}`;
+    case "task_file_attached":
+      return isLinkActivity(d)
+        ? addedLink(d)
+        : `attached ${(d as { file_name?: string }).file_name ?? "a file"}`;
     case "task_archived": return "deleted this task";
     case "project_updated": {
       const status = (d as { status?: { to?: string } }).status?.to;
       return status ? `moved the project to ${statusWords[status] ?? status}` : "edited the project";
     }
-    case "project_document_added": return `uploaded ${(d as { file_name?: string }).file_name ?? "a document"}`;
+    case "project_document_added":
+      return isLinkActivity(d)
+        ? addedLink(d)
+        : `uploaded ${(d as { file_name?: string }).file_name ?? "a document"}`;
     case "milestone_completed": return "completed a milestone";
     default: return entry.type.replace(/_/g, " ");
   }
@@ -247,26 +262,52 @@ export function validateFile(file: File): string | null {
   return null;
 }
 
-export function formatBytes(bytes: number): string {
+/** "1.2 MB". A link has no size and shows "—". */
+export function formatBytes(bytes: number | null | undefined): string {
+  if (bytes === null || bytes === undefined) return "—";
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-export interface StoredFile {
+interface StoredItemBase {
   id: string;
+  /** The file's name, or the name a link is listed under. */
   name: string;
-  size: number;
-  mimeType: string;
-  path: string;
+  /** Which list it is in: a task's attachments or a project's documents. */
   bucket: "task-attachments" | "project-documents";
   uploadedBy: PersonRef;
   createdAt: string;
   isMine: boolean;
 }
 
+/** A file uploaded to a private storage bucket. */
+export interface StoredUpload extends StoredItemBase {
+  kind: "file";
+  size: number;
+  mimeType: string;
+  path: string;
+  url: null;
+}
+
+/**
+ * A link to a document kept elsewhere (SharePoint, OneDrive, Google Docs), so
+ * people edit it in place. No size, no storage object, nothing to download:
+ * it opens in a new tab. Put `url` through safeHref() before using it.
+ */
+export interface StoredLink extends StoredItemBase {
+  kind: "link";
+  url: string;
+  size: null;
+  mimeType: null;
+  path: null;
+}
+
+/** One row of task_attachments or project_documents: a file or a link. */
+export type StoredFile = StoredUpload | StoredLink;
+
 export interface UploadResult {
-  uploaded: StoredFile[];
+  uploaded: StoredUpload[];
   rejected: { name: string; reason: string }[];
 }
 
@@ -308,10 +349,12 @@ async function uploadFiles(
     }
     result.uploaded.push({
       id: row.id,
+      kind: "file",
       name: file.name,
       size: file.size,
       mimeType: file.type,
       path,
+      url: null,
       bucket,
       uploadedBy: me.get(auth.user?.id ?? "") ?? personRef(auth.user?.id, null),
       createdAt: row.created_at,
@@ -350,33 +393,71 @@ export function uploadProjectDocuments(project: { id: string; organizationId: st
   });
 }
 
-async function mapFiles(
+/** The columns task_attachments and project_documents share. */
+interface StoredRow {
+  id: string;
+  file_name: string;
+  file_size: number | null;
+  mime_type: string | null;
+  storage_path: string | null;
+  link_url: string | null;
+  uploaded_by: string;
+  created_at: string;
+}
+
+function toStoredFile(
   bucket: StoredFile["bucket"],
-  rows: { id: string; file_name: string; file_size: number; mime_type: string; storage_path: string; uploaded_by: string; created_at: string }[],
-): Promise<StoredFile[]> {
+  row: StoredRow,
+  uploadedBy: PersonRef,
+  isMine: boolean,
+): StoredFile | null {
+  const base = {
+    id: row.id,
+    name: row.file_name,
+    bucket,
+    uploadedBy,
+    createdAt: row.created_at,
+    isMine,
+  };
+  if (row.link_url !== null) {
+    return { ...base, kind: "link", url: row.link_url, size: null, mimeType: null, path: null };
+  }
+  // The table CHECK makes every row a file or a link; anything else is skipped.
+  if (row.storage_path === null) return null;
+  return {
+    ...base,
+    kind: "file",
+    size: row.file_size ?? 0,
+    mimeType: row.mime_type ?? "",
+    path: row.storage_path,
+    url: null,
+  };
+}
+
+async function mapFiles(bucket: StoredFile["bucket"], rows: StoredRow[]): Promise<StoredFile[]> {
   const [{ data: auth }, people] = await Promise.all([
     supabase.auth.getUser(),
     peopleById(rows.map((r) => r.uploaded_by)),
   ]);
-  return rows.map((r) => ({
-    id: r.id,
-    name: r.file_name,
-    size: r.file_size,
-    mimeType: r.mime_type,
-    path: r.storage_path,
-    bucket,
-    uploadedBy: people.get(r.uploaded_by) ?? personRef(r.uploaded_by, null),
-    createdAt: r.created_at,
-    isMine: r.uploaded_by === auth.user?.id,
-  }));
+  return rows.flatMap((r) => {
+    const item = toStoredFile(
+      bucket,
+      r,
+      people.get(r.uploaded_by) ?? personRef(r.uploaded_by, null),
+      r.uploaded_by === auth.user?.id,
+    );
+    return item ? [item] : [];
+  });
 }
 
+/** Files and links on a task, oldest first. */
 export async function listTaskFiles(taskId: string): Promise<StoredFile[] | null> {
   const { data, error } = await supabase.from("task_attachments").select("*").eq("task_id", taskId).order("created_at");
   if (error) return fail("listTaskFiles", error);
   return mapFiles("task-attachments", data ?? []);
 }
 
+/** Files and links on a project, newest first. */
 export async function listProjectDocuments(projectId: string): Promise<StoredFile[] | null> {
   const { data, error } = await supabase
     .from("project_documents")
@@ -387,17 +468,118 @@ export async function listProjectDocuments(projectId: string): Promise<StoredFil
   return mapFiles("project-documents", data ?? []);
 }
 
+/* ------------------------------------------------------------------ */
+/* Links                                                               */
+/* ------------------------------------------------------------------ */
+
+export type AddLinkResult = { ok: true; link: StoredLink } | { ok: false; error: string };
+
+export interface AddLinksResult {
+  added: StoredLink[];
+  /** `reason` completes "<name> …", like UploadResult.rejected. */
+  rejected: { name: string; reason: string }[];
+}
+
+const LINK_NOT_SAVED = "The link could not be saved. Please try again.";
+
+/**
+ * Check a link the same way the Add link form does, insert it, and return it
+ * as a StoredLink. `insert` returns the new row, or null after logging why not.
+ */
+async function addLink(
+  bucket: StoredFile["bucket"],
+  input: LinkInput,
+  insert: (link: LinkInput) => Promise<StoredRow | null>,
+): Promise<AddLinkResult> {
+  const parsed = parseLinkInput(input);
+  if (!parsed.ok) {
+    return { ok: false, error: parsed.errors.url ?? parsed.errors.name ?? LINK_NOT_SAVED };
+  }
+  const row = await insert(parsed.link);
+  if (!row) return { ok: false, error: LINK_NOT_SAVED };
+  const [stored] = await mapFiles(bucket, [row]);
+  return stored?.kind === "link"
+    ? { ok: true, link: stored }
+    : { ok: false, error: LINK_NOT_SAVED };
+}
+
+/** Add a link to a task's attachments. uploaded_by is filled from the session. */
+export function addTaskLink(task: { id: string }, link: LinkInput): Promise<AddLinkResult> {
+  return addLink("task-attachments", link, async ({ url, name }) => {
+    const { data, error } = await supabase
+      .from("task_attachments")
+      .insert({ task_id: task.id, file_name: name, link_url: url })
+      .select("*")
+      .single();
+    return error ? fail("record task link", error) : data;
+  });
+}
+
+/** Add a link to a project's documents. uploaded_by is filled from the session. */
+export function addProjectLink(
+  project: { id: string; organizationId: string },
+  link: LinkInput,
+): Promise<AddLinkResult> {
+  return addLink("project-documents", link, async ({ url, name }) => {
+    const { data, error } = await supabase
+      .from("project_documents")
+      .insert({
+        project_id: project.id,
+        organization_id: project.organizationId,
+        file_name: name,
+        link_url: url,
+      })
+      .select("*")
+      .single();
+    return error ? fail("record project link", error) : data;
+  });
+}
+
+async function addEach(
+  links: LinkInput[],
+  add: (link: LinkInput) => Promise<AddLinkResult>,
+): Promise<AddLinksResult> {
+  const result: AddLinksResult = { added: [], rejected: [] };
+  // One at a time, so they are listed in the order they were added.
+  for (const link of links) {
+    const outcome = await add(link);
+    if (outcome.ok) result.added.push(outcome.link);
+    else result.rejected.push({ name: link.name || link.url, reason: "could not be saved" });
+  }
+  return result;
+}
+
+/** Save links picked in a form once the task exists, the way uploadTaskFiles saves files. */
+export function addTaskLinks(task: { id: string }, links: LinkInput[]): Promise<AddLinksResult> {
+  return addEach(links, (link) => addTaskLink(task, link));
+}
+
+/** Save links picked in a form once the project exists, the way uploadProjectDocuments saves files. */
+export function addProjectLinks(
+  project: { id: string; organizationId: string },
+  links: LinkInput[],
+): Promise<AddLinksResult> {
+  return addEach(links, (link) => addProjectLink(project, link));
+}
+
+/** Remove a file or a link. A link is only its row; a file also loses its storage object. */
 export async function deleteStoredFile(file: StoredFile): Promise<boolean> {
   const table = file.bucket === "task-attachments" ? "task_attachments" : "project_documents";
   const { error } = await supabase.from(table).delete().eq("id", file.id);
   if (error) return Boolean(fail("delete file row", error));
+  if (file.kind === "link") return true;
   const { error: storageError } = await supabase.storage.from(file.bucket).remove([file.path]);
   if (storageError) fail("delete file object", storageError);
   return true;
 }
 
-/** A short-lived link to open or download a private file. */
+/**
+ * Where to send the browser: a short-lived signed link to open or download a
+ * private file, or the link itself for a link (null if it is not a safe web
+ * link). A link has nothing to download — open it in a new tab instead.
+ */
 export async function fileUrl(file: StoredFile, download = false): Promise<string | null> {
+  if (file.kind === "link") return safeHref(file.url);
   const { data, error } = await supabase.storage
     .from(file.bucket)
     .createSignedUrl(file.path, 60 * 10, download ? { download: file.name } : undefined);

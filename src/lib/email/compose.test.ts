@@ -14,6 +14,7 @@ import {
   allKinds,
   baseSnapshot,
   claimed,
+  groupTask,
   membership,
   org,
   person,
@@ -423,6 +424,35 @@ describe("task_assigned", () => {
   });
 });
 
+describe("group tasks", () => {
+  const [parent, mayasPart, dansPart] = groupTask(
+    { title: "Open day stand", dueDate: "2026-09-28", createdBy: ADMIN },
+    [{ assigneeId: MAYA }, { assigneeId: DAN }],
+  );
+  const snapshot = baseSnapshot({ tasks: [parent, mayasPart, dansPart] });
+
+  test("each member hears about their own part, as for any task", () => {
+    for (const kind of ["task_assigned", "due_reminder"] as const) {
+      const row = claimed({ kind, taskId: mayasPart.id, payload: { due: "2026-09-28" } });
+      expect(sent(compose(row, snapshot)).html).toContain(`?task=${mayasPart.id}`);
+    }
+  });
+
+  test("the group itself is nobody's to be emailed about", () => {
+    for (const kind of ["task_assigned", "due_reminder", "overdue_alert"] as const) {
+      for (const recipientUserId of [MAYA, ADMIN]) {
+        const row = claimed({
+          kind,
+          recipientUserId,
+          taskId: parent.id,
+          payload: { due: "2026-09-28" },
+        });
+        expect(reason(compose(row, snapshot))).toBe("task is a group task");
+      }
+    }
+  });
+});
+
 describe("due_reminder and overdue_alert", () => {
   const upcoming = task({ title: "Q3 OKR planning doc", dueDate: "2026-09-28" });
   const reminder = claimed({
@@ -610,6 +640,7 @@ describe("digests and summaries", () => {
         task({
           organizationId: KOLKATA,
           assigneeId: null,
+          createdBy: LEAD,
           dueDate: "2026-09-24",
           title: "TTI unassigned work",
         }),

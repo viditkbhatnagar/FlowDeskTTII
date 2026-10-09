@@ -3,23 +3,25 @@
  *
  * Every people list on Team Tasks used to come from task assignees, so a
  * manager saw "3 with tasks" and had no way to reach anyone with nothing
- * assigned (QA bug 6). Someone who manages an organization — admin, manager or
- * team lead, the people row-level security shows every task in it to — now gets
- * its whole active roster, zero-task members included. Everyone else keeps the
- * assignee-only view: they only see their own tasks, so listing colleagues at
- * zero would say something untrue about their workload.
+ * assigned (QA bug 6). Since 9 Oct a task is visible to the people involved,
+ * the organization's admins and whoever manages its assignee or creator
+ * (spec rule c), and the roster follows the same lines: an admin gets the
+ * organization's whole active roster, zero-task members included; anyone else
+ * gets the people they manage — who report to them, or are in the department
+ * they head or the team they lead — plus themselves.
  *
  * No Supabase imports, so this can be unit-tested with plain data.
  */
+import type { ManagementIndex } from "./task-permissions";
 
 export const NO_DEPARTMENT = "No department";
 /** Assignee filter value for tasks nobody is assigned to. */
 export const UNASSIGNED = "__unassigned";
 /** Open tasks at which someone counts as fully loaded. */
 export const CAPACITY = 10;
-
-/** Mirrors private.has_management_access: these privileges see every task in the organization. */
-const TEAM_PRIVILEGES: ReadonlySet<string> = new Set(["admin", "manager", "team_lead"]);
+/** Shown above the workload when the roster is not a whole organization. */
+export const TEAM_NOTE =
+  "Your team: people who report to you, your department or your team. Counts include only tasks you can see.";
 
 const isOpen = (status: string) => status !== "done" && status !== "cancelled";
 
@@ -27,6 +29,7 @@ export interface RosterMembership {
   orgId: string;
   departmentId?: string;
   teamId?: string;
+  reportingManagerId?: string;
   status: string;
   /** The user_roles privilege, when the viewer can read it (always for their own rows). */
   privilege?: string;
@@ -80,49 +83,42 @@ export interface WorkloadMember extends Avatar {
   availability: "Busy" | "Available" | "Free";
 }
 
-/** The organizations the viewer manages: an active membership with admin, manager or team lead. */
-export function teamOrganizationIds(viewer: RosterUser | null | undefined): string[] {
-  if (!viewer) return [];
-  const ids = viewer.memberships
-    .filter(
-      (m) => m.status === "active" && m.privilege !== undefined && TEAM_PRIVILEGES.has(m.privilege),
-    )
-    .map((m) => m.orgId);
-  return [...new Set(ids)];
-}
-
-/** Admins and managers: row-level security shows them every task in the organization. */
-const OVERSIGHT_PRIVILEGES: ReadonlySet<string> = new Set(["admin", "manager"]);
-
 /**
- * Who the viewer's Team Tasks roster covers in one organization.
- *
- * Since projects are open only to their people (QA bug 4), a team lead no
- * longer sees every task in the organization: only those outside projects and
- * those in projects they are part of. Listing the whole organization would
- * show colleagues whose work sits in other projects as having none, so a team
- * lead's roster is their own team (their department when they have no team),
- * and the page says the counts are of the tasks they can see.
+ * Who the viewer's Team Tasks roster covers in one organization: all of it
+ * for an admin (they see every task there), otherwise the people they manage
+ * and themselves (the tasks they can see are those people's, their own, and
+ * the ones they created, are reviewing or share in a group).
  */
 export interface RosterScope {
   orgId: string;
-  /** The whole organization (admin or manager), rather than a team or department. */
+  /** The whole organization (an admin), rather than the people they manage. */
   whole: boolean;
-  teamId?: string;
-  departmentId?: string;
+  /** When not whole: the people covered, the viewer included. */
+  personIds?: readonly string[];
 }
 
-export function rosterScopes(viewer: RosterUser | null | undefined): RosterScope[] {
+export function rosterScopes(
+  viewer: RosterUser | null | undefined,
+  management: Pick<ManagementIndex, "managedBy">,
+): RosterScope[] {
   if (!viewer) return [];
   const scopes: RosterScope[] = [];
   for (const m of viewer.memberships) {
-    if (m.status !== "active" || m.privilege === undefined || !TEAM_PRIVILEGES.has(m.privilege)) continue;
-    if (OVERSIGHT_PRIVILEGES.has(m.privilege)) scopes.push({ orgId: m.orgId, whole: true });
-    else if (m.teamId) scopes.push({ orgId: m.orgId, whole: false, teamId: m.teamId });
-    else if (m.departmentId) scopes.push({ orgId: m.orgId, whole: false, departmentId: m.departmentId });
+    if (m.status !== "active" || scopes.some((scope) => scope.orgId === m.orgId)) continue;
+    if (m.privilege === "admin") scopes.push({ orgId: m.orgId, whole: true });
+    else
+      scopes.push({
+        orgId: m.orgId,
+        whole: false,
+        personIds: [viewer.id, ...management.managedBy(viewer.id, m.orgId)],
+      });
   }
   return scopes;
 }
+
+/** Whether the roster is less than whole organizations, so the page says whose it is. */
+export const isPartialRoster = (scopes: readonly RosterScope[]): boolean =>
+  scopes.length > 0 && !scopes.every((scope) => scope.whole);
 
 /** Active people with an active membership that falls in one of `scopes`, by name. */
 export function buildScopedRoster(
@@ -132,17 +128,14 @@ export function buildScopedRoster(
   avatarFor: (id: string, name: string) => Avatar,
 ): RosterMember[] {
   if (!scopes.length) return [];
-  const inScope = (m: RosterMembership) =>
+  const inScope = (userId: string, m: RosterMembership) =>
     scopes.some(
       (scope) =>
-        scope.orgId === m.orgId &&
-        (scope.whole ||
-          (scope.teamId !== undefined && m.teamId === scope.teamId) ||
-          (scope.departmentId !== undefined && m.departmentId === scope.departmentId)),
+        scope.orgId === m.orgId && (scope.whole || Boolean(scope.personIds?.includes(userId))),
     );
   const scopedUsers = users.map((user) => ({
     ...user,
-    memberships: user.memberships.filter((m) => m.status === "active" && inScope(m)),
+    memberships: user.memberships.filter((m) => m.status === "active" && inScope(user.id, m)),
   }));
   return buildRoster(scopedUsers, [...new Set(scopes.map((scope) => scope.orgId))], departmentNames, avatarFor);
 }

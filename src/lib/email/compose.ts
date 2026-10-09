@@ -13,6 +13,7 @@ import {
   firstNameOf,
   indexSnapshot,
   isActiveMember,
+  isGroupParent,
   isOpenTask,
   kindEnabledForOrg,
   orgToday,
@@ -120,6 +121,8 @@ function requireOpenTask(env: Env): SnapshotTask {
   const task = env.row.taskId ? env.index.taskById.get(env.row.taskId) : undefined;
   if (!task) return suppress("task no longer exists or is archived");
   if (!isOpenTask(task)) suppress(`task is ${task.status}`);
+  // No one's own work: each member hears about their own part (a child) instead.
+  if (isGroupParent(env.index, task)) suppress("task is a group task");
   if (task.assigneeId !== env.recipient.person.userId) suppress("task was reassigned");
   return task;
 }

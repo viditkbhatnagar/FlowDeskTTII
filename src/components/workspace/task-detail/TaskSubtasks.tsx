@@ -16,11 +16,17 @@ export function TaskSubtasks({
   task,
   onCompleteTask,
   completedLabel,
+  readOnly = false,
+  canComplete = true,
 }: {
   task: WorkspaceTask;
   /** Offered once every subtask is ticked; completing is never automatic. */
   onCompleteTask: () => void;
   completedLabel: string;
+  /** Shown but not changed: the viewer may not change this task (spec B). */
+  readOnly?: boolean;
+  /** Whether "mark task completed" may be offered (the viewer may move it). */
+  canComplete?: boolean;
 }) {
   const { addSubtask, toggleSubtask, removeSubtask } = useWorkspace();
   const [draft, setDraft] = useState("");
@@ -52,11 +58,16 @@ export function TaskSubtasks({
         {total === 0 && <p className="text-sm text-muted-foreground">No subtasks yet.</p>}
         {task.subtasks.map((subtask) => (
           <div key={subtask.id} className="group flex items-center gap-2 text-sm">
-            <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2">
+            <label
+              className={cn(
+                "flex min-w-0 flex-1 items-center gap-2",
+                readOnly ? "cursor-default" : "cursor-pointer",
+              )}
+            >
               <input
                 type="checkbox"
                 checked={subtask.completed}
-                disabled={pending === subtask.id}
+                disabled={readOnly || pending === subtask.id}
                 onChange={() =>
                   void run(subtask.id, () => toggleSubtask(task.id, subtask.id, !subtask.completed))
                 }
@@ -71,18 +82,20 @@ export function TaskSubtasks({
                 {subtask.title}
               </span>
             </label>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="h-7 w-7 shrink-0 text-muted-foreground hover:text-destructive"
-              aria-label={`Remove subtask ${subtask.title}`}
-              title="Remove subtask"
-              disabled={pending === subtask.id}
-              onClick={() => void run(subtask.id, () => removeSubtask(task.id, subtask.id))}
-            >
-              <Trash2 className="h-3.5 w-3.5" />
-            </Button>
+            {!readOnly && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7 shrink-0 text-muted-foreground hover:text-destructive"
+                aria-label={`Remove subtask ${subtask.title}`}
+                title="Remove subtask"
+                disabled={pending === subtask.id}
+                onClick={() => void run(subtask.id, () => removeSubtask(task.id, subtask.id))}
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </Button>
+            )}
           </div>
         ))}
         {total > 0 && (
@@ -90,7 +103,7 @@ export function TaskSubtasks({
             <span>
               {done} of {total} complete
             </span>
-            {done === total && task.status !== "done" && (
+            {done === total && task.status !== "done" && canComplete && (
               <button
                 type="button"
                 onClick={onCompleteTask}
@@ -101,39 +114,41 @@ export function TaskSubtasks({
             )}
           </div>
         )}
-        <div className="flex gap-2 pt-1">
-          <label htmlFor={inputId} className="sr-only">
-            New subtask
-          </label>
-          <Input
-            id={inputId}
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-            onKeyDown={(event) => {
-              // Enter adds, like the + button. Only the button worked before (FD-027).
-              if (event.key === "Enter" && !event.nativeEvent.isComposing) {
-                event.preventDefault();
-                void add();
-              }
-            }}
-            placeholder="Add a subtask"
-            aria-invalid={tooLong || undefined}
-            // Not disabled while saving: that would drop focus between quick Enter-adds.
-            className="h-8 text-sm"
-          />
-          <Button
-            type="button"
-            variant="outline"
-            size="icon"
-            className="h-8 w-8 shrink-0"
-            aria-label="Add subtask"
-            disabled={!draft.trim() || tooLong || adding}
-            onClick={() => void add()}
-          >
-            <Plus className="h-4 w-4" />
-          </Button>
-        </div>
-        {tooLong && (
+        {!readOnly && (
+          <div className="flex gap-2 pt-1">
+            <label htmlFor={inputId} className="sr-only">
+              New subtask
+            </label>
+            <Input
+              id={inputId}
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              onKeyDown={(event) => {
+                // Enter adds, like the + button. Only the button worked before (FD-027).
+                if (event.key === "Enter" && !event.nativeEvent.isComposing) {
+                  event.preventDefault();
+                  void add();
+                }
+              }}
+              placeholder="Add a subtask"
+              aria-invalid={tooLong || undefined}
+              // Not disabled while saving: that would drop focus between quick Enter-adds.
+              className="h-8 text-sm"
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              className="h-8 w-8 shrink-0"
+              aria-label="Add subtask"
+              disabled={!draft.trim() || tooLong || adding}
+              onClick={() => void add()}
+            >
+              <Plus className="h-4 w-4" />
+            </Button>
+          </div>
+        )}
+        {!readOnly && tooLong && (
           <p className="text-xs text-destructive">
             A subtask must be {TASK_LIMITS.subtaskMax} characters or fewer.
           </p>

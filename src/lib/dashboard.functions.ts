@@ -3,7 +3,15 @@ import { z } from "zod";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import type { Database, Json } from "@/integrations/supabase/types";
-import { projectHealth, projectProgress, type ProjectHealth } from "@/lib/project-metrics";
+import {
+  personalWork,
+  projectHealth,
+  projectProgress,
+  unitIsOverdue,
+  workUnits,
+  type ProjectHealth,
+  type ProjectUnit,
+} from "@/lib/project-metrics";
 import { todayIn } from "@/lib/today";
 
 const inputSchema = z.object({
@@ -20,6 +28,8 @@ export type DashboardTask = {
   assignee_id: string | null; reviewer_id: string | null; created_by: string; due_at: string | null; due_date: string | null;
   blocked: boolean; blocked_reason: string | null; progress: number; estimated_hours: number | null; tags: string[];
   created_at: string; completed_at: string | null; updated_at: string; projectName: string;
+  /** Set on a group task's child (one per person); the parent has none and no assignee. */
+  parent_task_id: string | null;
 };
 export type DashboardProject = { id: string; organization_id: string; name: string; status: string; start_date: string | null; due_date: string | null; taskCount: number; complete: number; progress: number; overdue: number; blocked: number; health: ProjectHealth };
 export type DashboardMilestone = { id: string; organization_id: string; project_id: string; title: string; due_at: string | null; due_date: string | null; completed_at: string | null; projectName: string };
@@ -107,7 +117,7 @@ async function loadDashboard(
   // real figure was 3 of 7 (FD-014).
   let tasksQuery = supabase
     .from("work_tasks")
-    .select("id, organization_id, project_id, title, description, status, priority, assignee_id, reviewer_id, created_by, due_at, due_date, blocked, blocked_reason, progress, estimated_hours, tags, created_at, completed_at, updated_at, work_projects(name)")
+    .select("id, organization_id, project_id, parent_task_id, title, description, status, priority, assignee_id, reviewer_id, created_by, due_at, due_date, blocked, blocked_reason, progress, estimated_hours, tags, created_at, completed_at, updated_at, work_projects(name)")
     .is("archived_at", null);
   // Cancelled and archived projects have no health to report.
   let projectsQuery = supabase
@@ -133,14 +143,17 @@ async function loadDashboard(
 
   // Everyone's names are loaded alongside the rest rather than in a third round
   // trip after the tasks arrive — part of why the dashboard took 2-3 s (FD-042).
-  const [tasksResult, projectsResult, milestonesResult, activityResult, peopleResult] = await Promise.all([
+  const [tasksResult, projectsResult, milestonesResult, activityResult, peopleResult, unitsResult] = await Promise.all([
     tasksQuery,
     projectsQuery,
     milestonesQuery,
     activityQuery,
     supabase.from("profiles").select("user_id, full_name, username"),
+    // Every task in each project the user may open, a group task once, with no
+    // titles or people: a member now sees only some of a project's tasks.
+    supabase.rpc("project_task_units", {}),
   ]);
-  for (const result of [tasksResult, projectsResult, milestonesResult, activityResult, peopleResult]) {
+  for (const result of [tasksResult, projectsResult, milestonesResult, activityResult, peopleResult, unitsResult]) {
     if (result.error) throw result.error;
   }
 
@@ -163,20 +176,29 @@ async function loadDashboard(
     ...task,
     projectName: work_projects?.name ?? "No project",
   }));
-  const tasks = scope === "mine" ? visibleTasks.filter((task) => task.assignee_id === userId) : visibleTasks;
+  const counts = dashboardCounts(visibleTasks, scope, userId);
+  const tasks = counts.tasks;
 
   // projectProgress/projectHealth are the only progress and health rules, so the
   // Projects screen and this widget cannot disagree (FD-014), and a project with
-  // every task done reads "Completed", not "On track" (FD-056).
+  // every task done reads "Completed", not "On track" (FD-056). Over the whole
+  // project's units of work (project_task_units, as the Projects screen), so a
+  // task for three people is one task, and the figure is the same whoever looks.
+  const unitsByProject = new Map<string, ProjectUnit[]>();
+  for (const unit of unitsResult.data ?? []) {
+    unitsByProject.set(unit.project_id, [...(unitsByProject.get(unit.project_id) ?? []), unit]);
+  }
   const projects: DashboardProject[] = (projectsResult.data ?? [])
     .map((project) => {
-      const projectTasks = visibleTasks.filter((task) => task.project_id === project.id);
-      const progress = projectProgress(projectTasks);
-      const overdue = projectTasks.filter(isOverdue).length;
+      const projectTasks = counts.units.filter((task) => task.project_id === project.id);
+      const units = unitsByProject.get(project.id) ?? [];
+      const progress = projectProgress(units);
+      const today = todayFor(project.organization_id);
+      const overdue = units.filter((unit) => unitIsOverdue(unit, today)).length;
       const health = projectHealth({
         progress,
         dueDate: project.due_date,
-        today: todayFor(project.organization_id),
+        today,
         lifecycle: project.status,
         overdueTasks: overdue,
       });
@@ -186,6 +208,7 @@ async function loadDashboard(
         complete: progress.done,
         progress: progress.percent,
         overdue,
+        // Blocked is per task and not in project_task_units: the ones the user can see.
         blocked: projectTasks.filter((task) => isOpen(task) && task.blocked).length,
         health,
       };
@@ -214,8 +237,8 @@ async function loadDashboard(
       projectName: work_projects?.name ?? null,
       actorName: nameOf(item.actor_id),
     })),
-    workload: [...new Set(tasks.map((task) => task.assignee_id).filter((id): id is string => Boolean(id)))].map((assigneeId) => {
-      const assigned = tasks.filter((task) => task.assignee_id === assigneeId && isOpen(task));
+    workload: [...new Set(counts.people.map((task) => task.assignee_id).filter((id): id is string => Boolean(id)))].map((assigneeId) => {
+      const assigned = counts.people.filter((task) => task.assignee_id === assigneeId && isOpen(task));
       return {
         userId: assigneeId,
         name: nameOf(assigneeId),
@@ -226,6 +249,27 @@ async function loadDashboard(
       };
     }).sort((a, b) => b.open - a.open),
   };
+}
+
+type CountedTask = Pick<DashboardTask, "id" | "assignee_id" | "parent_task_id">;
+
+/**
+ * How the dashboard counts the tasks row-level security lets the user see. A group task is a
+ * parent (no assignee) plus one child per person:
+ *   units  — project progress and task totals: a group once, as its parent (workUnits);
+ *   people — person-level figures (workload, overdue per person): the children, never a parent;
+ *   tasks  — what the page counts and lists: in "My Overview" the user's own work (their part of
+ *            a group, never the group), in "Team Overview" the units, as the Team board shows them.
+ */
+export function dashboardCounts<T extends CountedTask>(
+  visibleTasks: readonly T[],
+  scope: "mine" | "team",
+  userId: string,
+): { units: T[]; people: T[]; tasks: T[] } {
+  const units = workUnits(visibleTasks);
+  const people = personalWork(visibleTasks);
+  const mine = people.filter((task) => task.assignee_id === userId);
+  return scope === "mine" ? { units, people: mine, tasks: mine } : { units, people, tasks: units };
 }
 
 function isoDate(date: Date) {

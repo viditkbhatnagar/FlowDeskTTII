@@ -45,17 +45,22 @@ import {
 } from "@/lib/admin-api";
 import { healthLabel, type ProjectHealth } from "@/lib/project-metrics";
 import {
+  addProjectLinks,
   FILE_RULES,
   formatBytes,
   uploadProjectDocuments,
   validateFile,
   type PersonRef,
 } from "@/lib/task-api";
+import type { LinkInput } from "@/lib/links";
 import { useOrganizations } from "@/lib/organizations-data";
 import { canCreateProjects } from "@/lib/project-permissions";
 import { useTaskSettings } from "@/lib/task-settings-data";
 import { useWorkspace } from "@/lib/workspace-data";
 import { ProjectWorkspace, type WorkspaceProject } from "./ProjectWorkspace";
+import { AddLinkButton } from "./files/AddLinkButton";
+import { PendingLinkList } from "./files/PendingLinkList";
+import { usePendingLinks } from "./files/use-pending-links";
 import {
   Dialog,
   DialogContent,
@@ -187,13 +192,24 @@ const projectSubtitle = (project: ProjectExt) =>
 /** A yyyy-mm-dd date in local time, as the date columns store it. */
 const localDate = (date: Date) => format(date, "yyyy-MM-dd");
 
-/** Upload files picked in the project form and report any the bucket refused. */
-async function attachProjectFiles(project: { id: string; organizationId: string }, files: File[]) {
-  if (!files.length) return;
-  const result = await uploadProjectDocuments(project, files);
-  if (result.rejected.length) {
+/**
+ * Upload files and save links picked in the project form, once the project
+ * exists, and report any that were refused.
+ */
+async function attachProjectFiles(
+  project: { id: string; organizationId: string },
+  files: File[],
+  links: LinkInput[] = [],
+) {
+  if (!files.length && !links.length) return;
+  const [uploads, saved] = await Promise.all([
+    files.length ? uploadProjectDocuments(project, files) : null,
+    links.length ? addProjectLinks(project, links) : null,
+  ]);
+  const rejected = [...(uploads?.rejected ?? []), ...(saved?.rejected ?? [])];
+  if (rejected.length) {
     toast.error(
-      `Not attached: ${result.rejected.map((file) => `${file.name} (${file.reason})`).join(", ")}`,
+      `Not attached: ${rejected.map((item) => `${item.name} (${item.reason})`).join(", ")}`,
     );
   }
 }
@@ -434,7 +450,11 @@ export function ProjectsPage({
       : (projectItems.find((project) => matchesTarget(project, dashboardScope.target))?.name ??
         dashboardScope.target);
 
-  const handleProjectCreated = async (project: ProjectExt, files: File[]): Promise<boolean> => {
+  const handleProjectCreated = async (
+    project: ProjectExt,
+    files: File[],
+    links: LinkInput[] = [],
+  ): Promise<boolean> => {
     // Saved first, shown second. The card used to appear straight away under a
     // made-up id (PRJ-00121...) and quietly vanish if the insert failed.
     const orgId = project.orgId ?? defaultOrgId;
@@ -464,7 +484,7 @@ export function ProjectsPage({
     if (project.teamIds?.length && !(await setProjectMembers(realId, project.teamIds))) {
       toast.error("The project was created, but its team members could not be saved.");
     }
-    await attachProjectFiles({ id: realId, organizationId: orgId }, files);
+    await attachProjectFiles({ id: realId, organizationId: orgId }, files, links);
     const saved: ProjectExt = { ...project, id: realId, projectId: displayId(realId), orgId };
     setProjectItems((current) => [saved, ...current]);
     setCreateOpen(false);
@@ -1227,10 +1247,15 @@ export function ProjectFormDialog({
   onClose: () => void;
   /**
    * Awaited while the button shows progress; the caller closes the dialog when
-   * it is done, or leaves it open and says why. `files` are the attachments
-   * picked in create mode — in edit mode the form uploads them itself.
+   * it is done, or leaves it open and says why. `files` and `links` are the
+   * attachments picked in create mode, to save once the project exists — in
+   * edit mode the form saves them itself.
    */
-  onSubmit: (project: ProjectExt, files: File[]) => void | boolean | Promise<void | boolean>;
+  onSubmit: (
+    project: ProjectExt,
+    files: File[],
+    links: LinkInput[],
+  ) => void | boolean | Promise<void | boolean>;
   /** No longer used: ids come from the database, not a running counter (FD-035). */
   nextNumber?: number;
   mode?: "create" | "edit";
@@ -1267,6 +1292,8 @@ export function ProjectFormDialog({
   const [endDate, setEndDate] = useState<Date>();
   const [members, setMembers] = useState<string[]>([]);
   const [files, setFiles] = useState<File[]>([]);
+  // Links to documents kept elsewhere (SharePoint…), saved with the files.
+  const pendingLinks = usePendingLinks();
   const [touched, setTouched] = useState<Partial<Record<FormField, boolean>>>({});
   const [submitting, setSubmitting] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -1404,6 +1431,7 @@ export function ProjectFormDialog({
     );
     setMembers(resolveMembers());
     setFiles([]);
+    pendingLinks.clear();
     setTouched({});
     setSubmitting(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1476,8 +1504,8 @@ export function ProjectFormDialog({
     if (!(await setProjectMembers(id, project.teamIds ?? []))) {
       toast.error("The project was saved, but its team members could not be updated.");
     }
-    if (files.length && project.orgId) {
-      await attachProjectFiles({ id, organizationId: project.orgId }, files);
+    if ((files.length || pendingLinks.links.length) && project.orgId) {
+      await attachProjectFiles({ id, organizationId: project.orgId }, files, pendingLinks.links);
     }
     editing?.onSaved(project);
     return true;
@@ -1523,7 +1551,10 @@ export function ProjectFormDialog({
       teamId: scope.teamId,
       priority,
       creationStatus: status,
-      attachmentNames: files.map((file) => file.name),
+      attachmentNames: [
+        ...files.map((file) => file.name),
+        ...pendingLinks.links.map((link) => link.name),
+      ],
       createdAt: editingProject?.createdAt ?? now,
       updatedAt: now,
       // Stored as the local calendar day. toISOString() used to shift a
@@ -1545,7 +1576,11 @@ export function ProjectFormDialog({
     setSubmitting(true);
     try {
       if (mode === "edit" && rowId && !(await persistEdit(rowId, project))) return;
-      await onSubmit(project, mode === "create" ? files : []);
+      await onSubmit(
+        project,
+        mode === "create" ? files : [],
+        mode === "create" ? pendingLinks.links : [],
+      );
     } finally {
       setSubmitting(false);
     }
@@ -1794,16 +1829,27 @@ export function ProjectFormDialog({
                 event.target.value = "";
               }}
             />
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="w-fit px-0 text-muted-foreground hover:bg-transparent hover:text-foreground"
-              onClick={() => fileInput.current?.click()}
-            >
-              <Paperclip className="h-3.5 w-3.5" /> Attach files
-            </Button>
-            <p className="text-[11px] text-muted-foreground">{FILE_RULES.label}</p>
+            <div className="flex flex-wrap items-center gap-x-5 gap-y-1">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="w-fit px-0 text-muted-foreground hover:bg-transparent hover:text-foreground"
+                onClick={() => fileInput.current?.click()}
+              >
+                <Paperclip className="h-3.5 w-3.5" /> Attach files
+              </Button>
+              <AddLinkButton
+                onAdd={pendingLinks.add}
+                variant="ghost"
+                align="start"
+                className="h-8 w-fit px-0 text-muted-foreground hover:bg-transparent hover:text-foreground"
+              />
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              {FILE_RULES.label}. Or add a link to a document kept elsewhere, like SharePoint, so
+              everyone edits the same copy.
+            </p>
             {files.map((file, index) => (
               <div
                 key={`${file.name}-${index}`}
@@ -1826,6 +1872,7 @@ export function ProjectFormDialog({
                 </Button>
               </div>
             ))}
+            <PendingLinkList links={pendingLinks.links} onRemove={pendingLinks.remove} />
           </div>
         </div>
         <DialogFooter className="shrink-0 justify-between border-t border-border bg-background px-6 py-4 sm:justify-between">

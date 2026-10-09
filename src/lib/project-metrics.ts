@@ -23,7 +23,10 @@ export interface ProjectProgress {
   percent: number;
 }
 
-/** Cancelled work is neither done nor outstanding, so it is left out of both. */
+/**
+ * Cancelled work is neither done nor outstanding, so it is left out of both. Counts what it is
+ * given: pass workUnits(tasks), so a group task counts once and not once per person.
+ */
 export function projectProgress(tasks: ProgressInput[]): ProjectProgress {
   const counted = tasks.filter((t) => t.status !== "cancelled");
   const done = counted.filter((t) => t.status === "done").length;
@@ -33,6 +36,27 @@ export function projectProgress(tasks: ProgressInput[]): ProjectProgress {
     open: counted.length - done,
     percent: counted.length ? Math.round((done / counted.length) * 100) : 0,
   };
+}
+
+/**
+ * One unit of a project's work as project_task_units returns it (a group task once), with no
+ * title or people: progress and lateness for the whole project, whoever looks.
+ */
+export interface ProjectUnit {
+  project_id: string;
+  status: string;
+  due_date: string | null;
+  due_at: string | null;
+}
+
+/** Still open and due before `today` (YYYY-MM-DD in the project's organization timezone). */
+export function unitIsOverdue(
+  unit: Pick<ProjectUnit, "status" | "due_date" | "due_at">,
+  today: string,
+): boolean {
+  if (unit.status === "done" || unit.status === "cancelled") return false;
+  const due = unit.due_date ?? unit.due_at?.slice(0, 10);
+  return Boolean(due && due < today);
 }
 
 export interface HealthInput {
@@ -74,3 +98,50 @@ export const healthLabel: Record<ProjectHealth, string> = {
   delayed: "Delayed",
   "no-tasks": "No tasks yet",
 };
+
+/**
+ * A task as any screen holds it: a database row (parent_task_id) or the app's and the email
+ * snapshot's camelCase (parentTaskId). A group task (a task for several people) is a parent with
+ * no assignee plus one child per person, each pointing at the parent.
+ */
+export interface GroupLink {
+  id: string;
+  parent_task_id?: string | null;
+  parentTaskId?: string | null;
+}
+
+export const parentTaskIdOf = (task: GroupLink): string | null =>
+  task.parent_task_id ?? task.parentTaskId ?? null;
+
+/** The group parents among `tasks`: the ones another task in the list points at. */
+export function groupParentIds(tasks: readonly GroupLink[]): Set<string> {
+  const ids = new Set<string>();
+  for (const task of tasks) {
+    const parentId = parentTaskIdOf(task);
+    if (parentId) ids.add(parentId);
+  }
+  return ids;
+}
+
+/**
+ * The units of work among `tasks`, for project progress and task totals: a group counts once, as
+ * its parent, and its children are skipped. A child whose parent is not in the list still counts
+ * (row-level security can show a manager their report's part without the group, and the boards
+ * then show that part as a card of its own). Order is kept.
+ */
+export function workUnits<T extends GroupLink>(tasks: readonly T[]): T[] {
+  const ids = new Set(tasks.map((task) => task.id));
+  return tasks.filter((task) => {
+    const parentId = parentTaskIdOf(task);
+    return !parentId || !ids.has(parentId);
+  });
+}
+
+/**
+ * Person-level work (my tasks, workload, overdue per person): every task but the group parents,
+ * which belong to no one. Each person's part of a group is their own child. Order is kept.
+ */
+export function personalWork<T extends GroupLink>(tasks: readonly T[]): T[] {
+  const parents = groupParentIds(tasks);
+  return tasks.filter((task) => !parents.has(task.id));
+}

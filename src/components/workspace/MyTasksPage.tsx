@@ -32,6 +32,8 @@ import { useTaskSettings } from "@/lib/task-settings-data";
 import { todayIn } from "@/lib/today";
 import { WorkspaceState } from "@/components/workspace/WorkspaceState";
 import { TaskDetailDrawer } from "@/components/workspace/TaskDetailDrawer";
+import { PartOfGroup } from "@/components/workspace/TaskGroupParts";
+import { useTaskAccess } from "@/lib/use-task-access";
 import { cn } from "@/lib/utils";
 import { format } from "date-fns";
 
@@ -219,7 +221,8 @@ export function MyTasksPage({
   linkedTaskId: emailTaskId,
   onLinkedTaskClosed,
 }: MyTasksPageProps) {
-  const { tasks: allTasks, updateTask, status: loadStatus } = useWorkspace();
+  const { tasks: allTasks, updateTask, status: loadStatus, groups } = useWorkspace();
+  const { permissionsFor } = useTaskAccess();
   const { statusLabel } = useTaskSettings();
   // Due-date comparisons must use the organization's calendar date, not UTC's.
   const { organizations, activeOrgId } = useOrganizations();
@@ -244,6 +247,8 @@ export function MyTasksPage({
   // "My Tasks" means the tasks assigned to me — the same set as the dashboard's
   // My Overview. It used to fall back to everyone's tasks while the user loaded
   // and whenever nothing was assigned yet, so it listed Priya Shah's work (FD-020).
+  // My part of a group task is mine; the group itself has no assignee, so it is
+  // never listed here (spec E).
   const items = useMemo(
     () => (currentUserId ? allTasks.filter((task) => task.assigneeId === currentUserId) : []),
     [allTasks, currentUserId],
@@ -385,6 +390,8 @@ export function MyTasksPage({
   const setStatus = (id: string, status: Status) => {
     const task = allTasks.find((item) => item.id === id);
     if (!task || task.status === status) return;
+    // Everything listed here is mine to move; this guards a drop from elsewhere.
+    if (!permissionsFor(task).canMove) return;
     // Was `progress: status === "done" ? 100 : task.progress`, which wrote 100%
     // back onto a reopened task (FD-025). The database now derives progress on
     // reopen — the subtask ratio, or 0 without subtasks — and updateTask derives
@@ -773,6 +780,11 @@ export function MyTasksPage({
                         today={today}
                         active={selectedId === t.id}
                         completedPulse={justCompleted === t.id}
+                        groupTitle={groups.parentOf.get(t.id)?.title}
+                        onOpenGroup={() => {
+                          const parent = groups.parentOf.get(t.id);
+                          if (parent) openTask(parent.id);
+                        }}
                         onSelect={() => openTask(t.id)}
                         onDragStart={() => setDragId(t.id)}
                         onStatus={(s) => setStatus(t.id, s)}
@@ -803,6 +815,7 @@ export function MyTasksPage({
             {filtered.map((t) => {
               const done = t.status === "done";
               const tags = t.tags ?? [];
+              const group = groups.parentOf.get(t.id);
               return (
                 // A <div> row: the completion toggle is a real button now, and a
                 // button cannot sit inside another button (FD-054).
@@ -852,6 +865,12 @@ export function MyTasksPage({
                       {taskRefs.get(t.id)}
                       {tags.length > 0 && ` · ${tags.join(" · ")}`}
                     </div>
+                    {t.parentTaskId && (
+                      <PartOfGroup
+                        title={group?.title}
+                        onOpen={group ? () => openTask(group.id) : undefined}
+                      />
+                    )}
                   </div>
                   <div className="text-xs text-muted-foreground truncate">{t.project}</div>
                   <span
@@ -929,6 +948,11 @@ export function MyTasksPage({
                         today={today}
                         active={selectedId === t.id}
                         completedPulse={justCompleted === t.id}
+                        groupTitle={groups.parentOf.get(t.id)?.title}
+                        onOpenGroup={() => {
+                          const parent = groups.parentOf.get(t.id);
+                          if (parent) openTask(parent.id);
+                        }}
                         onSelect={() => openTask(t.id)}
                         onStatus={(s) => setStatus(t.id, s)}
                         compact
@@ -954,6 +978,7 @@ export function MyTasksPage({
         open={detailOpen && Boolean(selected)}
         onOpenChange={changeDetailOpen}
         variant={view === "kanban" ? "modal" : "sheet"}
+        onOpenTask={openTask}
       />
     </div>
   );
@@ -1003,6 +1028,8 @@ function MyTaskCard({
   active,
   compact,
   completedPulse,
+  groupTitle,
+  onOpenGroup,
   onSelect,
   onDragStart,
   onStatus,
@@ -1013,6 +1040,9 @@ function MyTaskCard({
   active?: boolean;
   compact?: boolean;
   completedPulse?: boolean;
+  /** My part of a group task: the group's title, when I can see the group. */
+  groupTitle?: string;
+  onOpenGroup?: () => void;
   onSelect: () => void;
   onDragStart?: () => void;
   onStatus: (s: Status) => void;
@@ -1075,6 +1105,13 @@ function MyTaskCard({
           <span className="line-clamp-3 [overflow-wrap:anywhere]">{task.title}</span>
         </button>
       </h4>
+      {task.parentTaskId && (
+        <PartOfGroup
+          title={groupTitle}
+          onOpen={groupTitle ? onOpenGroup : undefined}
+          className="mt-1"
+        />
+      )}
       {!compact && (
         // Was "Tagged ." on untagged tasks (FD-044).
         <p className="mt-1 text-[11px] text-muted-foreground line-clamp-2 [overflow-wrap:anywhere]">

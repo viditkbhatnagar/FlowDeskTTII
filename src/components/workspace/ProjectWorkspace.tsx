@@ -83,20 +83,22 @@ import { cn } from "@/lib/utils";
 import { supabase } from "@/integrations/supabase/client";
 import type { Database } from "@/integrations/supabase/types";
 import type { Priority, Status } from "@/lib/mock-data";
-import { updateProjectRow } from "@/lib/admin-api";
+import { loadProjectUnits, updateProjectRow } from "@/lib/admin-api";
 import { useOrganizations } from "@/lib/organizations-data";
 import { canCreateProjects, canDeleteProjects, canManageProject } from "@/lib/project-permissions";
 import {
   healthLabel,
   projectHealth,
   projectProgress,
+  unitIsOverdue,
   type ProjectHealth,
+  type ProjectUnit,
 } from "@/lib/project-metrics";
 import {
   FILE_RULES,
+  addProjectLink,
   deleteStoredFile,
   describeActivity,
-  fileUrl,
   formatBytes,
   listProjectActivity,
   listProjectDocuments,
@@ -110,8 +112,19 @@ import {
 import { useTaskSettings } from "@/lib/task-settings-data";
 import { todayIn } from "@/lib/today";
 import { useWorkspace, type WorkspaceTask } from "@/lib/workspace-data";
+import {
+  GROUP_STATUS_HINT,
+  foldGroups,
+  groupSummary,
+  type TaskGroupIndex,
+} from "@/lib/task-groups";
+import { READ_ONLY_HINT, type TaskPermissions } from "@/lib/task-permissions";
+import { useTaskAccess } from "@/lib/use-task-access";
 import { NewTaskDialog } from "./NewTaskDialog";
 import { TaskDetailDrawer } from "./TaskDetailDrawer";
+import { GroupAvatars, GroupMembersStrip, PartOfGroup } from "./TaskGroupParts";
+import { AddLinkButton, openStoredFile, StoredFileName, storedFileType } from "./files";
+import type { LinkInput } from "@/lib/links";
 
 export type WorkspaceProject = {
   id: string;
@@ -370,36 +383,6 @@ async function removeProjectMembers(projectId: string, userIds: string[]): Promi
   return error ? writeFailed("removeProjectMembers", error) : true;
 }
 
-/** Opens a private file through a short-lived signed link. */
-async function openStoredFile(file: StoredFile, download: boolean) {
-  // The tab is opened before the await: one opened after it counts as a popup
-  // and is blocked, which is why Preview appeared to do nothing (FD-060).
-  const preview = download ? null : window.open("", "_blank");
-  const url = await fileUrl(file, download);
-  if (!url) {
-    preview?.close();
-    toast.error(`${file.name} could not be opened.`);
-    return;
-  }
-  if (download) {
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = file.name;
-    link.rel = "noopener";
-    link.click();
-    return;
-  }
-  if (preview) {
-    preview.opener = null;
-    preview.location.href = url;
-  } else {
-    window.open(url, "_blank", "noopener");
-  }
-}
-
-const fileType = (file: StoredFile) =>
-  /\.([a-z0-9]+)$/i.exec(file.name)?.[1]?.toUpperCase() ?? "File";
-
 const activityCategory = (entry: ActivityEntry): ActivityCategory =>
   entry.taskId || entry.type.startsWith("task_")
     ? "tasks"
@@ -425,7 +408,8 @@ export function ProjectWorkspace({
   /** Called after an edit is saved, so the Projects list can show it without a reload. */
   onUpdated?: (project: WorkspaceProject) => void;
 }) {
-  const { tasks, people, updateTask, deleteTask } = useWorkspace();
+  const { tasks, people, updateTask, deleteTask, groups } = useWorkspace();
+  const { permissionsFor } = useTaskAccess();
   const { organizations, users, departments, currentUserId, ownPrivilegesIn } = useOrganizations();
   const [project, setProject] = useState(initialProject);
   const [sourceId, setSourceId] = useState(initialProject.id);
@@ -448,6 +432,7 @@ export function ProjectWorkspace({
   const [activity, setActivity] = useState<ActivityEntry[]>([]);
   const [activityState, setActivityState] = useState<LoadState>("loading");
   const [activityVersion, setActivityVersion] = useState(0);
+  const [wholeProject, setWholeProject] = useState<ProjectUnit[] | null>(null);
 
   // ProjectsPage swaps the project in place — Duplicate, or a new project
   // receiving its real id — without remounting this screen. Follow it, or the
@@ -461,6 +446,7 @@ export function ProjectWorkspace({
     setDocumentsState("loading");
     setActivity([]);
     setActivityState("loading");
+    setWholeProject(null);
   }
 
   // A project created on this screen has a placeholder id until its row is saved.
@@ -541,6 +527,22 @@ export function ProjectWorkspace({
     () => tasks.filter((task) => task.projectId === project.id),
     [tasks, project.id],
   );
+  // Units of work: a group task counts once, as its own card, not once per
+  // person (spec C). Person-level views (the Team tab) keep every part.
+  const projectUnits = useMemo(() => foldGroups(projectTasks), [projectTasks]);
+  // Progress counts the whole project, the same rows as its card on Projects:
+  // a member may read only some of its tasks, and the figure must not differ
+  // by viewer. Re-read whenever a task changes; until then, what is loaded.
+  useEffect(() => {
+    if (!isSaved) return;
+    let active = true;
+    void loadProjectUnits(project.id).then((rows) => {
+      if (active && rows) setWholeProject(rows);
+    });
+    return () => {
+      active = false;
+    };
+  }, [project.id, isSaved, tasks]);
   const organizationId =
     records?.organizationId ??
     project.orgId ??
@@ -606,9 +608,13 @@ export function ProjectWorkspace({
   // The single progress and health calculation, shared with the Projects cards
   // and the Dashboard. This screen used to compute its own and disagreed with
   // both (FD-014), and called finished projects "On Track" (FD-056).
-  const progress = projectProgress(projectTasks);
-  const inProgress = projectTasks.filter((task) => task.status === "progress").length;
-  const overdue = projectTasks.filter((task) => isOverdue(task, today)).length;
+  const progress = projectProgress(wholeProject ?? projectUnits);
+  const inProgress = (wholeProject ?? projectUnits).filter(
+    (task) => task.status === "progress",
+  ).length;
+  const overdue = wholeProject
+    ? wholeProject.filter((unit) => unitIsOverdue(unit, today)).length
+    : projectUnits.filter((task) => isOverdue(task, today)).length;
   const deadlineDay = dayOf(project.deadline);
   const health = projectHealth({
     progress,
@@ -638,7 +644,7 @@ export function ProjectWorkspace({
   const setupItems = [
     true,
     milestones.length > 0,
-    projectTasks.length > 0,
+    (wholeProject?.length ?? projectTasks.length) > 0,
     team.some((person) => person.id !== manager.id),
     documents.length > 0,
   ];
@@ -693,8 +699,10 @@ export function ProjectWorkspace({
           }
         : current,
     );
-    // Re-read what was stored, and the "edited the project" entry it logged.
+    // Re-read what was stored, and the "edited the project" entry it logged,
+    // and any files or links attached through the edit form.
     setRecordsVersion((version) => version + 1);
+    setDocumentsVersion((version) => version + 1);
     refreshActivity();
     toast.success("Project updated");
     onUpdated?.(next);
@@ -788,6 +796,24 @@ export function ProjectWorkspace({
         : current,
     );
     toast.success("Milestone deleted");
+    return true;
+  };
+
+  const addDocumentLink = async (link: LinkInput): Promise<boolean> => {
+    if (!ensureSaved()) return false;
+    if (!organizationId) {
+      toast.error("This project's organization is unknown, so links cannot be stored.");
+      return false;
+    }
+    const result = await addProjectLink({ id: project.id, organizationId }, link);
+    if (!result.ok) {
+      toast.error(result.error);
+      return false;
+    }
+    setDocuments((current) => [result.link, ...current]);
+    setDocumentsState("ready");
+    toast.success("Link added");
+    refreshActivity();
     return true;
   };
 
@@ -1040,7 +1066,7 @@ export function ProjectWorkspace({
               project={project}
               manager={manager}
               teamCount={teamCount}
-              tasks={projectTasks}
+              tasks={projectUnits}
               today={today}
               milestones={milestones}
               activity={activity}
@@ -1067,6 +1093,8 @@ export function ProjectWorkspace({
             <TasksTab
               orgId={organizationId}
               tasks={projectTasks}
+              groups={groups}
+              permissionsFor={permissionsFor}
               today={today}
               onAdd={() => setTaskOpen(true)}
               onSelect={(task, view) => openTask(task, view === "board" ? "modal" : "sheet")}
@@ -1100,7 +1128,7 @@ export function ProjectWorkspace({
             <TimelineTab
               project={project}
               canManage={canManage}
-              tasks={projectTasks}
+              tasks={projectUnits}
               milestones={milestones}
               state={isSaved ? recordsState : "loading"}
               today={today}
@@ -1117,6 +1145,7 @@ export function ProjectWorkspace({
               state={isSaved ? documentsState : "loading"}
               uploading={uploading}
               onUpload={uploadDocuments}
+              onAddLink={addDocumentLink}
               onDelete={removeDocument}
               onRetry={() => setDocumentsVersion((version) => version + 1)}
             />
@@ -1143,6 +1172,7 @@ export function ProjectWorkspace({
           task={selectedTask}
           open={Boolean(selectedTask)}
           onOpenChange={(open) => !open && setSelectedTaskId(undefined)}
+          onOpenTask={setSelectedTaskId}
         />
         <EditProjectDialog
           open={editOpen}
@@ -1567,9 +1597,14 @@ function readTaskView(): "list" | "board" {
   }
 }
 
+/** Assignee filter key of a group task: it belongs to its people, not to "Unassigned". */
+const GROUP_ASSIGNEE_KEY = "__group";
+
 function TasksTab({
   orgId,
   tasks,
+  groups,
+  permissionsFor,
   today,
   onAdd,
   onSelect,
@@ -1578,7 +1613,11 @@ function TasksTab({
 }: {
   /** The project's organization: its tasks read in that organization's status names. */
   orgId: string | null;
+  /** Every task of the project the viewer can see, each person's part of a group included. */
   tasks: WorkspaceTask[];
+  groups: TaskGroupIndex<WorkspaceTask>;
+  /** Spec B: who may edit, move and delete each task. */
+  permissionsFor: (task: WorkspaceTask) => TaskPermissions;
   today: string;
   onAdd: () => void;
   onSelect: (task: WorkspaceTask, view: "list" | "board") => void;
@@ -1606,34 +1645,41 @@ function TasksTab({
       // Storage can be unavailable (private mode); the choice just isn't remembered.
     }
   };
+  // A group task is one unit of work (spec C): its people's parts fold into
+  // its card, and the counts count it once.
+  const units = foldGroups(tasks);
   const counts = {
-    all: tasks.length,
-    todo: tasks.filter((task) => task.status === "todo").length,
-    progress: tasks.filter((task) => task.status === "progress").length,
-    review: tasks.filter((task) => task.status === "review").length,
-    done: tasks.filter((task) => task.status === "done").length,
-    overdue: tasks.filter((task) => isOverdue(task, today)).length,
+    all: units.length,
+    todo: units.filter((task) => task.status === "todo").length,
+    progress: units.filter((task) => task.status === "progress").length,
+    review: units.filter((task) => task.status === "review").length,
+    done: units.filter((task) => task.status === "done").length,
+    overdue: units.filter((task) => isOverdue(task, today)).length,
   };
+  const isGroup = (task: WorkspaceTask) => groups.groups.has(task.id);
   // By id: two people with the same name used to share one filter entry.
-  const assigneeKey = (task: WorkspaceTask) => task.assigneeId ?? "unassigned";
+  const assigneeKey = (task: WorkspaceTask) =>
+    isGroup(task) ? GROUP_ASSIGNEE_KEY : (task.assigneeId ?? "unassigned");
   const assigneeNames = Object.fromEntries(
-    tasks.map((task) => [assigneeKey(task), task.assignee.name]),
+    tasks.filter((task) => !isGroup(task)).map((task) => [assigneeKey(task), task.assignee.name]),
   );
-  const filtered = tasks
-    .filter(
+  // Filtered first, then folded: a filter that leaves the group out (one
+  // person, one status) keeps each matching part as its own row.
+  const filtered = foldGroups(
+    tasks.filter(
       (task) =>
         (bucket === "all" ||
           (bucket === "overdue" ? isOverdue(task, today) : task.status === bucket)) &&
         (assignee === "all" || assigneeKey(task) === assignee) &&
         (priority === "all" || task.priority === priority) &&
         `${task.title} ${task.id}`.toLowerCase().includes(query.toLowerCase()),
-    )
-    .sort((a, b) =>
-      sort === "priority"
-        ? ["critical", "high", "medium", "low"].indexOf(a.priority) -
-          ["critical", "high", "medium", "low"].indexOf(b.priority)
-        : +new Date(a.dueDate) - +new Date(b.dueDate),
-    );
+    ),
+  ).sort((a, b) =>
+    sort === "priority"
+      ? ["critical", "high", "medium", "low"].indexOf(a.priority) -
+        ["critical", "high", "medium", "low"].indexOf(b.priority)
+      : +new Date(a.dueDate) - +new Date(b.dueDate),
+  );
   if (!tasks.length)
     return (
       <EmptyState
@@ -1649,7 +1695,7 @@ function TasksTab({
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h3 className="text-lg font-semibold">
-            Tasks <span className="text-muted-foreground">({tasks.length})</span>
+            Tasks <span className="text-muted-foreground">({units.length})</span>
           </h3>
         </div>
         <Button size="sm" onClick={onAdd}>
@@ -1754,93 +1800,113 @@ function TasksTab({
               </tr>
             </thead>
             <tbody>
-              {filtered.map((task) => (
-                <tr
-                  key={task.id}
-                  onClick={() => onSelect(task, "list")}
-                  className="cursor-pointer border-t border-border hover:bg-accent/40"
-                >
-                  <td className="px-4 py-3">
-                    <div className="font-medium">{task.title}</div>
-                    <div className="text-[10px] text-muted-foreground">{task.id.slice(0, 8)}</div>
-                  </td>
-                  <td className="px-4 py-3">
-                    <Person person={task.assignee} />
-                  </td>
-                  <td className="px-4 py-3">
-                    {/* nowrap: "In Progress" broke onto two lines (FD-048). */}
-                    <span
-                      className={cn(
-                        "inline-block whitespace-nowrap rounded-md px-2 py-1 text-[10px]",
-                        taskStatusStyles[task.status],
-                      )}
-                    >
-                      {statusLabel(task.status)}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3">
-                    <span
-                      className={cn(
-                        "inline-block whitespace-nowrap rounded-md px-2 py-1 text-[10px] capitalize",
-                        priorityStyles[task.priority],
-                      )}
-                    >
-                      {task.priority}
-                    </span>
-                  </td>
-                  <td
-                    className={cn(
-                      "whitespace-nowrap px-4 py-3 text-xs",
-                      isOverdue(task, today) ? "text-destructive" : "text-muted-foreground",
-                    )}
+              {filtered.map((task) => {
+                const group = groups.groups.get(task.id);
+                const parent = groups.parentOf.get(task.id);
+                const allowed = permissionsFor(task);
+                return (
+                  <tr
+                    key={task.id}
+                    onClick={() => onSelect(task, "list")}
+                    className="cursor-pointer border-t border-border hover:bg-accent/40"
                   >
-                    {formatDay(task.dueDate, "MMM d")}
-                  </td>
-                  <td className="px-4 py-3">
-                    <div className="flex items-center gap-2">
-                      <Progress
-                        value={task.progress}
-                        className="w-20"
-                        aria-label={`${task.progress}% done`}
-                      />
-                      <span className="whitespace-nowrap text-xs">{task.progress}%</span>
-                    </div>
-                  </td>
-                  {/* The "…" opened the drawer like the rest of the row; it is an
+                    <td className="px-4 py-3">
+                      <div className="font-medium">{task.title}</div>
+                      <div className="text-[10px] text-muted-foreground">{task.id.slice(0, 8)}</div>
+                      {task.parentTaskId && (
+                        <PartOfGroup
+                          title={parent?.title}
+                          onOpen={parent ? () => onSelect(parent, "list") : undefined}
+                          className="mt-0.5"
+                        />
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      {group ? <GroupAvatars group={group} /> : <Person person={task.assignee} />}
+                    </td>
+                    <td className="px-4 py-3">
+                      {/* nowrap: "In Progress" broke onto two lines (FD-048). */}
+                      <span
+                        title={group ? GROUP_STATUS_HINT : undefined}
+                        className={cn(
+                          "inline-block whitespace-nowrap rounded-md px-2 py-1 text-[10px]",
+                          taskStatusStyles[task.status],
+                        )}
+                      >
+                        {statusLabel(task.status)}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3">
+                      <span
+                        className={cn(
+                          "inline-block whitespace-nowrap rounded-md px-2 py-1 text-[10px] capitalize",
+                          priorityStyles[task.priority],
+                        )}
+                      >
+                        {task.priority}
+                      </span>
+                    </td>
+                    <td
+                      className={cn(
+                        "whitespace-nowrap px-4 py-3 text-xs",
+                        isOverdue(task, today) ? "text-destructive" : "text-muted-foreground",
+                      )}
+                    >
+                      {formatDay(task.dueDate, "MMM d")}
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-2">
+                        <Progress
+                          value={task.progress}
+                          className="w-20"
+                          aria-label={`${task.progress}% done`}
+                        />
+                        <span className="whitespace-nowrap text-xs">{task.progress}%</span>
+                      </div>
+                    </td>
+                    {/* The "…" opened the drawer like the rest of the row; it is an
                       actions menu now, with Edit and Delete (FD-006). */}
-                  <td className="px-4 py-3" onClick={(event) => event.stopPropagation()}>
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          aria-label={`Actions for ${task.title}`}
-                        >
-                          <MoreHorizontal className="h-4 w-4" />
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end">
-                        <DropdownMenuItem onSelect={() => onSelect(task, "list")}>
-                          <FolderOpen />
-                          Open
-                        </DropdownMenuItem>
-                        <DropdownMenuItem onSelect={() => onSelect(task, "list")}>
-                          <Edit3 />
-                          Edit
-                        </DropdownMenuItem>
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem
-                          className="text-destructive focus:text-destructive"
-                          onSelect={() => setDeleteTarget(task)}
-                        >
-                          <Trash2 />
-                          Delete
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </td>
-                </tr>
-              ))}
+                    <td className="px-4 py-3" onClick={(event) => event.stopPropagation()}>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            aria-label={`Actions for ${task.title}`}
+                          >
+                            <MoreHorizontal className="h-4 w-4" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem onSelect={() => onSelect(task, "list")}>
+                            <FolderOpen />
+                            Open
+                          </DropdownMenuItem>
+                          {/* Only for the people the database lets change it (spec B). */}
+                          {allowed.canEdit && (
+                            <DropdownMenuItem onSelect={() => onSelect(task, "list")}>
+                              <Edit3 />
+                              Edit
+                            </DropdownMenuItem>
+                          )}
+                          {allowed.canDelete && (
+                            <>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem
+                                className="text-destructive focus:text-destructive"
+                                onSelect={() => setDeleteTarget(task)}
+                              >
+                                <Trash2 />
+                                Delete
+                              </DropdownMenuItem>
+                            </>
+                          )}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
           {!filtered.length && (
@@ -1857,7 +1923,8 @@ function TasksTab({
               onDragOver={(event) => event.preventDefault()}
               onDrop={() => {
                 // Status only: progress is derived from the status and subtasks.
-                if (dragId) onUpdate(dragId, { status });
+                const dragged = tasks.find((task) => task.id === dragId);
+                if (dragged && permissionsFor(dragged).canMove) onUpdate(dragged.id, { status });
                 setDragId(undefined);
               }}
               className="min-h-[320px] rounded-xl border border-border bg-muted/20 p-3"
@@ -1871,42 +1938,62 @@ function TasksTab({
               <div className="space-y-2">
                 {filtered
                   .filter((task) => task.status === status)
-                  .map((task) => (
-                    <button
-                      key={task.id}
-                      draggable
-                      onDragStart={() => setDragId(task.id)}
-                      onClick={() => onSelect(task, "board")}
-                      className="w-full rounded-lg border border-border bg-card p-3 text-left shadow-[var(--shadow-soft)] hover:border-ring/40"
-                    >
-                      <div className="text-sm font-medium">{task.title}</div>
-                      <div className="mt-2 flex items-center justify-between">
-                        <Person person={task.assignee} compact />
-                        <span
-                          className={cn(
-                            "whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] capitalize",
-                            priorityStyles[task.priority],
+                  .map((task) => {
+                    const group = groups.groups.get(task.id);
+                    const canMove = permissionsFor(task).canMove;
+                    return (
+                      <button
+                        key={task.id}
+                        draggable={canMove}
+                        onDragStart={canMove ? () => setDragId(task.id) : undefined}
+                        onClick={() => onSelect(task, "board")}
+                        title={canMove ? undefined : group ? GROUP_STATUS_HINT : READ_ONLY_HINT}
+                        className="w-full rounded-lg border border-border bg-card p-3 text-left shadow-[var(--shadow-soft)] hover:border-ring/40"
+                      >
+                        <div className="text-sm font-medium">{task.title}</div>
+                        {task.parentTaskId && (
+                          <PartOfGroup
+                            title={groups.parentOf.get(task.id)?.title}
+                            className="mt-1"
+                          />
+                        )}
+                        {group && (
+                          <GroupMembersStrip group={group} orgId={orgId} className="mt-2" />
+                        )}
+                        <div className="mt-2 flex items-center justify-between">
+                          {group ? (
+                            <span className="text-[10px] text-muted-foreground">
+                              {groupSummary(group)}
+                            </span>
+                          ) : (
+                            <Person person={task.assignee} compact />
                           )}
-                        >
-                          {task.priority}
-                        </span>
-                      </div>
-                      <div className="mt-3 flex items-center justify-between text-[10px] text-muted-foreground">
-                        <span
-                          className={cn(
-                            "whitespace-nowrap",
-                            isOverdue(task, today) && "text-destructive",
-                          )}
-                        >
-                          {formatDay(task.dueDate, "MMM d")}
-                        </span>
-                        <span className="whitespace-nowrap">
-                          {task.subtasks.filter((item) => item.completed).length}/
-                          {task.subtasks.length} subtasks
-                        </span>
-                      </div>
-                    </button>
-                  ))}
+                          <span
+                            className={cn(
+                              "whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] capitalize",
+                              priorityStyles[task.priority],
+                            )}
+                          >
+                            {task.priority}
+                          </span>
+                        </div>
+                        <div className="mt-3 flex items-center justify-between text-[10px] text-muted-foreground">
+                          <span
+                            className={cn(
+                              "whitespace-nowrap",
+                              isOverdue(task, today) && "text-destructive",
+                            )}
+                          >
+                            {formatDay(task.dueDate, "MMM d")}
+                          </span>
+                          <span className="whitespace-nowrap">
+                            {task.subtasks.filter((item) => item.completed).length}/
+                            {task.subtasks.length} subtasks
+                          </span>
+                        </div>
+                      </button>
+                    );
+                  })}
               </div>
             </div>
           ))}
@@ -2180,7 +2267,7 @@ function TeamTab({
                   ))
                 ) : (
                   <p className="text-sm text-muted-foreground">
-                    No tasks assigned in this project.
+                    No tasks of theirs that you can see in this project.
                   </p>
                 )}
               </Section>
@@ -2198,7 +2285,8 @@ function TeamTab({
             <AlertDialogDescription>
               {activeForRemoval.length
                 ? `This member currently has ${plural(activeForRemoval.length, "active task")} in this project. Reassign them before removal.`
-                : "This member has no active project tasks."}
+                : // Only the tasks this viewer may see: a manager sees their own people's.
+                  "You can't see any open tasks of theirs in this project. Any tasks they have stay assigned to them."}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -2713,6 +2801,7 @@ function DocumentsTab({
   state,
   uploading,
   onUpload,
+  onAddLink,
   onDelete,
   onRetry,
 }: {
@@ -2722,6 +2811,7 @@ function DocumentsTab({
   state: LoadState;
   uploading: boolean;
   onUpload: (files: File[]) => Promise<void>;
+  onAddLink: (link: LinkInput) => Promise<boolean>;
   onDelete: (file: StoredFile) => Promise<boolean>;
   onRetry: () => void;
 }) {
@@ -2735,7 +2825,7 @@ function DocumentsTab({
     .filter(
       (file) =>
         file.name.toLowerCase().includes(query.toLowerCase()) &&
-        (type === "all" || fileType(file) === type),
+        (type === "all" || storedFileType(file) === type),
     )
     .sort((a, b) =>
       sort === "name" ? a.name.localeCompare(b.name) : b.createdAt.localeCompare(a.createdAt),
@@ -2771,10 +2861,13 @@ function DocumentsTab({
             void onUpload(files);
           }}
         />
-        <Button size="sm" onClick={pick} disabled={uploading || state !== "ready"}>
-          <Upload className="h-4 w-4" />
-          {uploading ? "Uploading..." : "Upload"}
-        </Button>
+        <div className="flex items-center gap-2">
+          <AddLinkButton onAdd={onAddLink} disabled={state !== "ready"} className="h-8 px-3" />
+          <Button size="sm" onClick={pick} disabled={uploading || state !== "ready"}>
+            <Upload className="h-4 w-4" />
+            {uploading ? "Uploading..." : "Upload"}
+          </Button>
+        </div>
       </div>
       {state !== "ready" ? (
         <div className="rounded-xl border border-border bg-card">
@@ -2801,7 +2894,7 @@ function DocumentsTab({
             <CompactSelect
               value={type}
               onValue={setType}
-              options={["all", ...Array.from(new Set(documents.map(fileType)))]}
+              options={["all", ...Array.from(new Set(documents.map(storedFileType)))]}
               label="File Type"
             />
             <CompactSelect
@@ -2827,10 +2920,7 @@ function DocumentsTab({
                 {filtered.map((file) => (
                   <tr key={file.id} className="border-t border-border">
                     <td className="px-4 py-3">
-                      <div className="flex items-center gap-2">
-                        <FileText className="h-4 w-4 shrink-0 text-muted-foreground" />
-                        <span className="break-all font-medium">{file.name}</span>
-                      </div>
+                      <StoredFileName file={file} />
                     </td>
                     <td className="px-4 py-3 text-xs">{file.uploadedBy.name}</td>
                     <td className="whitespace-nowrap px-4 py-3 text-xs text-muted-foreground">
@@ -2853,12 +2943,14 @@ function DocumentsTab({
                         <DropdownMenuContent align="end">
                           <DropdownMenuItem onSelect={() => void openStoredFile(file, false)}>
                             <FolderOpen />
-                            Preview
+                            {file.kind === "link" ? "Open link" : "Preview"}
                           </DropdownMenuItem>
-                          <DropdownMenuItem onSelect={() => void openStoredFile(file, true)}>
-                            <Download />
-                            Download
-                          </DropdownMenuItem>
+                          {file.kind === "file" && (
+                            <DropdownMenuItem onSelect={() => void openStoredFile(file, true)}>
+                              <Download />
+                              Download
+                            </DropdownMenuItem>
+                          )}
                           {(file.isMine || canManage) && (
                             <>
                               <DropdownMenuSeparator />
@@ -2890,7 +2982,7 @@ function DocumentsTab({
           <EmptyState
             icon={FileText}
             title="No project documents yet"
-            description="Keep project briefs, references and important files together."
+            description="Upload project files, or add a link to a SharePoint document so everyone works on the same copy."
             action="Upload Document"
             onAction={pick}
           />
@@ -2906,7 +2998,9 @@ function DocumentsTab({
               Delete “{deleteTarget?.name}”?
             </AlertDialogTitle>
             <AlertDialogDescription>
-              The file will be removed from this project.
+              {deleteTarget?.kind === "link"
+                ? "The link will be removed from this project. The document it points to is not changed."
+                : "The file will be removed from this project."}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

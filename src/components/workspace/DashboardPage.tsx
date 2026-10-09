@@ -286,6 +286,7 @@ function buildTrend(tasks: DashboardTask[], start: string, end: string, timezone
 function describe(item: DashboardActivity, statusLabel: StatusLabel): { verb: string; target: string; suffix: string } {
   const details = item.details && typeof item.details === "object" && !Array.isArray(item.details) ? item.details : {};
   const to = typeof details.to === "string" ? details.to : null;
+  const isLink = details.kind === "link";
   const target = item.taskTitle || item.projectName || "work";
   const sentence = (verb: string, suffix = "") => ({ verb, target, suffix });
   switch (item.event_type) {
@@ -297,10 +298,10 @@ function describe(item: DashboardActivity, statusLabel: StatusLabel): { verb: st
     case "task_due_date_changed": return sentence("changed the due date for");
     case "task_updated": return sentence("edited");
     case "task_commented": return sentence("commented on");
-    case "task_file_attached": return sentence("attached a file to");
+    case "task_file_attached": return sentence(isLink ? "added a link to" : "attached a file to");
     case "task_archived": return sentence("deleted");
     case "project_updated": return sentence("updated");
-    case "project_document_added": return sentence("uploaded a document to");
+    case "project_document_added": return sentence(isLink ? "added a link to" : "uploaded a document to");
     case "milestone_completed": return sentence("completed a milestone in");
     default: return sentence(String(item.event_type).replace(/_/g, " "));
   }

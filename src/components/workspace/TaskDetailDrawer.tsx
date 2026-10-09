@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Pencil, Trash2 } from "lucide-react";
+import { Pencil, Trash2, Users } from "lucide-react";
 import { toast } from "sonner";
 import {
   Sheet,
@@ -19,6 +19,7 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useTaskSettings } from "@/lib/task-settings-data";
 import { useWorkspace, type WorkspaceTask } from "@/lib/workspace-data";
+import { useTaskAccess } from "@/lib/use-task-access";
 import { ConfirmDialog } from "./task-detail/ConfirmDialog";
 import { TaskEditForm } from "./task-detail/TaskEditForm";
 import { TaskOverview } from "./task-detail/TaskOverview";
@@ -30,6 +31,11 @@ export interface TaskDetailDrawerProps {
   onOpenChange: (open: boolean) => void;
   /** "sheet" slides in beside lists; "modal" centers over Kanban boards so columns don't reflow. */
   variant?: "sheet" | "modal";
+  /**
+   * Opens another task in this drawer: a person's part from a group task's
+   * People, or the group from a part. Without it those are shown, not linked.
+   */
+  onOpenTask?: (id: string) => void;
 }
 
 type Layout = NonNullable<TaskDetailDrawerProps["variant"]>;
@@ -45,12 +51,21 @@ export function TaskDetailDrawer({
   open,
   onOpenChange,
   variant = "sheet",
+  onOpenTask,
 }: TaskDetailDrawerProps) {
   if (!task) return null;
   const close = () => onOpenChange(false);
   // Keyed by task id: switching tasks resets edit mode and drafts, and reloads
   // comments, files and activity for the new task.
-  const content = <TaskDetail key={task.id} task={task} layout={variant} onClose={close} />;
+  const content = (
+    <TaskDetail
+      key={task.id}
+      task={task}
+      layout={variant}
+      onClose={close}
+      onOpenTask={onOpenTask}
+    />
+  );
 
   if (variant === "modal") {
     return (
@@ -81,12 +96,17 @@ function TaskDetail({
   task,
   layout,
   onClose,
+  onOpenTask,
 }: {
   task: WorkspaceTask;
   layout: Layout;
   onClose: () => void;
+  onOpenTask?: (id: string) => void;
 }) {
-  const { deleteTask } = useWorkspace();
+  const { deleteTask, groups } = useWorkspace();
+  const { permissionsFor } = useTaskAccess();
+  const permissions = permissionsFor(task);
+  const group = groups.groups.get(task.id);
   const { statusLabelFor } = useTaskSettings();
   const statusLabel = (value: string) => statusLabelFor(value, task.organizationId);
   const [editing, setEditing] = useState(false);
@@ -108,17 +128,26 @@ function TaskDetail({
     return true;
   };
 
-  const body = editing ? (
-    <TaskEditForm
-      task={task}
-      onDone={() => {
-        setEditing(false);
-        bump();
-      }}
-    />
-  ) : (
-    <TaskOverview task={task} refreshKey={`${task.updatedAt}:${version}`} onChanged={bump} />
-  );
+  const body =
+    editing && permissions.canEdit ? (
+      <TaskEditForm
+        task={task}
+        canChangeAssignee={permissions.canChangeAssignee}
+        isGroup={Boolean(group)}
+        onDone={() => {
+          setEditing(false);
+          bump();
+        }}
+      />
+    ) : (
+      <TaskOverview
+        task={task}
+        permissions={permissions}
+        refreshKey={`${task.updatedAt}:${version}`}
+        onChanged={bump}
+        onOpenTask={onOpenTask}
+      />
+    );
 
   return (
     <>
@@ -137,32 +166,45 @@ function TaskDetail({
             <span className="truncate" title={task.project}>
               {task.project}
             </span>
+            {group && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span className="inline-flex shrink-0 items-center gap-1 font-medium text-foreground/80">
+                  <Users className="h-3 w-3" aria-hidden="true" /> Group task
+                </span>
+              </>
+            )}
           </div>
-          {!editing && (
+          {!editing && (permissions.canEdit || permissions.canDelete) && (
             <div className="flex shrink-0 items-center gap-1">
-              {/* Edit and delete lived nowhere before: only the status could change (FD-006). */}
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7 text-muted-foreground"
-                aria-label="Edit task"
-                title="Edit task"
-                onClick={() => setEditing(true)}
-              >
-                <Pencil className="h-3.5 w-3.5" />
-              </Button>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7 text-muted-foreground hover:text-destructive"
-                aria-label="Delete task"
-                title="Delete task"
-                onClick={() => setConfirmDelete(true)}
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-              </Button>
+              {/* Edit and delete lived nowhere before: only the status could change (FD-006).
+                  Since 9 Oct only the people the database lets change a task see them. */}
+              {permissions.canEdit && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7 text-muted-foreground"
+                  aria-label="Edit task"
+                  title="Edit task"
+                  onClick={() => setEditing(true)}
+                >
+                  <Pencil className="h-3.5 w-3.5" />
+                </Button>
+              )}
+              {permissions.canDelete && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7 text-muted-foreground hover:text-destructive"
+                  aria-label="Delete task"
+                  title="Delete task"
+                  onClick={() => setConfirmDelete(true)}
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </Button>
+              )}
             </div>
           )}
         </div>
@@ -185,7 +227,11 @@ function TaskDetail({
         open={confirmDelete}
         onOpenChange={setConfirmDelete}
         title="Delete this task?"
-        description={`“${shorten(task.title, 80)}” will be removed from every list and board. Its history is kept.`}
+        description={
+          group
+            ? `“${shorten(task.title, 80)}” and every person's part in it will be removed from every list and board. Its history is kept.`
+            : `“${shorten(task.title, 80)}” will be removed from every list and board. Its history is kept.`
+        }
         confirmLabel="Delete task"
         onConfirm={remove}
       />

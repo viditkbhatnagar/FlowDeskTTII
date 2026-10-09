@@ -8,6 +8,7 @@ import { colorFor, describeActivity, listRecentActivity, personRef, type Activit
 import {
   CAPACITY,
   NO_DEPARTMENT,
+  TEAM_NOTE,
   UNASSIGNED,
   assigneeOptions as buildAssigneeOptions,
   buildScopedRoster,
@@ -15,9 +16,14 @@ import {
   countWithTasks,
   departmentOptions as buildDepartmentOptions,
   filterRoster,
+  isPartialRoster,
   rosterScopes,
   type WorkloadMember,
 } from "@/lib/team-roster";
+import { GROUP_STATUS_HINT, foldGroups, groupSummary, type TaskGroup } from "@/lib/task-groups";
+import { READ_ONLY_HINT } from "@/lib/task-permissions";
+import { useTaskAccess } from "@/lib/use-task-access";
+import { GroupAvatars, GroupMembersStrip, PartOfGroup, ReadOnlyStatus } from "./TaskGroupParts";
 import { todayIn } from "@/lib/today";
 import { WorkspaceState } from "@/components/workspace/WorkspaceState";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -44,8 +50,12 @@ import { cn } from "@/lib/utils";
 import { TaskDetailDrawer } from "./TaskDetailDrawer";
 
 interface TeamTask extends WorkspaceTask {
+  /** The assignee's department; a group's when all its people share one, else "". */
   department: string;
 }
+
+/** Assignee filter key of a group task: it belongs to its people, not to "Unassigned". */
+const GROUP_KEY = "__group";
 
 // One column per real status. There used to be "Backlog" and "Assigned" columns,
 // neither of which exists in Settings › Task Status: both were `todo`, split first
@@ -135,7 +145,8 @@ export function TeamTasksPage({
   onLinkedTaskClosed?: () => void;
 }) {
   const [view, setView] = useState<"kanban" | "table" | "timeline">("kanban");
-  const { tasks: workspaceTasks, updateTask, status: loadStatus, people } = useWorkspace();
+  const { tasks: workspaceTasks, updateTask, status: loadStatus, people, groups } = useWorkspace();
+  const access = useTaskAccess();
   const { users, currentUser, departments: orgDepartments, organizations, activeOrgId, canManageUsers } = useOrganizations();
   const { statusLabel, statusLabelFor, priorities } = useTaskSettings();
 
@@ -162,31 +173,40 @@ export function TeamTasksPage({
     };
   }, [users, departmentNames]);
 
-  const items = useMemo<TeamTask[]>(
-    () => workspaceTasks.map((task) => ({ ...task, department: departmentOf(task) })),
-    [workspaceTasks, departmentOf],
-  );
+  const items = useMemo<TeamTask[]>(() => {
+    const plain = workspaceTasks.map((task) => ({ ...task, department: departmentOf(task) }));
+    const byId = new Map(plain.map((task) => [task.id, task]));
+    // A group sits in a department only when every part of it the viewer sees does.
+    return plain.map((task) => {
+      const group = groups.groups.get(task.id);
+      if (!group) return task;
+      const shared = new Set(group.members.map((m) => byId.get(m.taskId)?.department ?? NO_DEPARTMENT));
+      return { ...task, department: shared.size === 1 ? [...shared][0] : "" };
+    });
+  }, [workspaceTasks, departmentOf, groups]);
+  const isGroup = (task: WorkspaceTask) => groups.groups.has(task.id);
 
-  // Admins and managers see every task in their organizations, so they get the
-  // whole team — people with nothing assigned too — not only today's assignees
-  // (QA bug 6). A team lead gets their own team (see rosterScopes). Employees
-  // see only their own tasks, so they keep the assignee-only view (no roster).
-  const scopes = useMemo(() => rosterScopes(currentUser), [currentUser]);
+  // An admin sees every task in their organizations, so they get the whole
+  // team — people with nothing assigned too — not only today's assignees (QA
+  // bug 6). Anyone else gets the people they manage and themselves (spec rule
+  // c): those are whose tasks they can see.
+  const scopes = useMemo(() => rosterScopes(currentUser, access.management), [currentUser, access.management]);
   const roster = useMemo(
     () => buildScopedRoster(users, scopes, departmentNames, personRef),
     [users, scopes, departmentNames],
   );
   const hasRoster = roster.length > 0;
-  // A team lead's counts leave out projects they are not part of.
-  const partialView = scopes.length > 0 && !scopes.every((scope) => scope.whole);
+  const partialView = isPartialRoster(scopes);
 
   // Only offer options that actually appear (on a task or on the team), so no
-  // filter can match nothing.
+  // filter can match nothing. A group is its people's, so it adds no
+  // "Unassigned" and no department of its own.
+  const personalItems = useMemo(() => items.filter((t) => !groups.groups.has(t.id)), [items, groups]);
   const departmentOptions = useMemo(
-    () => buildDepartmentOptions(items.map((t) => t.department), roster),
-    [items, roster],
+    () => buildDepartmentOptions(personalItems.map((t) => t.department), roster),
+    [personalItems, roster],
   );
-  const assigneeOptions = useMemo(() => buildAssigneeOptions(items, roster), [items, roster]);
+  const assigneeOptions = useMemo(() => buildAssigneeOptions(personalItems, roster), [personalItems, roster]);
   const projectOptions = useMemo(() => [...new Set(items.map((t) => t.project))].sort(), [items]);
 
   const [dragId, setDragId] = useState<string | null>(null);
@@ -199,18 +219,26 @@ export function TeamTasksPage({
   const [selectedId, setSelectedId] = useState<string>();
   const activeFilterCount = [priorityFilter, assigneeFilter, projectFilter].filter((v) => v !== "all").length;
 
+  // Every task the filters keep, a group's parts included: the people panels
+  // count each person's own part. The board shows `cards`.
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return items.filter(
-      (t) =>
+    return items.filter((t) => {
+      const group = groups.groups.has(t.id);
+      return (
         matchesDashboardFilter(t, dashboardFilter, today) &&
         (dept === "all" || t.department === dept) &&
         (priorityFilter === "all" || t.priority === priorityFilter) &&
-        (assigneeFilter === "all" || (t.assigneeId ?? UNASSIGNED) === assigneeFilter) &&
+        (assigneeFilter === "all" || (group ? GROUP_KEY : (t.assigneeId ?? UNASSIGNED)) === assigneeFilter) &&
         (projectFilter === "all" || t.project === projectFilter) &&
-        (q === "" || t.title.toLowerCase().includes(q) || t.assignee.name.toLowerCase().includes(q)),
-    );
-  }, [items, query, dept, priorityFilter, assigneeFilter, projectFilter, dashboardFilter, today]);
+        (q === "" || t.title.toLowerCase().includes(q) || (!group && t.assignee.name.toLowerCase().includes(q)))
+      );
+    });
+  }, [items, groups, query, dept, priorityFilter, assigneeFilter, projectFilter, dashboardFilter, today]);
+  // One card per unit of work: a group's parts fold into the group's card when
+  // it is in view too; when a filter leaves it out ("Dan's tasks"), each part
+  // in view keeps its own card (spec E).
+  const cards = useMemo(() => foldGroups(filtered), [filtered]);
 
   // "task:<id>" opens that task (C3); it does not narrow the board to one card.
   useEffect(() => {
@@ -270,24 +298,30 @@ export function TeamTasksPage({
     if (next !== "all") toolbarRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   };
 
-  // Every figure describes the tasks in view (FD-013). "Active" counted In
-  // Progress plus only some To Do tasks, and "Completed Today" was the all-time total.
+  // Every figure describes the cards in view (FD-013): a group counts once.
+  // "Active" counted In Progress plus only some To Do tasks, and "Completed
+  // Today" was the all-time total.
   const stats = useMemo(() => {
-    const total = filtered.length;
-    const active = filtered.filter((t) => isOpen(t.status)).length;
-    const delayed = filtered.filter((t) => isOpen(t.status) && dueDay(t) < today).length;
-    const done = filtered.filter((t) => t.status === "done").length;
-    const completedToday = filtered.filter(
+    const total = cards.length;
+    const active = cards.filter((t) => isOpen(t.status)).length;
+    const delayed = cards.filter((t) => isOpen(t.status) && dueDay(t) < today).length;
+    const done = cards.filter((t) => t.status === "done").length;
+    const completedToday = cards.filter(
       (t) => t.status === "done" && t.completedAt && dayIn(t.completedAt, orgTimezone) === today,
     ).length;
-    const reviews = filtered.filter((t) => t.status === "review").length;
+    const reviews = cards.filter((t) => t.status === "review").length;
     const completionRate = total ? Math.round((done / total) * 100) : 0;
     return { active, delayed, completedToday, reviews, completionRate };
-  }, [filtered, today, orgTimezone]);
+  }, [cards, today, orgTimezone]);
 
   const move = async (id: string, status: Status) => {
     const task = workspaceTasks.find((t) => t.id === id);
     if (!task || task.status === status) return;
+    // Not offered to them; this catches a drop from elsewhere. The database refuses it too.
+    if (!access.permissionsFor(task).canMove) {
+      toast.error(isGroup(task) ? `${GROUP_STATUS_HINT}.` : "You can't move this task.");
+      return;
+    }
     // updateTask reverts and shows its own error toast when the write fails.
     if (await updateTask(id, { status }))
       toast.success(`Moved to ${statusLabelFor(status, task.organizationId)}`, {
@@ -516,7 +550,7 @@ export function TeamTasksPage({
         {view === "kanban" && (
           <div className="grid gap-3 grid-cols-1 md:grid-cols-2 xl:grid-cols-4">
             {BOARD_STATUSES.map((status) => {
-              const cards = filtered.filter((t) => t.status === status);
+              const column = cards.filter((t) => t.status === status);
               return (
                 <div
                   key={status}
@@ -539,7 +573,7 @@ export function TeamTasksPage({
                       <span className={cn("h-2 w-2 rounded-full", statusDot[status])} />
                       <span className="text-[11px] font-semibold uppercase tracking-wide">{statusLabel(status)}</span>
                       <span className="rounded-md bg-card border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                        {cards.length}
+                        {column.length}
                       </span>
                     </div>
                     {/* New tasks start in To Do, so only that column offers "+"; the
@@ -555,11 +589,18 @@ export function TeamTasksPage({
                     )}
                   </div>
                   <div className="flex flex-col gap-2 flex-1">
-                    {cards.map((task) => (
+                    {column.map((task) => (
                       <TeamTaskCard
                         key={task.id}
                         task={task}
                         today={today}
+                        group={groups.groups.get(task.id)}
+                        parentTitle={groups.parentOf.get(task.id)?.title}
+                        canMove={access.permissionsFor(task).canMove}
+                        onOpenParent={() => {
+                          const parent = groups.parentOf.get(task.id);
+                          if (parent) setSelectedId(parent.id);
+                        }}
                         onDragStart={(e) => {
                           // Firefox starts no drag without data (FD-071).
                           e.dataTransfer.setData("text/plain", task.id);
@@ -571,7 +612,7 @@ export function TeamTasksPage({
                         onMove={(next) => void move(task.id, next)}
                       />
                     ))}
-                    {cards.length === 0 && (
+                    {column.length === 0 && (
                       <div className="flex-1 rounded-lg border border-dashed border-border/70 flex items-center justify-center text-[11px] text-muted-foreground py-6">
                         No tasks
                       </div>
@@ -583,8 +624,12 @@ export function TeamTasksPage({
           </div>
         )}
 
-        {view === "table" && <TableView tasks={filtered} today={today} onOpen={setSelectedId} />}
-        {view === "timeline" && <TimelineView tasks={filtered} today={today} onOpen={setSelectedId} />}
+        {view === "table" && (
+          <TableView tasks={cards} groups={groups.groups} parentOf={groups.parentOf} today={today} onOpen={setSelectedId} />
+        )}
+        {view === "timeline" && (
+          <TimelineView tasks={cards} groups={groups.groups} today={today} onOpen={setSelectedId} />
+        )}
       </section>
 
       {/* Team insights */}
@@ -596,7 +641,7 @@ export function TeamTasksPage({
           onSelect={toggleAssignee}
           emptyText={hasRoster ? "No team members match these filters." : "No tasks are assigned yet."}
           onManage={canManageUsers ? onManageMembers : undefined}
-          note={partialView ? "Your team. Counts include only tasks you can see: your projects and tasks outside projects." : undefined}
+          note={partialView ? TEAM_NOTE : undefined}
         />
         <HeatmapPanel
           members={workloadData}
@@ -613,6 +658,7 @@ export function TeamTasksPage({
         task={workspaceTasks.find((task) => task.id === selectedId)}
         open={Boolean(selectedId)}
         onOpenChange={closeDetail}
+        onOpenTask={setSelectedId}
       />
     </div>
   );
@@ -621,6 +667,10 @@ export function TeamTasksPage({
 function TeamTaskCard({
   task,
   today,
+  group,
+  parentTitle,
+  canMove,
+  onOpenParent,
   onDragStart,
   onDragEnd,
   onOpen,
@@ -628,6 +678,13 @@ function TeamTaskCard({
 }: {
   task: TeamTask;
   today: string;
+  /** Set when this card is a group task: its people and their own statuses. */
+  group?: TaskGroup;
+  /** On one person's part: the group's title when the viewer can see it. */
+  parentTitle?: string;
+  /** Spec B: only people allowed to move it can drag it or pick a status. */
+  canMove: boolean;
+  onOpenParent: () => void;
   onDragStart: (event: React.DragEvent) => void;
   onDragEnd: () => void;
   onOpen: () => void;
@@ -637,11 +694,14 @@ function TeamTaskCard({
   const overdue = isOpen(task.status) && dueDay(task) < today;
   return (
     <div
-      draggable
-      onDragStart={onDragStart}
-      onDragEnd={onDragEnd}
+      draggable={canMove}
+      onDragStart={canMove ? onDragStart : undefined}
+      onDragEnd={canMove ? onDragEnd : undefined}
       onClick={onOpen}
-      className="group rounded-lg border border-border bg-card p-3 shadow-sm hover:shadow-md hover:-translate-y-0.5 transition cursor-grab active:cursor-grabbing"
+      className={cn(
+        "group rounded-lg border border-border bg-card p-3 shadow-sm hover:shadow-md hover:-translate-y-0.5 transition",
+        canMove ? "cursor-grab active:cursor-grabbing" : "cursor-pointer",
+      )}
     >
       <div className="flex items-start justify-between gap-2">
         {/* A real button, so the card opens from the keyboard too. */}
@@ -653,27 +713,38 @@ function TeamTaskCard({
         >
           {task.title}
         </button>
-        {/* Keyboard alternative to dragging (FD-071); replaces a "…" button that did nothing. */}
-        <select
-          value={task.status}
-          aria-label={`Status of ${task.title}`}
-          onClick={(e) => e.stopPropagation()}
-          onKeyDown={(e) => e.stopPropagation()}
-          onChange={(e) => onMove(e.target.value as Status)}
-          className="h-6 max-w-[7.5rem] shrink-0 rounded border border-border bg-card px-1 text-[10px] text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
-        >
-          {BOARD_STATUSES.map((s) => (
-            <option key={s} value={s}>{statusLabelFor(s, task.organizationId)}</option>
-          ))}
-        </select>
+        {/* Keyboard alternative to dragging (FD-071); replaces a "…" button that did nothing.
+            A group's status follows its people, and only people allowed to move a task get a picker. */}
+        {canMove ? (
+          <select
+            value={task.status}
+            aria-label={`Status of ${task.title}`}
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => e.stopPropagation()}
+            onChange={(e) => onMove(e.target.value as Status)}
+            className="h-6 max-w-[7.5rem] shrink-0 rounded border border-border bg-card px-1 text-[10px] text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+          >
+            {BOARD_STATUSES.map((s) => (
+              <option key={s} value={s}>{statusLabelFor(s, task.organizationId)}</option>
+            ))}
+          </select>
+        ) : (
+          <ReadOnlyStatus
+            label={statusLabelFor(task.status, task.organizationId)}
+            hint={group ? GROUP_STATUS_HINT : READ_ONLY_HINT}
+          />
+        )}
       </div>
+      {task.parentTaskId && <PartOfGroup title={parentTitle} onOpen={parentTitle ? onOpenParent : undefined} className="mt-1" />}
       <div className="mt-2 flex items-center gap-1.5 flex-wrap">
         <span className={cn("whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-medium capitalize", priorityClass[task.priority])}>
           {task.priority}
         </span>
-        <span className="whitespace-nowrap rounded bg-secondary px-1.5 py-0.5 text-[10px] text-muted-foreground">
-          {task.department}
-        </span>
+        {task.department && (
+          <span className="whitespace-nowrap rounded bg-secondary px-1.5 py-0.5 text-[10px] text-muted-foreground">
+            {task.department}
+          </span>
+        )}
         {task.projectId && (
           <span className="inline-flex min-w-0 items-center gap-1 text-[10px] text-muted-foreground">
             <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: colorFor(task.project) }} />
@@ -690,17 +761,23 @@ function TeamTaskCard({
           <div className="h-full bg-primary transition-all" style={{ width: `${task.progress}%` }} />
         </div>
       </div>
+      {group && <GroupMembersStrip group={group} orgId={task.organizationId} className="mt-2.5" />}
       <div className="mt-3 flex items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-1.5">
-          <div
-            className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold text-white"
-            style={{ background: task.assignee.color }}
-            title={task.assignee.name}
-          >
-            {task.assignee.initials}
+        {group ? (
+          // The strip above already says "2 people · 1 done".
+          <span className="truncate text-[11px] text-muted-foreground">Group task</span>
+        ) : (
+          <div className="flex min-w-0 items-center gap-1.5">
+            <div
+              className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold text-white"
+              style={{ background: task.assignee.color }}
+              title={task.assignee.name}
+            >
+              {task.assignee.initials}
+            </div>
+            <span className="truncate text-[11px] text-muted-foreground">{task.assignee.name.split(" ")[0]}</span>
           </div>
-          <span className="truncate text-[11px] text-muted-foreground">{task.assignee.name.split(" ")[0]}</span>
-        </div>
+        )}
         <div className="flex shrink-0 items-center gap-2 text-[10px] text-muted-foreground">
           <span className="inline-flex items-center gap-1" aria-label={`${task.comments} comments`}>
             <MessageSquare className="h-3 w-3" /> {task.comments}
@@ -715,7 +792,19 @@ function TeamTaskCard({
   );
 }
 
-function TableView({ tasks, today, onOpen }: { tasks: TeamTask[]; today: string; onOpen: (id: string) => void }) {
+function TableView({
+  tasks,
+  groups,
+  parentOf,
+  today,
+  onOpen,
+}: {
+  tasks: TeamTask[];
+  groups: ReadonlyMap<string, TaskGroup>;
+  parentOf: ReadonlyMap<string, WorkspaceTask>;
+  today: string;
+  onOpen: (id: string) => void;
+}) {
   const { statusLabelFor } = useTaskSettings();
   const headings = ["Task", "Assigned To", "Department", "Status", "Priority", "Due Date", "Progress", "Last Updated"];
   return (
@@ -739,6 +828,8 @@ function TableView({ tasks, today, onOpen }: { tasks: TeamTask[]; today: string;
             )}
             {tasks.map((t) => {
               const overdue = isOpen(t.status) && dueDay(t) < today;
+              const group = groups.get(t.id);
+              const parent = parentOf.get(t.id);
               return (
                 <tr key={t.id} onClick={() => onOpen(t.id)} className="cursor-pointer border-t border-border hover:bg-accent/40 transition">
                   <td className="px-4 py-2.5 font-medium">
@@ -750,19 +841,32 @@ function TableView({ tasks, today, onOpen }: { tasks: TeamTask[]; today: string;
                     >
                       {t.title}
                     </button>
+                    {t.parentTaskId && (
+                      <PartOfGroup
+                        title={parent?.title}
+                        onOpen={parent ? () => onOpen(parent.id) : undefined}
+                        className="mt-0.5 font-normal"
+                      />
+                    )}
                   </td>
                   <td className="px-4 py-2.5">
-                    <div className="flex items-center gap-2">
-                      <div
-                        className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold text-white"
-                        style={{ background: t.assignee.color }}
-                      >
-                        {t.assignee.initials}
+                    {group ? (
+                      <GroupAvatars group={group} />
+                    ) : (
+                      <div className="flex items-center gap-2">
+                        <div
+                          className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold text-white"
+                          style={{ background: t.assignee.color }}
+                        >
+                          {t.assignee.initials}
+                        </div>
+                        <span className="whitespace-nowrap text-xs">{t.assignee.name}</span>
                       </div>
-                      <span className="whitespace-nowrap text-xs">{t.assignee.name}</span>
-                    </div>
+                    )}
                   </td>
-                  <td className="whitespace-nowrap px-4 py-2.5 text-xs text-muted-foreground">{t.department}</td>
+                  <td className="whitespace-nowrap px-4 py-2.5 text-xs text-muted-foreground">
+                    {t.department || "Several"}
+                  </td>
                   {/* Status names come from Settings; "review" was hardcoded as "Under Review" (FD-018). */}
                   <td className="whitespace-nowrap px-4 py-2.5 text-xs">
                     {statusLabelFor(t.status, t.organizationId)}
@@ -812,7 +916,17 @@ const dayLabel = (day: number, options: Intl.DateTimeFormatOptions) =>
  * ending on its due date, on a fixed today−3 … today+10 window, so a Sep 14–19
  * task drew as Sep 21–23 and there was no way to look elsewhere (FD-032).
  */
-function TimelineView({ tasks, today, onOpen }: { tasks: TeamTask[]; today: string; onOpen: (id: string) => void }) {
+function TimelineView({
+  tasks,
+  groups,
+  today,
+  onOpen,
+}: {
+  tasks: TeamTask[];
+  groups: ReadonlyMap<string, TaskGroup>;
+  today: string;
+  onOpen: (id: string) => void;
+}) {
   const todayNumber = dayNumber(today);
   const spans = useMemo(
     () =>
@@ -889,6 +1003,7 @@ function TimelineView({ tasks, today, onOpen }: { tasks: TeamTask[]; today: stri
               const from = Math.max(taskStart, start);
               const to = Math.min(due, end);
               const range = `${t.hasStartDate ? `${dayLabel(taskStart, { month: "short", day: "numeric" })} – ` : "No start date · due "}${dayLabel(due, { month: "short", day: "numeric" })}`;
+              const group = groups.get(t.id);
               return (
                 <div key={t.id} className="grid items-center" style={{ gridTemplateColumns: `${labelWidth}px ${timelineWidth}px` }}>
                   <button
@@ -908,10 +1023,14 @@ function TimelineView({ tasks, today, onOpen }: { tasks: TeamTask[]; today: stri
                     {to >= from ? (
                       <div
                         className="absolute top-1 h-5 rounded-md text-[10px] text-white flex items-center px-2 truncate"
-                        style={{ left: (from - start) * dayWidth, width: (to - from + 1) * dayWidth - 4, background: t.assignee.color }}
-                        title={`${t.title}: ${range}`}
+                        style={{
+                          left: (from - start) * dayWidth,
+                          width: (to - from + 1) * dayWidth - 4,
+                          background: group ? "var(--primary)" : t.assignee.color,
+                        }}
+                        title={`${t.title}: ${range}${group ? ` · ${groupSummary(group)}` : ""}`}
                       >
-                        {t.assignee.initials} · {t.progress}%
+                        {group ? `${group.total} people` : t.assignee.initials} · {t.progress}%
                       </div>
                     ) : (
                       // Outside the window: say which way it is instead of drawing it in the wrong place.

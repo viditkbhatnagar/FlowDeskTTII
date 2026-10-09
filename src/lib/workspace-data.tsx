@@ -4,7 +4,16 @@ import type { Priority, Status, Task } from "@/lib/mock-data";
 import { supabase } from "@/integrations/supabase/client";
 import type { Database } from "@/integrations/supabase/types";
 import { nextRecurrenceDate, recurrenceSummary, type RecurrenceRule } from "@/lib/recurrence";
-import { personRef, uploadTaskFiles, type PersonRef } from "@/lib/task-api";
+import { addTaskLinks, personRef, uploadTaskFiles, type PersonRef } from "@/lib/task-api";
+import type { LinkInput } from "@/lib/links";
+import {
+  NO_UNIT_LEADS,
+  createGroupTask,
+  distinctIds,
+  loadUnitLeads,
+  type UnitLeads,
+} from "@/lib/group-task-api";
+import { GROUP_STATUS_HINT, indexTaskGroups, type TaskGroupIndex } from "@/lib/task-groups";
 
 export interface Subtask {
   id: string;
@@ -33,6 +42,13 @@ export type WorkspaceTask = Task & {
   organizationId?: string;
   assigneeId?: string | null;
   reviewerId?: string | null;
+  /** Who created it; with the assignee and reviewer, decides who may change it (spec B). */
+  createdById?: string | null;
+  /**
+   * Set on one person's part of a group task: the group (parent) it belongs to.
+   * A parent has no assignee; see task-groups.ts.
+   */
+  parentTaskId?: string | null;
   blocked: boolean;
   blockedReason?: string;
   createdAt: string;
@@ -52,11 +68,19 @@ export type NewWorkspaceTask = Omit<
   blockedReason?: string;
   /** The person picked in the form. Was ignored: the creator was always saved (FD-001). */
   assigneeId?: string | null;
+  /**
+   * Two or more people: one group task with a part for each (create_group_task).
+   * One person, or none given, keeps the single-task path with `assigneeId`.
+   */
+  assigneeIds?: string[];
   /** Files to upload once the task exists (FD-058). */
   files?: File[];
+  /** Links (e.g. to SharePoint documents) to add once the task exists. */
+  links?: LinkInput[];
 };
 
 export type AddTaskResult =
+  /** rejectedFiles: files and links that could not be attached. */
   | { ok: true; task: WorkspaceTask; rejectedFiles: { name: string; reason: string }[] }
   | { ok: false; error: string };
 
@@ -72,6 +96,10 @@ type WorkspaceContextValue = {
   status: WorkspaceStatus;
   /** Everyone whose profile this user can see, for pickers and avatars. */
   people: PersonRef[];
+  /** Group tasks among `tasks`: each group's visible people, and each part's group. */
+  groups: TaskGroupIndex<WorkspaceTask>;
+  /** Department heads and team leads by user id, for who manages whom (use-task-access.ts). */
+  unitLeads: UnitLeads;
   addTask: (task: NewWorkspaceTask) => Promise<AddTaskResult>;
   /** Optimistic; reverts and shows an error when the database refuses the write. */
   updateTask: (id: string, updates: Partial<WorkspaceTask>) => Promise<boolean>;
@@ -136,6 +164,8 @@ function mapRow(row: TaskRow, personFor: (id: string | null | undefined) => Pers
     assignee: { name: assignee.name, initials: assignee.initials, color: assignee.color },
     assigneeId: row.assignee_id,
     reviewerId: row.reviewer_id,
+    createdById: row.created_by,
+    parentTaskId: row.parent_task_id ?? null,
     status: row.status as Status,
     priority: row.priority as Priority,
     dueDate: row.due_at ?? `${row.due_date ?? today()}T23:59:59`,
@@ -169,8 +199,14 @@ function friendlyError(error: unknown, fallback: string): string {
   if (/row-level security|permission denied/i.test(message)) return "You don't have permission to do that.";
   // Messages raised by our own validation triggers are already written for people.
   if (/must be|cannot be|at most|or fewer/i.test(message)) return message;
+  // create_group_task and the group guards raise their sentences as 22023.
+  if ((error as { code?: string } | null)?.code === "22023" && message) return message;
   return fallback;
 }
+
+/** The tasks a change to `task` can alter in the database too: its group's parent or parts. */
+const groupRelated = (task: WorkspaceTask, all: readonly WorkspaceTask[]) =>
+  Boolean(task.parentTaskId) || all.some((other) => other.parentTaskId === task.id);
 
 const announce = () => window.dispatchEvent(new Event("flowdesk-work-changed"));
 
@@ -183,6 +219,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const [tasks, setTasks] = useState<WorkspaceTask[]>([]);
   const [status, setStatus] = useState<WorkspaceStatus>("loading");
   const [people, setPeople] = useState<PersonRef[]>([]);
+  const [unitLeads, setUnitLeads] = useState<UnitLeads>(NO_UNIT_LEADS);
   // Latest tasks for callbacks that must not go stale between renders.
   const tasksRef = useRef<WorkspaceTask[]>([]);
   tasksRef.current = tasks;
@@ -195,10 +232,13 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   );
 
   const fetchAll = useCallback(async (): Promise<boolean> => {
-    const [{ data: rows, error }, { data: profiles }] = await Promise.all([
+    const [{ data: rows, error }, { data: profiles }, leads] = await Promise.all([
       supabase.from("work_tasks").select(TASK_SELECT).is("archived_at", null),
       supabase.from("profiles").select("user_id, full_name, username"),
+      loadUnitLeads(),
     ]);
+    // Kept as they were when the read fails: they only decide which controls show.
+    if (leads) setUnitLeads(leads);
     if (error || !rows) {
       console.error("[flowdesk] failed to load work_tasks", error);
       return false;
@@ -299,9 +339,68 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       projectId = named[0].id;
     }
 
+    const subtaskTitles = (input.subtasks ?? []).map((s) => s.title.trim()).filter(Boolean);
+    const reviewerId = input.status === "review" ? auth.user.id : null;
+
+    // Two or more people: one group task, a part for each, created together by
+    // the database (spec C). Each person moves their own part.
+    const groupAssignees = distinctIds(input.assigneeIds ?? []);
+    if (groupAssignees.length >= 2) {
+      // The New Task form switches Recurring off for several people: a schedule
+      // spawns one task, not a group.
+      if (input.recurrence) {
+        return { ok: false, error: "A task for several people can't repeat. Switch off Recurring task." };
+      }
+      const group = await createGroupTask(
+        {
+          organizationId,
+          projectId,
+          title: input.title,
+          description: input.description ?? null,
+          priority: input.priority,
+          status: input.status,
+          dueDate: input.dueDate.slice(0, 10),
+          dueAt: null,
+          startDate: input.startDate ? input.startDate.slice(0, 10) : null,
+          estimatedHours: input.estimatedHours ?? null,
+          tags: input.tags ?? [],
+          reviewerId,
+        },
+        groupAssignees,
+        subtaskTitles,
+      );
+      if (!group.ok) return { ok: false, error: group.error };
+
+      // Files and links belong to the group task, where everyone in it can open them.
+      let groupRejected: { name: string; reason: string }[] = [];
+      if (input.files?.length) {
+        const upload = await uploadTaskFiles({ id: group.id, organizationId }, input.files);
+        groupRejected = upload.rejected;
+      }
+      if (input.links?.length) {
+        const saved = await addTaskLinks({ id: group.id }, input.links);
+        groupRejected = [...groupRejected, ...saved.rejected];
+      }
+      const [{ data: parentRow }] = await Promise.all([
+        supabase.from("work_tasks").select(TASK_SELECT).eq("id", group.id).maybeSingle(),
+        // The parent and every part, with the status the database derived.
+        fetchAll(),
+      ]);
+      const parent = parentRow
+        ? mapRow(parentRow as unknown as TaskRow, personFor)
+        : ({ ...input, id: group.id, assigneeId: null } as unknown as WorkspaceTask);
+      announce();
+      return { ok: true, task: parent, rejectedFiles: groupRejected };
+    }
+
     // The person picked in the form. This used to be auth.user.id unconditionally,
     // so every task was silently assigned to its creator (FD-001).
-    const assigneeId = input.assigneeId === undefined ? auth.user.id : input.assigneeId;
+    const assigneeId =
+      groupAssignees.length === 1
+        ? groupAssignees[0]
+        : input.assigneeId === undefined
+          ? auth.user.id
+          : input.assigneeId;
 
     let recurrenceId: string | null = null;
     if (input.recurrence) {
@@ -316,7 +415,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
           title: input.title,
           description: input.description ?? null,
           assignee_id: assigneeId,
-          reviewer_id: input.status === "review" ? auth.user.id : null,
+          reviewer_id: reviewerId,
           task_status: input.status,
           priority: input.priority,
           estimated_hours: input.estimatedHours,
@@ -352,7 +451,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         status: input.status,
         priority: input.priority,
         assignee_id: assigneeId,
-        reviewer_id: input.status === "review" ? auth.user.id : null,
+        reviewer_id: reviewerId,
         created_by: auth.user.id,
         start_date: input.startDate ? input.startDate.slice(0, 10) : null,
         due_date: input.dueDate.slice(0, 10),
@@ -373,7 +472,6 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     }
 
     // Subtasks the user typed into the form. They were discarded before (FD-004).
-    const subtaskTitles = (input.subtasks ?? []).map((s) => s.title.trim()).filter(Boolean);
     if (subtaskTitles.length) {
       const { error: subtaskError } = await supabase.from("task_subtasks").insert(
         subtaskTitles.map((title, index) => ({ task_id: created.id, title, sort_order: index + 1 })),
@@ -386,6 +484,10 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       const upload = await uploadTaskFiles({ id: created.id, organizationId }, input.files);
       rejectedFiles = upload.rejected;
     }
+    if (input.links?.length) {
+      const saved = await addTaskLinks({ id: created.id }, input.links);
+      rejectedFiles = [...rejectedFiles, ...saved.rejected];
+    }
 
     const { data: row } = await supabase.from("work_tasks").select(TASK_SELECT).eq("id", created.id).single();
     const task = row
@@ -394,11 +496,17 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     setTasks((current) => [task, ...current]);
     announce();
     return { ok: true, task, rejectedFiles };
-  }, [personFor]);
+  }, [fetchAll, personFor]);
 
   const updateTask = useCallback(async (id: string, updates: Partial<WorkspaceTask>): Promise<boolean> => {
     const before = tasksRef.current.find((task) => task.id === id);
     if (!before) return false;
+    // A group's status follows its people; the database refuses it outright.
+    const isParent = tasksRef.current.some((task) => task.parentTaskId === id);
+    if (isParent && updates.status !== undefined && updates.status !== before.status) {
+      toast.error(`${GROUP_STATUS_HINT}.`);
+      return false;
+    }
 
     const next: WorkspaceTask = { ...before, ...updates };
     // Clearing the start date falls back to the creation time, as on load.
@@ -450,8 +558,10 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     }
 
     // Completing a recurring task can create its next occurrence server-side;
-    // pull it in now instead of on the next full reload (FD-065).
-    if (updates.status === "done" && before.recurrenceId) await refresh();
+    // pull it in now instead of on the next full reload (FD-065). A part of a
+    // group moves the group, and a group's details are copied to its parts.
+    if ((updates.status === "done" && before.recurrenceId) || groupRelated(before, tasksRef.current))
+      await refresh();
     else await reloadTask(id);
     announce();
     return true;
@@ -460,17 +570,22 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const deleteTask = useCallback(async (id: string): Promise<boolean> => {
     const before = tasksRef.current.find((task) => task.id === id);
     if (!before) return false;
-    setTasks((current) => current.filter((task) => task.id !== id));
+    // Deleting a group deletes its parts with it (the database archives them).
+    const removed = tasksRef.current.filter((task) => task.id === id || task.parentTaskId === id);
+    const related = groupRelated(before, tasksRef.current);
+    setTasks((current) => current.filter((task) => task.id !== id && task.parentTaskId !== id));
     const { error } = await supabase.from("work_tasks").update({ archived_at: new Date().toISOString() }).eq("id", id);
     if (error) {
       console.error("[flowdesk] task delete failed", error);
-      setTasks((current) => [before, ...current]);
+      setTasks((current) => [...removed, ...current]);
       toast.error(friendlyError(error, "The task could not be deleted."));
       return false;
     }
+    // A removed part changes its group's status and count.
+    if (related) await refresh();
     announce();
     return true;
-  }, []);
+  }, [refresh]);
 
   const setSubtasksLocally = useCallback((taskId: string, change: (subtasks: Subtask[]) => Subtask[]) => {
     setTasks((current) =>
@@ -532,9 +647,24 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     return true;
   }, [reloadTask, setSubtasksLocally]);
 
+  const groups = useMemo(() => indexTaskGroups(tasks), [tasks]);
+
   const value = useMemo<WorkspaceContextValue>(
-    () => ({ tasks, status, people, addTask, updateTask, deleteTask, addSubtask, toggleSubtask, removeSubtask, refresh }),
-    [tasks, status, people, addTask, updateTask, deleteTask, addSubtask, toggleSubtask, removeSubtask, refresh],
+    () => ({
+      tasks,
+      status,
+      people,
+      groups,
+      unitLeads,
+      addTask,
+      updateTask,
+      deleteTask,
+      addSubtask,
+      toggleSubtask,
+      removeSubtask,
+      refresh,
+    }),
+    [tasks, status, people, groups, unitLeads, addTask, updateTask, deleteTask, addSubtask, toggleSubtask, removeSubtask, refresh],
   );
 
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>;

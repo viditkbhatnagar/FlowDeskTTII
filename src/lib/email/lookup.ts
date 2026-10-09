@@ -16,6 +16,8 @@ import { localParts } from "./time";
 export const MANAGEMENT_ROLES: ReadonlySet<string> = new Set(["admin", "manager", "team_lead"]);
 /** Every project in the organization is open to them (private.has_project_oversight). */
 export const OVERSIGHT_ROLES: ReadonlySet<string> = new Set(["admin", "manager"]);
+/** Every task in the organization is open to them (private.can_view_task, rule b). */
+const ADMIN_ROLES: ReadonlySet<string> = new Set(["admin"]);
 
 export const isOpenTask = (task: Pick<SnapshotTask, "status">) =>
   task.status !== "done" && task.status !== "cancelled";
@@ -31,7 +33,10 @@ export type SnapshotIndex = {
   taskById: ReadonlyMap<string, SnapshotTask>;
   projectById: ReadonlyMap<string, SnapshotProject>;
   tasksByOrg: ReadonlyMap<string, SnapshotTask[]>;
+  /** Each person's own work. A group's parent belongs to no one: each person has their child. */
   tasksByAssignee: ReadonlyMap<string, SnapshotTask[]>;
+  /** A group task's non-archived children in the snapshot, by the group's (parent's) id. */
+  childrenByParent: ReadonlyMap<string, SnapshotTask[]>;
   /** Active memberships of organizations in the snapshot, sorted by organization id. */
   activeOrgsByUser: ReadonlyMap<string, string[]>;
   primaryOrgByUser: ReadonlyMap<string, string>;
@@ -39,7 +44,7 @@ export type SnapshotIndex = {
   memberOrgsByUser: ReadonlyMap<string, string[]>;
   /**
    * Organizations where the person is admin, manager or team_lead AND an active member: they get
-   * the management summaries there, and RLS shows them every task with no project.
+   * the management summaries there. Which tasks those show is canSeeTask's business.
    */
   managedOrgsByUser: ReadonlyMap<string, string[]>;
   /**
@@ -47,6 +52,13 @@ export type SnapshotIndex = {
    * is open to them.
    */
   oversightOrgsByUser: ReadonlyMap<string, string[]>;
+  /** Organizations where the person is admin AND an active member: every task there is open. */
+  adminOrgsByUser: ReadonlyMap<string, string[]>;
+  /**
+   * `${organizationId}:${personId}` → who manages that person there (private.manages_person).
+   * Empty for a snapshot without reporting lines, so nobody manages anybody.
+   */
+  managersOf: ReadonlyMap<string, ReadonlySet<string>>;
   projectRoleLabels: ReadonlyMap<string, string | null>;
   projectCountById: ReadonlyMap<string, SnapshotProjectCount>;
   priorityLabels: ReadonlyMap<string, string>;
@@ -98,7 +110,47 @@ function membershipMaps(snapshot: EmailSnapshot, orgIds: ReadonlySet<string>) {
     memberOrgsByUser: orgIdsByUser(known),
     managedOrgsByUser: holding(MANAGEMENT_ROLES),
     oversightOrgsByUser: holding(OVERSIGHT_ROLES),
+    adminOrgsByUser: holding(ADMIN_ROLES),
   };
+}
+
+/**
+ * private.manages_person, for every active membership at once: the person's reporting manager,
+ * the head of their department and the lead of their team there, each only with an active
+ * membership in that organization, and never the person themself. A department or team of
+ * another organization manages no one here.
+ *
+ * A snapshot RPC from before the reporting lines (no departments or teams) cannot settle any of
+ * this, so the map stays empty and only admins and a task's own people see it (fail closed).
+ */
+function managerMap(
+  snapshot: EmailSnapshot,
+  activeOrgsByUser: ReadonlyMap<string, string[]>,
+): Map<string, Set<string>> {
+  const managers = new Map<string, Set<string>>();
+  if (!Array.isArray(snapshot.departments) || !Array.isArray(snapshot.teams)) return managers;
+  const departmentById = new Map(snapshot.departments.map((d) => [d.id, d]));
+  const teamById = new Map(snapshot.teams.map((t) => [t.id, t]));
+  for (const m of snapshot.memberships) {
+    if (m.status !== "active") continue;
+    const orgId = m.organizationId;
+    const department = m.departmentId ? departmentById.get(m.departmentId) : undefined;
+    const team = m.teamId ? teamById.get(m.teamId) : undefined;
+    const candidates = [
+      m.reportingManagerId,
+      department?.organizationId === orgId ? department.headUserId : null,
+      team?.organizationId === orgId ? team.leadUserId : null,
+    ];
+    for (const managerId of candidates) {
+      if (typeof managerId !== "string" || managerId === m.userId) continue;
+      if (!activeOrgsByUser.get(managerId)?.includes(orgId)) continue;
+      const key = `${orgId}:${m.userId}`;
+      const set = managers.get(key);
+      if (set) set.add(managerId);
+      else managers.set(key, new Set([managerId]));
+    }
+  }
+  return managers;
 }
 
 const labelMap = (labels: readonly SnapshotLabel[]) =>
@@ -106,6 +158,12 @@ const labelMap = (labels: readonly SnapshotLabel[]) =>
 
 function buildIndex(snapshot: EmailSnapshot): SnapshotIndex {
   const orgById = new Map(snapshot.organizations.map((org) => [org.id, org]));
+  const memberships = membershipMaps(snapshot, new Set(orgById.keys()));
+  // `?? null`: a snapshot RPC from before group tasks has no parentTaskId, and no groups.
+  const childrenByParent = groupBy(
+    snapshot.tasks.filter((task) => !task.archivedAt),
+    (task) => task.parentTaskId ?? null,
+  );
   return {
     snapshot,
     orgById,
@@ -114,8 +172,14 @@ function buildIndex(snapshot: EmailSnapshot): SnapshotIndex {
     taskById: new Map(snapshot.tasks.map((task) => [task.id, task])),
     projectById: new Map(snapshot.projects.map((project) => [project.id, project])),
     tasksByOrg: groupBy(snapshot.tasks, (task) => task.organizationId),
-    tasksByAssignee: groupBy(snapshot.tasks, (task) => task.assigneeId),
-    ...membershipMaps(snapshot, new Set(orgById.keys())),
+    // A parent has no assignee anyway; left out by name so it can never read as someone's work.
+    tasksByAssignee: groupBy(
+      snapshot.tasks.filter((task) => !childrenByParent.has(task.id)),
+      (task) => task.assigneeId,
+    ),
+    childrenByParent,
+    ...memberships,
+    managersOf: managerMap(snapshot, memberships.activeOrgsByUser),
     projectRoleLabels: new Map(
       snapshot.projectMembers.map((m) => [`${m.projectId}:${m.userId}`, m.roleLabel]),
     ),
@@ -143,10 +207,32 @@ export const isActiveMember = (index: SnapshotIndex, userId: string, orgId: stri
 const hasOversight = (index: SnapshotIndex, userId: string, orgId: string) =>
   index.oversightOrgsByUser.get(userId)?.includes(orgId) ?? false;
 
+const isOrgAdmin = (index: SnapshotIndex, userId: string, orgId: string) =>
+  index.adminOrgsByUser.get(userId)?.includes(orgId) ?? false;
+
+/**
+ * private.manages_person: `managerId` is `personId`'s reporting manager, department head or team
+ * lead in the organization, both with active memberships there. Nobody manages themself.
+ */
+export const managesPerson = (
+  index: SnapshotIndex,
+  managerId: string,
+  personId: string,
+  orgId: string,
+) => index.managersOf.get(`${orgId}:${personId}`)?.has(managerId) ?? false;
+
+/**
+ * A group task's parent: the snapshot holds at least one of its children. Never anyone's own work
+ * (it has no assignee); each person's part is their child.
+ */
+export const isGroupParent = (index: SnapshotIndex, task: Pick<SnapshotTask, "id">) =>
+  index.childrenByParent.has(task.id);
+
 // The snapshot is read through a SECURITY DEFINER function, so row-level security never narrows
-// it. The two checks below are the database's own rule for projects and tasks
-// (20260930000100_project_access.sql), applied here so a summary lists only what the app would
-// show its recipient. Anything the snapshot cannot settle is left out.
+// it. The two checks below are the database's own rules for projects
+// (20260930000100_project_access.sql) and tasks (private.can_view_task, 9 Oct 2026), applied
+// here so a summary lists only what the app would show its recipient. Anything the snapshot
+// cannot settle is left out.
 
 /**
  * private.can_access_project: an admin or manager of the project's organization, or its owner,
@@ -167,29 +253,34 @@ export function canSeeProject(index: SnapshotIndex, userId: string, projectId: s
 }
 
 /**
- * The work_tasks SELECT policy. A task with no project keeps the older rule: its creator,
- * assignee or reviewer, or an admin, manager or team lead of its organization. A project's task
- * is open to whoever may open the project, and its creator, assignee and reviewer keep it even
- * off the team. A task whose project is not in the snapshot (archived) is shown to admins and
- * managers only.
+ * private.can_view_task, the work_tasks SELECT policy. With an active membership in the task's
+ * organization, the viewer:
+ *   a. created it, or is its assignee or reviewer;
+ *   b. is an admin of the organization;
+ *   c. manages its assignee or its creator there (managesPerson);
+ *   d. is the assignee of one of its non-archived children (a group's members see the group);
+ *   e. has a part in the same group (a group's members see each other's parts).
+ * Being on the project's team, or a manager or team lead by role, shows nobody else's tasks.
  */
 export function canSeeTask(
   index: SnapshotIndex,
   userId: string,
-  task: Pick<
-    SnapshotTask,
-    "organizationId" | "projectId" | "createdBy" | "assigneeId" | "reviewerId"
-  >,
+  task: Pick<SnapshotTask, "id" | "organizationId" | "createdBy" | "assigneeId" | "reviewerId"> &
+    Partial<Pick<SnapshotTask, "parentTaskId">>,
 ): boolean {
-  const own = task.createdBy === userId || task.assigneeId === userId || task.reviewerId === userId;
-  if (!task.projectId) {
-    return own || (index.managedOrgsByUser.get(userId)?.includes(task.organizationId) ?? false);
+  const orgId = task.organizationId;
+  if (!isActiveMember(index, userId, orgId)) return false;
+  if (task.createdBy === userId || task.assigneeId === userId || task.reviewerId === userId) {
+    return true;
   }
-  if (own && isActiveMember(index, userId, task.organizationId)) return true;
-  if (!index.projectById.has(task.projectId)) {
-    return hasOversight(index, userId, task.organizationId);
+  if (isOrgAdmin(index, userId, orgId)) return true;
+  const people = [task.assigneeId, task.createdBy];
+  if (people.some((personId) => personId && managesPerson(index, userId, personId, orgId))) {
+    return true;
   }
-  return canSeeProject(index, userId, task.projectId);
+  const hasPartIn = (groupId: string) =>
+    (index.childrenByParent.get(groupId) ?? []).some((child) => child.assigneeId === userId);
+  return hasPartIn(task.id) || Boolean(task.parentTaskId && hasPartIn(task.parentTaskId));
 }
 
 export const kindEnabledForOrg = (org: SnapshotOrganization | undefined, kind: PreferenceKind) =>

@@ -62,14 +62,18 @@ function validate(draft: Draft): TaskFieldErrors {
 }
 
 /** Only the fields that actually changed, so an unchanged save logs no activity. */
-function changesFrom(task: WorkspaceTask, draft: Draft): Partial<WorkspaceTask> {
+function changesFrom(
+  task: WorkspaceTask,
+  draft: Draft,
+  canChangeAssignee: boolean,
+): Partial<WorkspaceTask> {
   const initial = draftFrom(task);
   const updates: Partial<WorkspaceTask> = {};
   const title = draft.title.trim();
   if (title !== task.title) updates.title = title;
   const description = draft.description.trim();
   if (description !== (task.description ?? "").trim()) updates.description = description;
-  if (draft.assigneeId !== initial.assigneeId) {
+  if (canChangeAssignee && draft.assigneeId !== initial.assigneeId) {
     updates.assigneeId = draft.assigneeId === UNASSIGNED ? null : draft.assigneeId;
   }
   if (draft.priority !== task.priority) updates.priority = draft.priority;
@@ -91,7 +95,22 @@ function changesFrom(task: WorkspaceTask, draft: Draft): Partial<WorkspaceTask> 
  * creating it — only its status (FD-006). Rules are the shared ones the New
  * Task form and the database use (FD-016), with the reason shown inline.
  */
-export function TaskEditForm({ task, onDone }: { task: WorkspaceTask; onDone: () => void }) {
+export function TaskEditForm({
+  task,
+  onDone,
+  canChangeAssignee = true,
+  isGroup = false,
+}: {
+  task: WorkspaceTask;
+  onDone: () => void;
+  /** A group task: what is saved here is copied to each person's part. */
+  isGroup?: boolean;
+  /**
+   * False for a group task: its people are its parts, so it has no assignee
+   * to change. Also false for anyone the database would refuse (spec B).
+   */
+  canChangeAssignee?: boolean;
+}) {
   const { updateTask, people } = useWorkspace();
   const { priorities, tagsFor } = useTaskSettings();
   // The task's own organization's tags (every organization has its own).
@@ -127,7 +146,7 @@ export function TaskEditForm({ task, onDone }: { task: WorkspaceTask; onDone: ()
   const save = async () => {
     setSubmitted(true);
     if (hasErrors(validate(draft))) return;
-    const updates = changesFrom(task, draft);
+    const updates = changesFrom(task, draft, canChangeAssignee);
     if (!Object.keys(updates).length) {
       onDone();
       return;
@@ -150,6 +169,11 @@ export function TaskEditForm({ task, onDone }: { task: WorkspaceTask; onDone: ()
         void save();
       }}
     >
+      {isGroup && (
+        <p className="rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+          This is a group task. What you save here is copied to each person&apos;s part.
+        </p>
+      )}
       <Field id={ids.title} label="Title*" error={errors.title}>
         <Input
           id={ids.title}
@@ -182,22 +206,24 @@ export function TaskEditForm({ task, onDone }: { task: WorkspaceTask; onDone: ()
         />
       </Field>
       <div className="grid gap-4 sm:grid-cols-2">
-        <Field id={ids.assignee} label="Assignee">
-          <Select value={draft.assigneeId} onValueChange={(value) => set("assigneeId", value)}>
-            <SelectTrigger id={ids.assignee}>
-              <SelectValue placeholder="Choose a person" />
-            </SelectTrigger>
-            <SelectContent>
-              {/* Offered only when the task has no assignee already, so an edit cannot orphan a task. */}
-              {!task.assigneeId && <SelectItem value={UNASSIGNED}>Unassigned</SelectItem>}
-              {assigneeOptions.map((person) => (
-                <SelectItem key={person.id} value={person.id}>
-                  {person.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </Field>
+        {canChangeAssignee && (
+          <Field id={ids.assignee} label="Assignee">
+            <Select value={draft.assigneeId} onValueChange={(value) => set("assigneeId", value)}>
+              <SelectTrigger id={ids.assignee}>
+                <SelectValue placeholder="Choose a person" />
+              </SelectTrigger>
+              <SelectContent>
+                {/* Offered only when the task has no assignee already, so an edit cannot orphan a task. */}
+                {!task.assigneeId && <SelectItem value={UNASSIGNED}>Unassigned</SelectItem>}
+                {assigneeOptions.map((person) => (
+                  <SelectItem key={person.id} value={person.id}>
+                    {person.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </Field>
+        )}
         <Field id={ids.priority} label="Priority">
           <Select
             value={draft.priority}
