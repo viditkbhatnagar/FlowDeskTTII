@@ -212,6 +212,59 @@ const announce = () => window.dispatchEvent(new Event("flowdesk-work-changed"));
 
 const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);
 
+/**
+ * Save a task's repeat schedule before the task itself. One person: assigneeId.
+ * A group task (14 Oct): no assignee, its people in assigneeIds, and each time
+ * it comes round the database makes a new group task for them.
+ */
+async function saveRecurrence(
+  input: NewWorkspaceTask,
+  organizationId: string,
+  projectId: string | null,
+  reviewerId: string | null,
+  people: { assigneeId: string | null; assigneeIds: string[] | null },
+): Promise<{ ok: true; id: string } | { ok: false; error: string }> {
+  const rule = input.recurrence;
+  if (!rule) return { ok: false, error: "The repeat schedule is missing." };
+  const { data: auth } = await supabase.auth.getUser();
+  if (!auth.user) return { ok: false, error: "Sign in again to create this task." };
+  const nextDueDate = rule.creationMode === "on_schedule" ? nextRecurrenceDate(input.dueDate, rule) : null;
+  const { data: recurrence, error } = await supabase
+    .from("task_recurrences")
+    .insert({
+      organization_id: organizationId,
+      project_id: projectId,
+      created_by: auth.user.id,
+      title: input.title,
+      description: input.description ?? null,
+      assignee_id: people.assigneeId,
+      assignee_ids: people.assigneeIds,
+      reviewer_id: reviewerId,
+      task_status: input.status,
+      priority: input.priority,
+      estimated_hours: input.estimatedHours,
+      tags: input.tags ?? [],
+      frequency: rule.frequency,
+      interval_count: rule.interval,
+      weekdays: rule.weekdays,
+      monthly_pattern: rule.monthlyPattern,
+      creation_mode: rule.creationMode,
+      end_mode: rule.endMode,
+      end_date: rule.endDate ?? null,
+      max_occurrences: rule.maxOccurrences ?? null,
+      next_due_date: nextDueDate,
+    })
+    .select("id")
+    .single();
+  // Previously ignored: a rejected rule (e.g. "every -3 weeks") still created
+  // the task, without its recurrence, while the UI claimed it repeated (FD-064).
+  if (error || !recurrence) {
+    console.error("[flowdesk] recurrence insert failed", error);
+    return { ok: false, error: friendlyError(error, "The repeat schedule could not be saved.") };
+  }
+  return { ok: true, id: recurrence.id };
+}
+
 export function WorkspaceProvider({ children }: { children: ReactNode }) {
   // Seeded empty, NOT with the sample tasks in mock-data.ts. Seeding fabricated tasks
   // here meant a failed or slow query rendered twelve convincing fake tasks that a user
@@ -346,10 +399,16 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     // the database (spec C). Each person moves their own part.
     const groupAssignees = distinctIds(input.assigneeIds ?? []);
     if (groupAssignees.length >= 2) {
-      // The New Task form switches Recurring off for several people: a schedule
-      // spawns one task, not a group.
+      // A repeating group task (14 Oct): the schedule keeps its people, and each
+      // time it comes round the database makes a new group task for them.
+      let groupRecurrenceId: string | null = null;
       if (input.recurrence) {
-        return { ok: false, error: "A task for several people can't repeat. Switch off Recurring task." };
+        const saved = await saveRecurrence(input, organizationId, projectId, reviewerId, {
+          assigneeId: null,
+          assigneeIds: groupAssignees,
+        });
+        if (!saved.ok) return { ok: false, error: saved.error };
+        groupRecurrenceId = saved.id;
       }
       const group = await createGroupTask(
         {
@@ -365,11 +424,15 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
           estimatedHours: input.estimatedHours ?? null,
           tags: input.tags ?? [],
           reviewerId,
+          recurrenceId: groupRecurrenceId,
         },
         groupAssignees,
         subtaskTitles,
       );
-      if (!group.ok) return { ok: false, error: group.error };
+      if (!group.ok) {
+        if (groupRecurrenceId) await supabase.from("task_recurrences").delete().eq("id", groupRecurrenceId);
+        return { ok: false, error: group.error };
+      }
 
       // Files and links belong to the group task, where everyone in it can open them.
       let groupRejected: { name: string; reason: string }[] = [];
@@ -404,41 +467,12 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
 
     let recurrenceId: string | null = null;
     if (input.recurrence) {
-      const nextDueDate =
-        input.recurrence.creationMode === "on_schedule" ? nextRecurrenceDate(input.dueDate, input.recurrence) : null;
-      const { data: recurrence, error: recurrenceError } = await supabase
-        .from("task_recurrences")
-        .insert({
-          organization_id: organizationId,
-          project_id: projectId,
-          created_by: auth.user.id,
-          title: input.title,
-          description: input.description ?? null,
-          assignee_id: assigneeId,
-          reviewer_id: reviewerId,
-          task_status: input.status,
-          priority: input.priority,
-          estimated_hours: input.estimatedHours,
-          tags: input.tags ?? [],
-          frequency: input.recurrence.frequency,
-          interval_count: input.recurrence.interval,
-          weekdays: input.recurrence.weekdays,
-          monthly_pattern: input.recurrence.monthlyPattern,
-          creation_mode: input.recurrence.creationMode,
-          end_mode: input.recurrence.endMode,
-          end_date: input.recurrence.endDate ?? null,
-          max_occurrences: input.recurrence.maxOccurrences ?? null,
-          next_due_date: nextDueDate,
-        })
-        .select("id")
-        .single();
-      // Previously ignored: a rejected rule (e.g. "every -3 weeks") still created
-      // the task, without its recurrence, while the UI claimed it repeated (FD-064).
-      if (recurrenceError || !recurrence) {
-        console.error("[flowdesk] recurrence insert failed", recurrenceError);
-        return { ok: false, error: friendlyError(recurrenceError, "The repeat schedule could not be saved.") };
-      }
-      recurrenceId = recurrence.id;
+      const saved = await saveRecurrence(input, organizationId, projectId, reviewerId, {
+        assigneeId,
+        assigneeIds: null,
+      });
+      if (!saved.ok) return { ok: false, error: saved.error };
+      recurrenceId = saved.id;
     }
 
     const { data: created, error } = await supabase

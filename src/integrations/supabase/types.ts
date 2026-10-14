@@ -881,6 +881,7 @@ export type Database = {
         Row: {
           active: boolean
           assignee_id: string | null
+          assignee_ids: string[] | null
           created_at: string
           created_by: string
           creation_mode: string
@@ -908,6 +909,7 @@ export type Database = {
         Insert: {
           active?: boolean
           assignee_id?: string | null
+          assignee_ids?: string[] | null
           created_at?: string
           created_by: string
           creation_mode?: string
@@ -935,6 +937,7 @@ export type Database = {
         Update: {
           active?: boolean
           assignee_id?: string | null
+          assignee_ids?: string[] | null
           created_at?: string
           created_by?: string
           creation_mode?: string

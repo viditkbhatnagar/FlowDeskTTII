@@ -22,6 +22,8 @@ export interface GroupTaskFields {
   estimatedHours: number | null;
   tags: string[];
   reviewerId: string | null;
+  /** A repeat schedule saved for these people (14 Oct): the group task comes round again. */
+  recurrenceId?: string | null;
 }
 
 export type GroupTaskResult = { ok: true; id: string } | { ok: false; error: string };

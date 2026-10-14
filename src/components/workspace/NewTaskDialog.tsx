@@ -301,8 +301,8 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
   const selectedAssignees = chosenAssignees.filter((id) => assigneeOptionIds.has(id));
   const leftOut = chosenAssignees.length - selectedAssignees.length;
   const isGroupTask = selectedAssignees.length >= 2;
-  // A schedule spawns one task, not a group, so a task for several people doesn't repeat.
-  const repeats = recurring && !isGroupTask;
+  // A task for several people repeats as a whole group task (14 Oct).
+  const repeats = recurring;
 
   // Names come from Settings, never hardcoded (FD-018): the statuses, names and
   // default of the organization the task is filed in, not the settings page's.
@@ -529,12 +529,14 @@ function NewTaskForm({ onClose, projectName, projectId }: Omit<NewTaskDialogProp
               <div>
                 <Label htmlFor={fieldId("recurring")}>Recurring task</Label>
                 <p id={fieldId("recurring-hint")} className="text-xs text-muted-foreground">
-                  {isGroupTask ? "Off when a task is for several people." : "Repeat this task automatically."}
+                  {isGroupTask
+                    ? "Repeat this task for the same people: each time, everyone gets a new part."
+                    : "Repeat this task automatically."}
                 </p>
               </div>
             </div>
             <Switch
-              id={fieldId("recurring")} checked={repeats} onCheckedChange={setRecurring} disabled={isGroupTask}
+              id={fieldId("recurring")} checked={repeats} onCheckedChange={setRecurring}
               aria-describedby={fieldId("recurring-hint")}
             />
           </div>
