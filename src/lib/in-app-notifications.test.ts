@@ -417,3 +417,16 @@ describe("rows from the database and from Realtime", () => {
     ).toEqual({});
   });
 });
+
+describe("a team member's new task, to their manager (14 Oct)", () => {
+  test("names who created it", () => {
+    const view = describeKind("task_created_in_project", {
+      actorName: "Fathimath",
+      taskTitle: "Call the new batch",
+      projectName: "Admissions",
+      byTeamMember: true,
+    });
+    expect(view.title).toBe("Fathimath created “Call the new batch”");
+    expect(view.description).toBe("Admissions");
+  });
+});

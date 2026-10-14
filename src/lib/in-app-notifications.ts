@@ -372,6 +372,15 @@ export function describeNotification(
       return view(`${actor} commented on ${task}`, excerpt ? clip(excerpt, EXCERPT_MAX) : project);
     }
     case "task_created_in_project": {
+      // To the creator's manager (14 Oct): someone on their team made a task.
+      const byTeamMember =
+        payload !== null &&
+        typeof payload === "object" &&
+        !Array.isArray(payload) &&
+        payload.byTeamMember === true;
+      if (byTeamMember) {
+        return view(taskTitle ? `${actor} created ${task}` : `${actor} created a task`, project);
+      }
       const lead = taskTitle ? `New task ${task}` : "New task";
       return view(project ? `${lead} in ${project}` : lead, `Added by ${actor}`);
     }

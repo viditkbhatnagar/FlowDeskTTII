@@ -153,17 +153,36 @@ describe("taskPermissions: an ordinary task or a member's part", () => {
     });
   });
 
-  test("the reviewer may edit and move, but not delete", () => {
-    const task = taskFor({ reviewerId: "naji" });
+  test("the reviewer may edit, and move it only while it waits for approval", () => {
+    const task = taskFor({ reviewerId: "naji", status: "progress" });
     expect(taskPermissions(task, false, viewer("naji"))).toEqual({
       ...ALL,
+      canMove: false,
       canDelete: false,
       canManageFiles: false,
     });
+    expect(taskPermissions({ ...task, status: "review" }, false, viewer("naji")).canMove).toBe(
+      true,
+    );
   });
 
-  test("an admin of the organization may do everything", () => {
-    expect(taskPermissions(taskFor(), false, viewer("sharon", [`sharon@${ORG}`]))).toEqual(ALL);
+  test("an admin of the organization may do everything but move someone else's task (14 Oct)", () => {
+    const task = taskFor({ createdById: "ravi", assigneeId: "asha" });
+    expect(taskPermissions(task, false, viewer("sharon", [`sharon@${ORG}`]))).toEqual({
+      ...ALL,
+      canMove: false,
+    });
+  });
+
+  test("only the assignee moves it, not its creator", () => {
+    const task = taskFor({ createdById: "ravi", assigneeId: "asha" });
+    expect(taskPermissions(task, false, viewer("ravi")).canMove).toBe(false);
+    expect(taskPermissions(task, false, viewer("asha")).canMove).toBe(true);
+  });
+
+  test("a task with nobody assigned is moved by its creator", () => {
+    const task = taskFor({ createdById: "ravi", assigneeId: null });
+    expect(taskPermissions(task, false, viewer("ravi")).canMove).toBe(true);
   });
 
   test("an admin of another organization may not", () => {
@@ -172,8 +191,12 @@ describe("taskPermissions: an ordinary task or a member's part", () => {
     );
   });
 
-  test("someone who manages the assignee may edit and move, but not delete", () => {
-    expect(taskPermissions(taskFor(), false, viewer("ravi"))).toEqual({ ...ALL, canDelete: false });
+  test("someone who manages the assignee may edit, but not move or delete", () => {
+    expect(taskPermissions(taskFor(), false, viewer("ravi"))).toEqual({
+      ...ALL,
+      canMove: false,
+      canDelete: false,
+    });
   });
 
   test("someone who manages only the creator may look but not change", () => {

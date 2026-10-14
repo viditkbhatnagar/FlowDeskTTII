@@ -88,6 +88,8 @@ export interface PermissionTask {
   reviewerId?: string | null;
   /** Set on one person's part of a group task. */
   parentTaskId?: string | null;
+  /** Its stage: the reviewer may move a task that is waiting for approval. */
+  status?: string | null;
 }
 
 export interface TaskViewer {
@@ -102,7 +104,11 @@ export interface TaskViewer {
 export interface TaskPermissions {
   /** Title, description, dates, priority, tags, blocked. */
   canEdit: boolean;
-  /** Its status: Kanban drag-and-drop, status pickers and buttons. */
+  /**
+   * Its status: Kanban drag-and-drop, status pickers and buttons. Only the
+   * person it is assigned to (private.guard_task_move, 14 Oct); its reviewer
+   * while it waits for approval; its creator while nobody is assigned.
+   */
   canMove: boolean;
   canDelete: boolean;
   /**
@@ -176,7 +182,7 @@ export function taskPermissions(
   const isPart = Boolean(task.parentTaskId);
   return {
     canEdit,
-    canMove: canEdit,
+    canMove: assignee || (!task.assigneeId && creator) || (reviewer && task.status === "review"),
     canDelete,
     // A part's creator is the group's creator (create_group_task).
     canChangeAssignee: isPart ? creator || admin : canEdit,
@@ -187,4 +193,4 @@ export function taskPermissions(
 }
 
 /** Why a status control is read-only, for its hint. */
-export const READ_ONLY_HINT = "You can see this task but not change it";
+export const READ_ONLY_HINT = "Only the person this task is assigned to can move it";
