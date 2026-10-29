@@ -1,5 +1,5 @@
 import { useId } from "react";
-import { AlignLeft, Ban, Calendar, Clock, GitBranch, Repeat2, Tag, Users } from "lucide-react";
+import { AlignLeft, Ban, Calendar, Clock, GitBranch, Tag, Users } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
@@ -16,6 +16,7 @@ import { LinkifiedText } from "./LinkifiedText";
 import { TaskActivity } from "./TaskActivity";
 import { TaskAttachments } from "./TaskAttachments";
 import { TaskComments } from "./TaskComments";
+import { TaskRepeat } from "./TaskRepeat";
 import { TaskSubtasks } from "./TaskSubtasks";
 import { Detail, DrawerSection } from "./shared";
 import { formatDate } from "./utils";
@@ -270,13 +271,7 @@ export function TaskOverview({
           {scheduleLabel(task)}
         </div>
       </DrawerSection>
-      {task.recurrenceSummary && (
-        <DrawerSection title="Recurring task" icon={Repeat2}>
-          <p className="rounded-md border border-border bg-muted/20 px-3 py-2 text-sm text-muted-foreground">
-            {task.recurrenceSummary}
-          </p>
-        </DrawerSection>
-      )}
+      <TaskRepeat task={task} canChange={permissions.canDelete} />
       {permissions.canCollaborate && (
         <>
           <TaskComments task={task} onChanged={onChanged} />

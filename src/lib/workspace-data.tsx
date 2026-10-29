@@ -58,6 +58,8 @@ export type WorkspaceTask = Task & {
   occurrenceNumber?: number | null;
   recurrence?: RecurrenceRule;
   recurrenceSummary?: string;
+  /** False once its repeat was stopped or ran out: no more copies come. */
+  recurrenceActive?: boolean;
 };
 
 export type NewWorkspaceTask = Omit<
@@ -104,7 +106,10 @@ type WorkspaceContextValue = {
   /** Optimistic; reverts and shows an error when the database refuses the write. */
   updateTask: (id: string, updates: Partial<WorkspaceTask>) => Promise<boolean>;
   /** Soft delete (archived_at), so history and activity survive (FD-006). */
-  deleteTask: (id: string) => Promise<boolean>;
+  /** stopRepeating: also stop the task's repeat, so no new copies are made (29 Oct). */
+  deleteTask: (id: string, options?: { stopRepeating?: boolean }) => Promise<boolean>;
+  /** Stop a repeat (no more copies), or end it on a date (YYYY-MM-DD). */
+  changeRepeat: (recurrenceId: string, change: { stop: true } | { endDate: string }) => Promise<boolean>;
   addSubtask: (taskId: string, title: string) => Promise<boolean>;
   toggleSubtask: (taskId: string, subtaskId: string, completed: boolean) => Promise<boolean>;
   removeSubtask: (taskId: string, subtaskId: string) => Promise<boolean>;
@@ -190,6 +195,7 @@ function mapRow(row: TaskRow, personFor: (id: string | null | undefined) => Pers
     occurrenceNumber: row.occurrence_number,
     recurrence: rule,
     recurrenceSummary: rule ? recurrenceSummary(rule) : undefined,
+    recurrenceActive: row.task_recurrences ? row.task_recurrences.active : undefined,
   };
 }
 
@@ -601,9 +607,41 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     return true;
   }, [personFor, refresh, reloadTask]);
 
-  const deleteTask = useCallback(async (id: string): Promise<boolean> => {
+  const changeRepeat = useCallback(
+    async (recurrenceId: string, change: { stop: true } | { endDate: string }): Promise<boolean> => {
+      const update =
+        "stop" in change
+          ? { active: false, next_due_date: null }
+          : { end_mode: "on_date", end_date: change.endDate };
+      const { data, error } = await supabase
+        .from("task_recurrences")
+        .update(update)
+        .eq("id", recurrenceId)
+        .select("id");
+      if (error || !data?.length) {
+        console.error("[flowdesk] repeat change failed", error);
+        toast.error(
+          error
+            ? friendlyError(error, "The repeat could not be changed.")
+            : "Only the person who made this repeating task, or an admin, can change its repeat.",
+        );
+        return false;
+      }
+      // Every copy shows the schedule, so read them again.
+      await refresh();
+      announce();
+      return true;
+    },
+    [refresh],
+  );
+
+  const deleteTask = useCallback(async (id: string, options?: { stopRepeating?: boolean }): Promise<boolean> => {
     const before = tasksRef.current.find((task) => task.id === id);
     if (!before) return false;
+    // Stopped first: deleting a copy alone let the next one come back (29 Oct).
+    if (options?.stopRepeating && before.recurrenceId && before.recurrenceActive !== false) {
+      if (!(await changeRepeat(before.recurrenceId, { stop: true }))) return false;
+    }
     // Deleting a group deletes its parts with it (the database archives them).
     const removed = tasksRef.current.filter((task) => task.id === id || task.parentTaskId === id);
     const related = groupRelated(before, tasksRef.current);
@@ -619,7 +657,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     if (related) await refresh();
     announce();
     return true;
-  }, [refresh]);
+  }, [refresh, changeRepeat]);
 
   const setSubtasksLocally = useCallback((taskId: string, change: (subtasks: Subtask[]) => Subtask[]) => {
     setTasks((current) =>
@@ -693,12 +731,13 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       addTask,
       updateTask,
       deleteTask,
+      changeRepeat,
       addSubtask,
       toggleSubtask,
       removeSubtask,
       refresh,
     }),
-    [tasks, status, people, groups, unitLeads, addTask, updateTask, deleteTask, addSubtask, toggleSubtask, removeSubtask, refresh],
+    [tasks, status, people, groups, unitLeads, addTask, updateTask, deleteTask, changeRepeat, addSubtask, toggleSubtask, removeSubtask, refresh],
   );
 
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>;

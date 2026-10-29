@@ -21,6 +21,8 @@ import { useTaskSettings } from "@/lib/task-settings-data";
 import { useWorkspace, type WorkspaceTask } from "@/lib/workspace-data";
 import { useTaskAccess } from "@/lib/use-task-access";
 import { ConfirmDialog } from "./task-detail/ConfirmDialog";
+import { StopRepeatingOption } from "./task-detail/StopRepeatingOption";
+import { repeatsStill } from "@/lib/repeat";
 import { TaskEditForm } from "./task-detail/TaskEditForm";
 import { TaskOverview } from "./task-detail/TaskOverview";
 import { formatDate } from "./task-detail/utils";
@@ -111,6 +113,7 @@ function TaskDetail({
   const statusLabel = (value: string) => statusLabelFor(value, task.organizationId);
   const [editing, setEditing] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [stopRepeating, setStopRepeating] = useState(true);
   // Bumped after comments and files change, so the activity list reloads.
   const [version, setVersion] = useState(0);
   const bump = () => setVersion((value) => value + 1);
@@ -121,7 +124,7 @@ function TaskDetail({
   const Description = isModal ? DialogDescription : SheetDescription;
 
   const remove = async () => {
-    const ok = await deleteTask(task.id);
+    const ok = await deleteTask(task.id, { stopRepeating: repeatsStill(task) && stopRepeating });
     if (!ok) return false;
     toast.success("Task deleted");
     onClose();
@@ -234,7 +237,11 @@ function TaskDetail({
         }
         confirmLabel="Delete task"
         onConfirm={remove}
-      />
+      >
+        {repeatsStill(task) && (
+          <StopRepeatingOption checked={stopRepeating} onCheckedChange={setStopRepeating} />
+        )}
+      </ConfirmDialog>
     </>
   );
 }

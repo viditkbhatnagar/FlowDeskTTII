@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -19,6 +19,7 @@ export function ConfirmDialog({
   description,
   confirmLabel,
   onConfirm,
+  children,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -27,6 +28,8 @@ export function ConfirmDialog({
   confirmLabel: string;
   /** Resolve true to close the dialog; false keeps it open (the action already explained why). */
   onConfirm: () => Promise<boolean>;
+  /** Anything to choose before confirming, under the description. */
+  children?: ReactNode;
 }) {
   const [busy, setBusy] = useState(false);
   return (
@@ -36,6 +39,7 @@ export function ConfirmDialog({
           <AlertDialogTitle className="break-words">{title}</AlertDialogTitle>
           <AlertDialogDescription className="break-words">{description}</AlertDialogDescription>
         </AlertDialogHeader>
+        {children}
         <AlertDialogFooter>
           <AlertDialogCancel disabled={busy}>Cancel</AlertDialogCancel>
           <AlertDialogAction

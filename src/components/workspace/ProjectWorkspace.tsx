@@ -123,6 +123,8 @@ import { useTaskAccess } from "@/lib/use-task-access";
 import { NewTaskDialog } from "./NewTaskDialog";
 import { TaskDetailDrawer } from "./TaskDetailDrawer";
 import { GroupAvatars, GroupMembersStrip, PartOfGroup } from "./TaskGroupParts";
+import { StopRepeatingOption } from "./task-detail/StopRepeatingOption";
+import { repeatsStill } from "@/lib/repeat";
 import { AddLinkButton, openStoredFile, StoredFileName, storedFileType } from "./files";
 import type { LinkInput } from "@/lib/links";
 
@@ -1099,8 +1101,8 @@ export function ProjectWorkspace({
               onAdd={() => setTaskOpen(true)}
               onSelect={(task, view) => openTask(task, view === "board" ? "modal" : "sheet")}
               onUpdate={(id, updates) => void updateTask(id, updates)}
-              onDelete={async (task) => {
-                const ok = await deleteTask(task.id);
+              onDelete={async (task, stopRepeating) => {
+                const ok = await deleteTask(task.id, { stopRepeating });
                 if (ok) toast.success(`“${task.title}” deleted`);
                 return ok;
               }}
@@ -1622,7 +1624,8 @@ function TasksTab({
   onAdd: () => void;
   onSelect: (task: WorkspaceTask, view: "list" | "board") => void;
   onUpdate: (id: string, updates: Partial<WorkspaceTask>) => void;
-  onDelete: (task: WorkspaceTask) => Promise<boolean>;
+  /** stopRepeating: also stop the task's repeat (29 Oct). */
+  onDelete: (task: WorkspaceTask, stopRepeating: boolean) => Promise<boolean>;
 }) {
   const { statusLabelFor } = useTaskSettings();
   const statusLabel = (value: string) => statusLabelFor(value, orgId);
@@ -1637,6 +1640,7 @@ function TasksTab({
   const [dragId, setDragId] = useState<string>();
   const [deleteTarget, setDeleteTarget] = useState<WorkspaceTask>();
   const [deleting, setDeleting] = useState(false);
+  const [stopRepeating, setStopRepeating] = useState(true);
   const setView = (value: "list" | "board") => {
     setViewState(value);
     try {
@@ -2012,6 +2016,9 @@ function TasksTab({
               The task is removed from every list and board. Its history is kept.
             </AlertDialogDescription>
           </AlertDialogHeader>
+          {repeatsStill(deleteTarget) && (
+            <StopRepeatingOption checked={stopRepeating} onCheckedChange={setStopRepeating} />
+          )}
           <AlertDialogFooter>
             <AlertDialogCancel disabled={deleting}>Cancel</AlertDialogCancel>
             <AlertDialogAction
@@ -2022,7 +2029,10 @@ function TasksTab({
                 event.preventDefault();
                 if (!deleteTarget) return;
                 setDeleting(true);
-                const ok = await onDelete(deleteTarget);
+                const ok = await onDelete(
+                  deleteTarget,
+                  repeatsStill(deleteTarget) && stopRepeating,
+                );
                 setDeleting(false);
                 if (ok) setDeleteTarget(undefined);
               }}
